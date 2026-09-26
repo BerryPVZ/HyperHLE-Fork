@@ -385,3 +385,8 @@ com.foursakenmedia.civilwar: --reverse-attrib-locations
 
 # Illusia: draws in landscape but never declares or requests an orientation.
 com.gamevil.illusia: --landscape-left
+
+# Monster Hunter: Dynamic Hunting checks Game Center authentication before
+# leaving its startup splash. If unauthenticated, it clears each frame without
+# submitting any draws. A local signed-in player lets its offline title load.
+jp.co.capcom.monhunipus: --game-center-authenticated
