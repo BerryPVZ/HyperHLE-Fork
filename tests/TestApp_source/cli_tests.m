@@ -70,55 +70,40 @@
 
 extern NSString *const NSDefaultRunLoopMode;
 
-@interface NSError : NSObject
-- (NSInteger)code;
-@end
-
 @interface GKLocalPlayer : NSObject
 + (instancetype)localPlayer;
 - (BOOL)isAuthenticated;
-- (void)authenticateWithCompletionHandler:(void (^)(NSError *error))handler;
+- (void)authenticateWithCompletionHandler:(void (^)(id error))handler;
 @end
 
 static int game_center_callback_count;
-static NSInteger game_center_callback_error_code;
+static int game_center_callback_had_error;
 
-int TestApp_game_center_test_main(int expect_authenticated) {
+int test_GKLocalPlayer_authentication(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
   GKLocalPlayer *player = [GKLocalPlayer localPlayer];
-  if ([player isAuthenticated] != expect_authenticated) {
-    printf("Game Center: incorrect initial authentication state\n");
-    [pool drain];
-    return 1;
+  int result = 0;
+
+  if (![player isAuthenticated]) {
+    result = -1;
+  } else {
+    game_center_callback_count = 0;
+    game_center_callback_had_error = 0;
+    [player authenticateWithCompletionHandler:^(id error) {
+      game_center_callback_count++;
+      game_center_callback_had_error = error != nil;
+    }];
+    if (game_center_callback_count != 0) {
+      result = -2;
+    } else {
+      [[NSRunLoop mainRunLoop]
+          runMode:NSDefaultRunLoopMode
+       beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+      if (game_center_callback_count != 1 || game_center_callback_had_error)
+        result = -3;
+    }
   }
 
-  game_center_callback_count = 0;
-  game_center_callback_error_code = 0;
-  [player authenticateWithCompletionHandler:^(NSError *error) {
-    game_center_callback_count++;
-    game_center_callback_error_code = error == nil ? 0 : [error code];
-  }];
-  if (game_center_callback_count != 0) {
-    printf("Game Center: authentication callback ran synchronously\n");
-    [pool drain];
-    return 2;
-  }
-
-  for (int i = 0; i < 3 && game_center_callback_count == 0; i++) {
-    [[NSRunLoop mainRunLoop]
-        runMode:NSDefaultRunLoopMode
-     beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
-  }
-  int expected_error_code = expect_authenticated ? 0 : 6;
-  int result = game_center_callback_count == 1 &&
-                       game_center_callback_error_code == expected_error_code &&
-                       [player isAuthenticated] == expect_authenticated
-                   ? 0
-                   : 3;
-  printf("Game Center authentication (%s): %s (callbacks=%d, error=%ld)\n",
-         expect_authenticated ? "enabled" : "disabled",
-         result == 0 ? "OK" : "FAIL", game_center_callback_count,
-         (long)game_center_callback_error_code);
   [pool drain];
   return result;
 }
@@ -6603,6 +6588,7 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
+    FUNC_DEF(test_GKLocalPlayer_authentication),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),

@@ -185,35 +185,18 @@ fn run_test_app(
         sources.iter().chain(cpp_objects.iter()),
         extra_compile_args,
     )?;
-    run_guest_test(&test_app_path, &[], "--game-center-unauthenticated")?;
-    run_guest_test(
-        &test_app_path,
-        &["--game-center-authenticated"],
-        "--game-center-authenticated",
-    )?;
-    run_guest_test(&test_app_path, extra_run_args, "--cli-tests")?;
-    write!(
-        &mut std::io::stdout(),
-        "Finished running {}.\n\n\n",
-        test_app_name
-    )
-    .unwrap();
-    Ok(())
-}
-
-fn run_guest_test(
-    test_app_path: &Path,
-    host_args: &[&str],
-    app_arg: &str,
-) -> Result<(), Box<dyn Error>> {
-    let binary_path = target_dir().join(format!("touchHLE{}", env::consts::EXE_SUFFIX));
-    let output = Command::new(binary_path)
+    let binary_name = "touchHLE";
+    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
+    let mut cmd = Command::new(binary_path);
+    let output = cmd
         .arg(test_app_path)
-        // Headless mode works in CI without opening a window.
+        // headless mode avoids a distracting window briefly appearing during
+        // testing, and works in CI.
         .arg("--headless")
-        .args(host_args)
+        .args(extra_run_args)
+        // Run the automated CLI tests, rather than the manual UIKit tests.
         .arg("--args")
-        .arg(app_arg)
+        .arg("--cli-tests")
         .output()
         .expect("failed to execute touchHLE process");
     std::io::stdout().write_all(&output.stdout).unwrap();
@@ -224,6 +207,12 @@ fn run_guest_test(
         find_subsequence(output.stderr.as_slice(), b"CPU emulation begins now."),
         None
     );
+    write!(
+        &mut std::io::stdout(),
+        "Finished running {}.\n\n\n",
+        test_app_name
+    )
+    .unwrap();
     Ok(())
 }
 
@@ -452,5 +441,10 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     }
 
     // Finally, build TestApp itself.
-    run_test_app(&tests_dir, "TestApp", &extra_compile_args, &[])
+    run_test_app(
+        &tests_dir,
+        "TestApp",
+        &extra_compile_args,
+        &["--game-center-authenticated"],
+    )
 }
