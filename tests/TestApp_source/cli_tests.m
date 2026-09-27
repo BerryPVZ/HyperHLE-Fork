@@ -70,6 +70,59 @@
 
 extern NSString *const NSDefaultRunLoopMode;
 
+@interface NSError : NSObject
+- (NSInteger)code;
+@end
+
+@interface GKLocalPlayer : NSObject
++ (instancetype)localPlayer;
+- (BOOL)isAuthenticated;
+- (void)authenticateWithCompletionHandler:(void (^)(NSError *error))handler;
+@end
+
+static int game_center_callback_count;
+static NSInteger game_center_callback_error_code;
+
+int TestApp_game_center_test_main(int expect_authenticated) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  GKLocalPlayer *player = [GKLocalPlayer localPlayer];
+  if ([player isAuthenticated] != expect_authenticated) {
+    printf("Game Center: incorrect initial authentication state\n");
+    [pool drain];
+    return 1;
+  }
+
+  game_center_callback_count = 0;
+  game_center_callback_error_code = 0;
+  [player authenticateWithCompletionHandler:^(NSError *error) {
+    game_center_callback_count++;
+    game_center_callback_error_code = error == nil ? 0 : [error code];
+  }];
+  if (game_center_callback_count != 0) {
+    printf("Game Center: authentication callback ran synchronously\n");
+    [pool drain];
+    return 2;
+  }
+
+  for (int i = 0; i < 3 && game_center_callback_count == 0; i++) {
+    [[NSRunLoop mainRunLoop]
+        runMode:NSDefaultRunLoopMode
+     beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+  }
+  int expected_error_code = expect_authenticated ? 0 : 6;
+  int result = game_center_callback_count == 1 &&
+                       game_center_callback_error_code == expected_error_code &&
+                       [player isAuthenticated] == expect_authenticated
+                   ? 0
+                   : 3;
+  printf("Game Center authentication (%s): %s (callbacks=%d, error=%ld)\n",
+         expect_authenticated ? "enabled" : "disabled",
+         result == 0 ? "OK" : "FAIL", game_center_callback_count,
+         (long)game_center_callback_error_code);
+  [pool drain];
+  return result;
+}
+
 static int perform_selector_on_main_thread_calls;
 
 @interface PerformSelectorOnMainThreadProbe : NSObject

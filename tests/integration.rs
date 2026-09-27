@@ -185,18 +185,35 @@ fn run_test_app(
         sources.iter().chain(cpp_objects.iter()),
         extra_compile_args,
     )?;
-    let binary_name = "touchHLE";
-    let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
-    let mut cmd = Command::new(binary_path);
-    let output = cmd
+    run_guest_test(&test_app_path, &[], "--game-center-unauthenticated")?;
+    run_guest_test(
+        &test_app_path,
+        &["--game-center-authenticated"],
+        "--game-center-authenticated",
+    )?;
+    run_guest_test(&test_app_path, extra_run_args, "--cli-tests")?;
+    write!(
+        &mut std::io::stdout(),
+        "Finished running {}.\n\n\n",
+        test_app_name
+    )
+    .unwrap();
+    Ok(())
+}
+
+fn run_guest_test(
+    test_app_path: &Path,
+    host_args: &[&str],
+    app_arg: &str,
+) -> Result<(), Box<dyn Error>> {
+    let binary_path = target_dir().join(format!("touchHLE{}", env::consts::EXE_SUFFIX));
+    let output = Command::new(binary_path)
         .arg(test_app_path)
-        // headless mode avoids a distracting window briefly appearing during
-        // testing, and works in CI.
+        // Headless mode works in CI without opening a window.
         .arg("--headless")
-        .args(extra_run_args)
-        // Run the automated CLI tests, rather than the manual UIKit tests.
+        .args(host_args)
         .arg("--args")
-        .arg("--cli-tests")
+        .arg(app_arg)
         .output()
         .expect("failed to execute touchHLE process");
     std::io::stdout().write_all(&output.stdout).unwrap();
@@ -207,12 +224,6 @@ fn run_test_app(
         find_subsequence(output.stderr.as_slice(), b"CPU emulation begins now."),
         None
     );
-    write!(
-        &mut std::io::stdout(),
-        "Finished running {}.\n\n\n",
-        test_app_name
-    )
-    .unwrap();
     Ok(())
 }
 
@@ -356,8 +367,10 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     // Build the stub libraries and ensure TestApp will link to them.
 
     for (dylib_path, stub_src_path) in files_to_compile {
-        if dylib_path.starts_with("/.touchHLE") {
-            // skip the fake app picker library
+        if !dylib_path.starts_with("/usr/lib/lib")
+            && !dylib_path.starts_with("/System/Library/Frameworks/")
+        {
+            // TestApp only links the public system libraries and frameworks.
             continue;
         }
         let is_framework = dylib_path

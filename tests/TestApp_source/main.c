@@ -15,6 +15,7 @@
 #include <string.h>
 
 int TestApp_cli_tests_main(void);
+int TestApp_game_center_test_main(int expect_authenticated);
 int TestApp_gui_tests_main(int argc, char **argv);
 
 int main(int argc, char **argv) {
@@ -22,6 +23,10 @@ int main(int argc, char **argv) {
     printf("Starting command-line automated tests (omit --cli-tests for UIKit "
            "test app).\n");
     return TestApp_cli_tests_main();
+  } else if (argc == 2 && !strcmp(argv[1], "--game-center-unauthenticated")) {
+    return TestApp_game_center_test_main(0);
+  } else if (argc == 2 && !strcmp(argv[1], "--game-center-authenticated")) {
+    return TestApp_game_center_test_main(1);
   } else if (argc == 1) {
     printf("Running UIKit test app (pass --cli-tests for other tests).\n");
     return TestApp_gui_tests_main(argc, argv);
