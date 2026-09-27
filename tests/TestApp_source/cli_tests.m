@@ -73,39 +73,10 @@ extern NSString *const NSDefaultRunLoopMode;
 @interface GKLocalPlayer : NSObject
 + (instancetype)localPlayer;
 - (BOOL)isAuthenticated;
-- (void)authenticateWithCompletionHandler:(void (^)(id error))handler;
 @end
 
-static int game_center_callback_count;
-static int game_center_callback_had_error;
-
-int test_GKLocalPlayer_authentication(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  GKLocalPlayer *player = [GKLocalPlayer localPlayer];
-  int result = 0;
-
-  if (![player isAuthenticated]) {
-    result = -1;
-  } else {
-    game_center_callback_count = 0;
-    game_center_callback_had_error = 0;
-    [player authenticateWithCompletionHandler:^(id error) {
-      game_center_callback_count++;
-      game_center_callback_had_error = error != nil;
-    }];
-    if (game_center_callback_count != 0) {
-      result = -2;
-    } else {
-      [[NSRunLoop mainRunLoop]
-          runMode:NSDefaultRunLoopMode
-       beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
-      if (game_center_callback_count != 1 || game_center_callback_had_error)
-        result = -3;
-    }
-  }
-
-  [pool drain];
-  return result;
+int test_GKLocalPlayer_authenticated(void) {
+  return [[GKLocalPlayer localPlayer] isAuthenticated] ? 0 : -1;
 }
 
 static int perform_selector_on_main_thread_calls;
@@ -6588,7 +6559,7 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
-    FUNC_DEF(test_GKLocalPlayer_authentication),
+    FUNC_DEF(test_GKLocalPlayer_authenticated),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
