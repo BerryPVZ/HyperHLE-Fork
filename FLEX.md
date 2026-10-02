@@ -6,7 +6,22 @@ returning to the picker and launching the app. Switching apps saves the current
 profile first; an invalid rule prevents the switch and displays its line number.
 Back discards unsaved edits.
 
-Rules require the app's actual Objective-C class and selector names:
+To choose a method without typing its name, tap **Browse methods**. The browser
+reads the selected app's main executable, lists its classes, and shows instance
+(`-`) and class (`+`) methods, their type encodings and inherited guest methods.
+Use the filter field and **Apply filter**, or Previous/Next page, to find a class
+or selector. Select a method, then tap false, true, nil or skip. Only choices
+compatible with its return type are enabled. This inserts a rule into the editor;
+press **Save** to apply it. Selecting the same method again replaces its active
+rule. You can edit the value to an integer in the editor. **Classes** returns to
+the class list; **Done** returns to the editor without inserting a rule.
+
+The browser supports ARM32 Objective-C 2 metadata, including universal binaries
+and categories on classes in the main executable. It does not list classes in
+separate frameworks or dynamically created classes, or resolve external category
+class bindings. Encrypted binaries and unsupported formats display an explanation.
+
+Rules use the app's actual Objective-C class and selector names:
 
 ```text
 # Illustrative names: replace these with methods from your app.

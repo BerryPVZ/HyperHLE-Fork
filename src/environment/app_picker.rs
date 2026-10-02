@@ -170,6 +170,13 @@ struct AppPickerDelegateHostObject {
     flex_page: i32,
     flex_enabled: Option<bool>,
     page_swipe: i32,
+    flex_browse: bool,
+    browser_close: bool,
+    browser_back: bool,
+    browser_filter: bool,
+    browser_page: i32,
+    browser_row: Option<usize>,
+    browser_return: Option<&'static str>,
     scale_hack_default: bool,
     scale_hack1: bool,
     scale_hack2: bool,
@@ -235,6 +242,20 @@ const CLASSES: ClassExports = objc_classes! {
 - (())flexSave { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_save = true; }
 - (())flexPrevious { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_page = -1; }
 - (())flexNext { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_page = 1; }
+- (())flexBrowse { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_browse = true; }
+- (())flexBrowserClose { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_close = true; }
+- (())flexBrowserBack { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_back = true; }
+- (())flexBrowserFilter { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_filter = true; }
+- (())flexBrowserPrevious { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_page = -1; }
+- (())flexBrowserNext { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_page = 1; }
+- (())flexBrowserSelect:(id)sender {
+    let row: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_row = Some(row as usize);
+}
+- (())flexBrowserFalse { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("false"); }
+- (())flexBrowserTrue { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("true"); }
+- (())flexBrowserNil { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("nil"); }
+- (())flexBrowserSkip { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("skip"); }
 - (())flexEnabled:(id)sender {
     let enabled: bool = msg![env; sender isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_enabled = Some(enabled);
@@ -580,6 +601,8 @@ fn app_picker_inner(
         quick_options_gles_native_switch_enabled,
     );
     let flex_panel = setup_flex_panel(env, delegate, quick_options_stuff.main_view, app_frame);
+    let browser_panel = setup_flex_browser(env, delegate, flex_panel.view, app_frame);
+    let mut browser = FlexBrowserState::default();
     let mut flex_index = 0usize;
     let mut flex_open = false;
     let mut flex_enabled = env.options.runtime_hooks_enabled;
@@ -726,6 +749,14 @@ fn app_picker_inner(
                 }
             }
         }
+        handle_flex_browser(
+            env,
+            delegate,
+            &browser_panel,
+            &mut browser,
+            &flex_panel,
+            apps.as_ref().ok().and_then(|a| a.get(flex_index)),
+        );
         if swipe != 0 && !flex_open {
             let hidden: bool = msg![env; (quick_options_stuff.main_view) isHidden];
             if hidden {
@@ -1070,7 +1101,6 @@ fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> 
     ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
 }
 
-
 struct FlexPanel {
     view: id,
     title: id,
@@ -1159,7 +1189,7 @@ fn setup_flex_panel(env: &mut Environment, delegate: id, parent: id, frame: CGRe
         view,
         frame.size,
         frame.size.height - 30.0,
-        &[("Save hooks", "flexSave")],
+        &[("Browse methods", "flexBrowse"), ("Save hooks", "flexSave")],
         Some(16.0),
     );
     release(env, view);
@@ -2313,5 +2343,370 @@ mod quick_options_gles_native_tests {
             quick_options_gles_native_argument(enabled),
             "--no-gles-native"
         );
+    }
+}
+
+#[derive(Default)]
+struct FlexBrowserState {
+    classes: Vec<crate::mach_o::objc_browser::ClassInfo>,
+    class: Option<usize>,
+    methods: Vec<crate::mach_o::objc_browser::MethodInfo>,
+    selected: Option<usize>,
+    query: String,
+    page: usize,
+    visible: Vec<usize>,
+    error: Option<String>,
+}
+struct FlexBrowserPanel {
+    view: id,
+    title: id,
+    filter: id,
+    rows: Vec<id>,
+    returns: Vec<id>,
+}
+fn setup_flex_browser(
+    env: &mut Environment,
+    delegate: id,
+    parent: id,
+    frame: CGRect,
+) -> FlexBrowserPanel {
+    let view: id = msg_class![env; UIView alloc];
+    let view: id = msg![env; view initWithFrame:frame];
+    let white: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; view setBackgroundColor:white];
+    () = msg![env; parent addSubview:view];
+    () = msg![env; view setHidden:true];
+    let title = flex_label(
+        env,
+        view,
+        CGRect {
+            origin: CGPoint { x: 10.0, y: 5.0 },
+            size: CGSize {
+                width: frame.size.width - 20.0,
+                height: 45.0,
+            },
+        },
+        14.0,
+    );
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        68.0,
+        &[("Classes", "flexBrowserBack"), ("Done", "flexBrowserClose")],
+        Some(14.0),
+    );
+    let filter: id = msg_class![env; UITextField alloc];
+    let filter_frame = CGRect {
+        origin: CGPoint { x: 10.0, y: 88.0 },
+        size: CGSize {
+            width: frame.size.width - 20.0,
+            height: 28.0,
+        },
+    };
+    let filter: id = msg![env; filter initWithFrame:filter_frame];
+    let placeholder = ns_string::get_static_str(env, "Filter classes or methods");
+    () = msg![env; filter setPlaceholder:placeholder];
+    let gray: id = msg_class![env; UIColor lightGrayColor];
+    () = msg![env; filter setBackgroundColor:gray];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; filter setTextColor:black];
+    () = msg![env; view addSubview:filter];
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        136.0,
+        &[("Apply filter", "flexBrowserFilter")],
+        Some(13.0),
+    );
+    let count = ((frame.size.height - 255.0) / 34.0).floor().max(1.0) as usize;
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let button = make_button_row(
+            env,
+            delegate,
+            view,
+            frame.size,
+            171.0 + index as CGFloat * 34.0,
+            &[("", "flexBrowserSelect:")],
+            Some(12.0),
+        )[0];
+        let tag = index as NSInteger;
+        () = msg![env; button setTag:tag];
+        rows.push(button);
+    }
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        frame.size.height - 65.0,
+        &[
+            ("Previous page", "flexBrowserPrevious"),
+            ("Next page", "flexBrowserNext"),
+        ],
+        Some(12.0),
+    );
+    let returns = make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        frame.size.height - 25.0,
+        &[
+            ("false", "flexBrowserFalse"),
+            ("true", "flexBrowserTrue"),
+            ("nil", "flexBrowserNil"),
+            ("skip", "flexBrowserSkip"),
+        ],
+        Some(13.0),
+    );
+    release(env, filter);
+    release(env, view);
+    FlexBrowserPanel {
+        view,
+        title,
+        filter,
+        rows,
+        returns,
+    }
+}
+fn refresh_flex_browser(
+    env: &mut Environment,
+    panel: &FlexBrowserPanel,
+    state: &mut FlexBrowserState,
+) {
+    let query = state.query.to_lowercase();
+    let filtered: Vec<usize> = if state.class.is_some() {
+        state
+            .methods
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.selector.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        state
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let pages = filtered.len().div_ceil(panel.rows.len()).max(1);
+    state.page = state.page.min(pages - 1);
+    state.visible = filtered
+        .into_iter()
+        .skip(state.page * panel.rows.len())
+        .take(panel.rows.len())
+        .collect();
+    let title = if let Some(error) = &state.error {
+        error.clone()
+    } else if let Some(method) = state.selected.and_then(|i| state.methods.get(i)) {
+        format!(
+            "{} {}\nReturn: {}",
+            if method.class_method { "+" } else { "-" },
+            method.selector,
+            method.return_description()
+        )
+    } else if let Some(index) = state.class {
+        format!(
+            "{}: methods ({}/{})",
+            state.classes[index].name,
+            state.page + 1,
+            pages
+        )
+    } else {
+        format!(
+            "{} classes ({}/{})",
+            state.classes.len(),
+            state.page + 1,
+            pages
+        )
+    };
+    set_flex_label(env, panel.title, &title);
+    for (slot, &button) in panel.rows.iter().enumerate() {
+        let index = state.visible.get(slot).copied();
+        let hidden = index.is_none();
+        () = msg![env; button setHidden:hidden];
+        if let Some(index) = index {
+            let title = if state.class.is_some() {
+                let method = &state.methods[index];
+                format!(
+                    "{} {}  [{}]",
+                    if method.class_method { "+" } else { "-" },
+                    method.selector,
+                    method.encoding
+                )
+            } else {
+                state.classes[index].name.clone()
+            };
+            let title = ns_string::from_rust_string(env, title);
+            () = msg![env; button setTitle:title forState:UIControlStateNormal];
+            release(env, title);
+            let color: id = if state.class.is_some() && state.selected == Some(index) {
+                msg_class![env; UIColor blueColor]
+            } else {
+                msg_class![env; UIColor grayColor]
+            };
+            () = msg![env; button setBackgroundColor:color];
+        }
+    }
+    for (&button, value) in panel.returns.iter().zip(["false", "true", "nil", "skip"]) {
+        let enabled = state
+            .selected
+            .and_then(|i| state.methods.get(i))
+            .map_or(false, |m| m.accepts(value));
+        () = msg![env; button setEnabled:enabled];
+        let alpha: CGFloat = if enabled { 1.0 } else { 0.35 };
+        () = msg![env; button setAlpha:alpha];
+    }
+}
+fn handle_flex_browser(
+    env: &mut Environment,
+    delegate: id,
+    panel: &FlexBrowserPanel,
+    state: &mut FlexBrowserState,
+    flex: &FlexPanel,
+    app: Option<&AppInfo>,
+) {
+    let (open, close, back, filter, page, row, value) = {
+        let h = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        (
+            std::mem::take(&mut h.flex_browse),
+            std::mem::take(&mut h.browser_close),
+            std::mem::take(&mut h.browser_back),
+            std::mem::take(&mut h.browser_filter),
+            std::mem::take(&mut h.browser_page),
+            h.browser_row.take(),
+            h.browser_return.take(),
+        )
+    };
+    if open {
+        let _: bool = msg![env; (flex.editor) resignFirstResponder];
+        *state = FlexBrowserState::default();
+        let result = app
+            .ok_or_else(|| "No installed app selected".to_string())
+            .and_then(|app| {
+                let data = BundleData::open_any(&app.path)?;
+                let (bundle, fs) = Bundle::new_bundle_and_fs_from_host_path(data, true)?;
+                let bytes = fs
+                    .read(&bundle.executable_path())
+                    .map_err(|_| "Cannot read the selected app executable".to_string())?;
+                crate::mach_o::objc_browser::browse(&bytes)
+            });
+        match result {
+            Ok(classes) => {
+                state.classes = classes;
+                if state.classes.is_empty() {
+                    state.error = Some("No Objective-C 2 classes in this executable".into());
+                }
+            }
+            Err(e) => state.error = Some(e),
+        }
+        set_flex_label(env, panel.filter, "");
+        refresh_flex_browser(env, panel, state);
+        () = msg![env; (panel.view) setHidden:false];
+    }
+    if close {
+        let _: bool = msg![env; (panel.filter) resignFirstResponder];
+        () = msg![env; (panel.view) setHidden:true];
+    }
+    if back {
+        state.class = None;
+        state.methods.clear();
+        state.selected = None;
+        state.query.clear();
+        state.page = 0;
+        set_flex_label(env, panel.filter, "");
+        refresh_flex_browser(env, panel, state);
+    }
+    if filter {
+        let text: id = msg![env; (panel.filter) text];
+        state.query = if text == nil {
+            String::new()
+        } else {
+            ns_string::to_rust_string(env, text).into_owned()
+        };
+        state.page = 0;
+        state.selected = None;
+        let _: bool = msg![env; (panel.filter) resignFirstResponder];
+        refresh_flex_browser(env, panel, state);
+    }
+    if page != 0 {
+        state.page = (state.page as i32 + page).max(0) as usize;
+        state.selected = None;
+        refresh_flex_browser(env, panel, state);
+    }
+    if let Some(index) = row.and_then(|slot| state.visible.get(slot).copied()) {
+        if state.class.is_none() {
+            state.class = Some(index);
+            state.methods = crate::mach_o::objc_browser::methods_for(&state.classes, index);
+            state.page = 0;
+            state.query.clear();
+            set_flex_label(env, panel.filter, "");
+        } else {
+            state.selected = Some(index);
+        }
+        refresh_flex_browser(env, panel, state);
+    }
+    if let (Some(value), Some(class), Some(method)) = (
+        value,
+        state.class,
+        state.selected.and_then(|i| state.methods.get(i)),
+    ) {
+        if method.accepts(value) {
+            let current: id = msg![env; (flex.editor) text];
+            let current = ns_string::to_rust_string(env, current).into_owned();
+            let rule = format!(
+                "{} {} {} {}",
+                if method.class_method { "+" } else { "-" },
+                state.classes[class].name,
+                method.selector,
+                value
+            );
+            let text = insert_flex_rule(&current, &rule);
+            set_flex_label(env, flex.editor, &text);
+            set_flex_label(env, flex.status, "Rule inserted. Press Save to apply it.");
+            () = msg![env; (panel.view) setHidden:true];
+        }
+    }
+}
+/// Replace an existing active rule for this method instead of creating duplicates.
+fn insert_flex_rule(text: &str, rule: &str) -> String {
+    let key: Vec<_> = rule.split_whitespace().take(3).collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            let fields: Vec<_> = line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .take(3)
+                .collect();
+            fields != key
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.push(rule.to_owned());
+    lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod flex_browser_rule_tests {
+    use super::insert_flex_rule;
+    #[test]
+    fn selection_replaces_rule_and_preserves_disabled_rules() {
+        let text = "# - Gate online true\n- Gate online true # old\n+ Gate online nil\n- Other online true\n";
+        let updated = insert_flex_rule(text, "- Gate online false");
+        assert!(!updated.contains("# old"));
+        assert!(updated.contains("# - Gate online true"));
+        assert!(updated.contains("+ Gate online nil"));
+        assert!(updated.ends_with("- Gate online false\n"));
     }
 }
