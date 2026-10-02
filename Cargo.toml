@@ -43,6 +43,7 @@ gl_generator = "0.14.0"
 [dependencies]
 caf = "0.1.0" # ИСПРАВЛЕНИЕ: Добавлен недостающий крейт
 hound = "3.5.0"
+openh264 = { version = "0.9.8", default-features = false, features = ["source"] }
 mach_object = "0.1.17"
 plist = "1.8.0"
 zip = { version = "0.6.4", default-features = false, features = ["deflate"] }
@@ -76,7 +77,7 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     # `symphonia-metadata` is an unconditional dependency of `symphonia`
     # (its `embedded` module is always re-exported) and `ape`/`id3v1`/`id3v2`
     # are plain cfg flags inside it, so `Cargo.lock` is unchanged.
-    "ape", "id3v1", "id3v2"
+    "ape", "id3v1", "id3v2", "exp-video-codecs"
 ] }
 quick-xml = "0.38.4"
 # PERF: use mimalloc as the global allocator (see src/lib.rs).

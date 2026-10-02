@@ -673,20 +673,21 @@ pub const CLASSES: ClassExports = objc_classes! {
     true
 }
 
-// ИЗМЕНЕНО: Ищем _objc_msgSend через create_proc_address (без логов)
 - (u32)methodForSelector:(SEL)selector {
-    let dyld = &mut env.dyld;
-    let mem = &mut env.mem;
-    let cpu = &mut env.cpu;
-    match dyld.create_proc_address(mem, cpu, "_objc_msgSend") {
-        Ok(guest_func) => guest_func.addr_with_thumb_bit(),
-        Err(_) => {
-            log!("Error: _objc_msgSend not found! Returning dummy IMP.");
-            let ptr: crate::mem::MutPtr<u16> = mem.alloc(2).cast();
-            mem.write(ptr, 0x4770);
-            ptr.to_bits() | 1
-        }
+    let class = crate::objc::ObjC::read_isa(this, &env.mem);
+    let implementation = crate::objc::class_getMethodImplementation(env, class, selector);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_METHOD_FOR_SELECTOR") {
+        let class_name = env.objc.get_class_name(class).to_owned();
+        let selector_name = selector.as_str(&env.mem);
+        log!(
+            "methodForSelector receiver={:?} class={} selector={} IMP={:#x}",
+            this,
+            class_name,
+            selector_name,
+            implementation.to_bits()
+        );
     }
+    implementation.to_bits()
 }
 
 - (id)methodSignatureForSelector:(SEL)selector {

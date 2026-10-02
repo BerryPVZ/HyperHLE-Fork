@@ -20,12 +20,13 @@
 //! properties, plus the `GLKMatrix4Identity` constant that math-only users
 //! of GLKit import.
 
-use crate::dyld::{ConstantExports, FunctionExports, HostConstant};
+use crate::abi::{impl_GuestRet_for_large_struct, GuestArg};
+use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_graphics::{CGFloat, CGRect};
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval};
 use crate::frameworks::uikit::ui_view::UIViewHostObject;
 use crate::frameworks::uikit::ui_view_controller::UIViewControllerHostObject;
-use crate::mem::{ConstVoidPtr, SafeRead};
+use crate::mem::{ConstVoidPtr, MutPtr, SafeRead};
 use crate::objc::{
     id, impl_HostObject_with_superclass, msg, nil, objc_classes, release, retain, ClassExports,
     NSZonePtr,
@@ -34,22 +35,195 @@ use crate::Environment;
 
 // GLKMatrix4Identity — 4x4 identity matrix of 32-bit floats (16 × 4 = 64
 // bytes). Layout matches Apple's `_GLKMatrix4 { float m[16]; }`.
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[repr(C)]
-struct GLKMatrix4 {
+pub(super) struct GLKMatrix4 {
     m: [f32; 16],
 }
 unsafe impl SafeRead for GLKMatrix4 {}
+impl_GuestRet_for_large_struct!(GLKMatrix4);
+impl GuestArg for GLKMatrix4 {
+    const REG_COUNT: usize = 16;
 
-fn glk_matrix4_identity(env: &mut Environment) -> ConstVoidPtr {
-    let identity = GLKMatrix4 {
+    fn from_regs(regs: &[u32]) -> Self {
+        GLKMatrix4 {
+            m: std::array::from_fn(|index| f32::from_bits(regs[index])),
+        }
+    }
+
+    fn to_regs(self, regs: &mut [u32]) {
+        for (destination, value) in regs.iter_mut().zip(self.m) {
+            *destination = value.to_bits();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub(super) struct GLKVector2 {
+    pub(super) x: f32,
+    pub(super) y: f32,
+}
+
+impl GuestArg for GLKVector2 {
+    const REG_COUNT: usize = 2;
+
+    fn from_regs(regs: &[u32]) -> Self {
+        Self {
+            x: f32::from_bits(regs[0]),
+            y: f32::from_bits(regs[1]),
+        }
+    }
+
+    fn to_regs(self, regs: &mut [u32]) {
+        regs[0] = self.x.to_bits();
+        regs[1] = self.y.to_bits();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub(super) struct GLKVector3 {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) z: f32,
+}
+
+impl GuestArg for GLKVector3 {
+    const REG_COUNT: usize = 3;
+
+    fn from_regs(regs: &[u32]) -> Self {
+        Self {
+            x: f32::from_bits(regs[0]),
+            y: f32::from_bits(regs[1]),
+            z: f32::from_bits(regs[2]),
+        }
+    }
+
+    fn to_regs(self, regs: &mut [u32]) {
+        regs[0] = self.x.to_bits();
+        regs[1] = self.y.to_bits();
+        regs[2] = self.z.to_bits();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[repr(C)]
+pub(super) struct GLKVector4 {
+    pub(super) x: f32,
+    pub(super) y: f32,
+    pub(super) z: f32,
+    pub(super) w: f32,
+}
+
+impl GuestArg for GLKVector4 {
+    const REG_COUNT: usize = 4;
+
+    fn from_regs(regs: &[u32]) -> Self {
+        Self {
+            x: f32::from_bits(regs[0]),
+            y: f32::from_bits(regs[1]),
+            z: f32::from_bits(regs[2]),
+            w: f32::from_bits(regs[3]),
+        }
+    }
+
+    fn to_regs(self, regs: &mut [u32]) {
+        regs[0] = self.x.to_bits();
+        regs[1] = self.y.to_bits();
+        regs[2] = self.z.to_bits();
+        regs[3] = self.w.to_bits();
+    }
+}
+
+fn matrix4_identity() -> GLKMatrix4 {
+    GLKMatrix4 {
         m: [
             1.0, 0.0, 0.0, 0.0, //
             0.0, 1.0, 0.0, 0.0, //
             0.0, 0.0, 1.0, 0.0, //
             0.0, 0.0, 0.0, 1.0, //
         ],
-    };
-    env.mem.alloc_and_write(identity).cast_void().cast_const()
+    }
+}
+
+fn glk_matrix4_identity(env: &mut Environment) -> ConstVoidPtr {
+    env.mem
+        .alloc_and_write(matrix4_identity())
+        .cast_void()
+        .cast_const()
+}
+
+fn invert_matrix4(matrix: GLKMatrix4) -> (GLKMatrix4, bool) {
+    let mut augmented = [[0.0_f64; 8]; 4];
+    for row in 0..4 {
+        for column in 0..4 {
+            augmented[row][column] = matrix.m[column * 4 + row] as f64;
+        }
+        augmented[row][row + 4] = 1.0;
+    }
+
+    for column in 0..4 {
+        let mut pivot_row = column;
+        for row in column + 1..4 {
+            if augmented[row][column].abs() > augmented[pivot_row][column].abs() {
+                pivot_row = row;
+            }
+        }
+        let pivot = augmented[pivot_row][column];
+        if !pivot.is_finite() || pivot == 0.0 {
+            return (matrix4_identity(), false);
+        }
+        augmented.swap(column, pivot_row);
+        for value in &mut augmented[column] {
+            *value /= pivot;
+        }
+        for row in 0..4 {
+            if row == column {
+                continue;
+            }
+            let factor = augmented[row][column];
+            for index in 0..8 {
+                augmented[row][index] -= factor * augmented[column][index];
+            }
+        }
+    }
+
+    let mut inverse = GLKMatrix4 { m: [0.0; 16] };
+    for row in 0..4 {
+        for column in 0..4 {
+            let value = augmented[row][column + 4] as f32;
+            if !value.is_finite() {
+                return (matrix4_identity(), false);
+            }
+            inverse.m[column * 4 + row] = value;
+        }
+    }
+    (inverse, true)
+}
+
+#[allow(non_snake_case)]
+pub fn GLKMatrix4Invert(
+    env: &mut Environment,
+    matrix: GLKMatrix4,
+    is_invertible: MutPtr<u8>,
+) -> GLKMatrix4 {
+    static TRACE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let (inverse, invertible) = invert_matrix4(matrix);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_GLK")
+        && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
+    {
+        log!(
+            "GLKMatrix4Invert input={:?} invertible={} output={:?}",
+            matrix.m,
+            invertible,
+            inverse.m
+        );
+    }
+    if !is_invertible.is_null() {
+        env.mem.write(is_invertible, u8::from(invertible));
+    }
+    inverse
 }
 
 pub const CONSTANTS: ConstantExports = &[(
@@ -57,7 +231,7 @@ pub const CONSTANTS: ConstantExports = &[(
     HostConstant::Custom(glk_matrix4_identity),
 )];
 
-pub const FUNCTIONS: FunctionExports = &[];
+pub const FUNCTIONS: FunctionExports = &[export_c_func!(GLKMatrix4Invert(_, _))];
 
 /// `GLKViewDrawableColorFormat` etc. are plain integer enums in GLKit's
 /// headers (`GLKView.h`); `GLKViewDrawableColorFormatRGBA8888` (the
@@ -351,3 +525,31 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
     constant_exports: &[CONSTANTS],
     function_exports: &[FUNCTIONS],
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{invert_matrix4, matrix4_identity, GLKMatrix4};
+
+    #[test]
+    fn glk_matrix4_invert_handles_identity_and_translation() {
+        let matrix = GLKMatrix4 {
+            m: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 4.0, -5.0, 6.0, 1.0,
+            ],
+        };
+        let (inverse, invertible) = invert_matrix4(matrix);
+        assert!(invertible);
+        assert_eq!(
+            inverse.m,
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -4.0, 5.0, -6.0, 1.0,]
+        );
+    }
+
+    #[test]
+    fn glk_matrix4_invert_reports_singular_matrices() {
+        let matrix = GLKMatrix4 { m: [0.0; 16] };
+        let (inverse, invertible) = invert_matrix4(matrix);
+        assert!(!invertible);
+        assert_eq!(inverse, matrix4_identity());
+    }
+}

@@ -37,6 +37,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Number of warnings for Move/Up events naming an untracked finger (its Down
 /// never arrived). Proof of lost Downs in "swipes randomly dead" reports.
 static UNTRACKED_TOUCH_WARNS: AtomicUsize = AtomicUsize::new(8);
+static TOUCH_BEGAN_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+static TOUCH_ENDED_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+
+fn log_touch_delivery(marker: &str, counter: &AtomicUsize, count: usize) {
+    if !crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+        return;
+    }
+    let sequence = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 12 {
+        log!(
+            "{} #{} delivered to UIKit ({} touch(es))",
+            marker,
+            sequence,
+            count
+        );
+    }
+}
 
 /// A touch with no event for this long is no longer part of a live gesture;
 /// its Up/Cancel was lost. Used to reclaim stale touches safely.
@@ -967,6 +984,8 @@ fn handle_touches_down(env: &mut Environment, map: HashMap<FingerId, Coords>) {
             view touchesBegan:v_set withEvent:event];
         super::ui_gesture_recognizer::touches_began(env, view, v_set);
         touchhle_send_cocos_touch_aliases_to_chain(env, view, "began", v_set, event);
+        let count: NSUInteger = msg![env; v_set count];
+        log_touch_delivery("TOUCH-DIAG", &TOUCH_BEGAN_DIAGNOSTICS, count as usize);
     }
     release(env, pool);
 }
@@ -1221,6 +1240,7 @@ fn handle_touches_up(env: &mut Environment, map: HashMap<FingerId, Coords>) {
         if count != 0 {
             let _: () = msg![env; view touchesEnded:deliver withEvent:event];
             touchhle_send_cocos_touch_aliases_to_chain(env, view, "ended", deliver, event);
+            log_touch_delivery("TOUCH-END", &TOUCH_ENDED_DIAGNOSTICS, count as usize);
         }
         release(env, deliver);
     }

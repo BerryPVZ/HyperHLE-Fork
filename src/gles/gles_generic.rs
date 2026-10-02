@@ -348,25 +348,15 @@ pub trait GLES {
         unimplemented!("LogicOp not implemented by this backend")
     }
 
-    // Points
-    unsafe fn PointSize(&mut self, _size: GLfloat) {
-        unimplemented!("PointSize not implemented by this backend")
-    }
-    unsafe fn PointSizex(&mut self, _size: GLfixed) {
-        unimplemented!("PointSizex not implemented by this backend")
-    }
-    unsafe fn PointParameterf(&mut self, _pname: GLenum, _param: GLfloat) {
-        unimplemented!("PointParameterf not implemented by this backend")
-    }
-    unsafe fn PointParameterx(&mut self, _pname: GLenum, _param: GLfixed) {
-        unimplemented!("PointParameterx not implemented by this backend")
-    }
-    unsafe fn PointParameterfv(&mut self, _pname: GLenum, _params: *const GLfloat) {
-        unimplemented!("PointParameterfv not implemented by this backend")
-    }
-    unsafe fn PointParameterxv(&mut self, _pname: GLenum, _params: *const GLfixed) {
-        unimplemented!("PointParameterxv not implemented by this backend")
-    }
+    // Fixed-function point state has no equivalent in GLES 2.0/3.0 contexts.
+    // Legacy apps sometimes call these setters from a shared GLES code path;
+    // ignoring them is safer than aborting the guest on shader-based backends.
+    unsafe fn PointSize(&mut self, _size: GLfloat) {}
+    unsafe fn PointSizex(&mut self, _size: GLfixed) {}
+    unsafe fn PointParameterf(&mut self, _pname: GLenum, _param: GLfloat) {}
+    unsafe fn PointParameterx(&mut self, _pname: GLenum, _param: GLfixed) {}
+    unsafe fn PointParameterfv(&mut self, _pname: GLenum, _params: *const GLfloat) {}
+    unsafe fn PointParameterxv(&mut self, _pname: GLenum, _params: *const GLfixed) {}
 
     // Lighting and materials
     unsafe fn Fogf(&mut self, _pname: GLenum, _param: GLfloat) {}
@@ -2386,5 +2376,30 @@ pub trait GLES {
         _params: *mut GLint,
     ) {
         log_once!("GetInternalformativ (OpenGL ES 3.0) not supported by this backend [stubbed]");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GLES;
+
+    struct UnsupportedPointStateBackend;
+
+    impl GLES for UnsupportedPointStateBackend {}
+
+    #[test]
+    fn fixed_function_point_state_is_safe_when_backend_does_not_support_it() {
+        let mut gles = UnsupportedPointStateBackend;
+        let attenuation = [1.0, 0.0, 0.0];
+        let attenuation_fixed = [1 << 16, 0, 0];
+
+        unsafe {
+            gles.PointSize(1.0);
+            gles.PointSizex(1 << 16);
+            gles.PointParameterf(0x8129, 1.0);
+            gles.PointParameterx(0x8129, 1 << 16);
+            gles.PointParameterfv(0x8129, attenuation.as_ptr());
+            gles.PointParameterxv(0x8129, attenuation_fixed.as_ptr());
+        }
     }
 }

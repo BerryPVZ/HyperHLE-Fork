@@ -946,12 +946,78 @@ fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         match target {
             ARRAY_BUFFER => shadow.array_buffer = buffer,
-            ELEMENT_ARRAY_BUFFER => shadow.element_array_buffer = Some(buffer),
+            ELEMENT_ARRAY_BUFFER => shadow.record_element_array_buffer_binding(buffer),
             _ => (),
+        }
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_BUFFER_BINDINGS") {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNT: AtomicUsize = AtomicUsize::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) < 256 {
+                let previous = match target {
+                    ARRAY_BUFFER => Some(shadow.array_buffer),
+                    ELEMENT_ARRAY_BUFFER => shadow.element_array_buffer,
+                    _ => None,
+                };
+                log!(
+                    "GLES_BIND_BUFFER target={:#x} buffer={} previous={:?}",
+                    target,
+                    buffer,
+                    previous
+                );
+            }
         }
         gles.BindBuffer(target, buffer)
     })
 }
+unsafe fn debug_log_buffer_upload(
+    gles: &mut dyn GLES,
+    mem: &Mem,
+    operation: &str,
+    target: GLenum,
+    offset: GuestGLintptr,
+    size: GuestGLsizeiptr,
+    data: ConstPtr<GLvoid>,
+) {
+    if !crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
+        return;
+    }
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let index = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if index >= 6 {
+        return;
+    }
+    let binding_query = match target {
+        ARRAY_BUFFER => 0x8894,
+        ELEMENT_ARRAY_BUFFER => 0x8895,
+        _ => 0,
+    };
+    let mut binding = 0;
+    if binding_query != 0 {
+        gles.GetIntegerv(binding_query, &mut binding);
+        let _ = gles.GetError();
+    }
+    let sample_len = size.clamp(0, 960) as u32;
+    let sample = if data.is_null() {
+        "null".to_string()
+    } else {
+        let bytes = std::slice::from_raw_parts(
+            mem.ptr_at(data.cast::<u8>(), sample_len),
+            sample_len as usize,
+        );
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(" ")
+    };
+    log!(
+        "[GLES BUFFER TRACE] {} target={:#x} binding={} offset={} size={} data={:#x} first_bytes={}",
+        operation,
+        target,
+        binding,
+        offset,
+        size,
+        data.to_bits(),
+        sample
+    );
+}
+
 fn glBufferData(
     env: &mut Environment,
     target: GLenum,
@@ -960,6 +1026,7 @@ fn glBufferData(
     usage: GLenum,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
+        debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
         let data: *const GLvoid = if data.is_null() {
             std::ptr::null()
         } else {
@@ -977,6 +1044,7 @@ fn glBufferSubData(
     data: ConstPtr<GLvoid>,
 ) {
     with_ctx_and_mem(env, |gles, mem| unsafe {
+        debug_log_buffer_upload(gles, mem, "BufferSubData", target, offset, size, data);
         let data = if data.is_null() {
             std::ptr::null()
         } else {
@@ -1465,44 +1533,67 @@ fn glPopGroupMarkerEXT(_env: &mut Environment) {
 fn glBindVertexArrayOES(env: &mut Environment, array: GLuint) {
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         if gles.supports_vao_oes() {
-            // The element array buffer binding is VAO state.
+            shadow.current_vertex_array = array;
             shadow.invalidate_vao_state();
             gles.BindVertexArrayOES(array);
+        } else {
+            if array != 0 && !shadow.is_software_vertex_array(array) {
+                log_once!("Ignoring glBindVertexArrayOES for an ungenerated name on the software fallback");
+                return;
+            }
+            let element_array_buffer = shadow.bind_software_vertex_array(array);
+            gles.BindBuffer(ELEMENT_ARRAY_BUFFER, element_array_buffer);
         }
-        // Otherwise no-op: without real VAO support all vertex state lives in
-        // the single default array object, so there is nothing to switch.
     });
 }
 fn glDeleteVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: ConstPtr<GLuint>) {
+    if n <= 0 || arrays.is_null() {
+        return;
+    }
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let count = n as GuestUSize;
         if gles.supports_vao_oes() {
-            // Deleting the bound VAO rebinds the default one.
-            shadow.invalidate_vao_state();
-            let slice = mem.bytes_at(arrays.cast(), (n.max(0) as GuestUSize) * 4);
+            let slice = mem.bytes_at(arrays.cast(), count * 4);
+            for array in slice.chunks_exact(4).map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap())) {
+                if array == shadow.current_vertex_array {
+                    shadow.current_vertex_array = 0;
+                    shadow.invalidate_vao_state();
+                }
+            }
             gles.DeleteVertexArraysOES(n, slice.as_ptr().cast());
+        } else {
+            for index in 0..count {
+                let array = mem.read(arrays + index);
+                if let Some(element_array_buffer) = shadow.delete_software_vertex_array(array) {
+                    gles.BindBuffer(ELEMENT_ARRAY_BUFFER, element_array_buffer);
+                }
+            }
         }
     });
 }
 fn glGenVertexArraysOES(env: &mut Environment, n: GLsizei, arrays: MutPtr<GLuint>) {
-    let supported = with_ctx_and_mem(env, |gles, _mem| gles.supports_vao_oes());
-    if supported {
-        with_ctx_and_mem(env, |gles, mem| unsafe {
-            let slice = mem.bytes_at_mut(arrays.cast(), (n.max(0) as GuestUSize) * 4);
-            gles.GenVertexArraysOES(n, slice.as_mut_ptr().cast());
-        });
-    } else {
-        // Fallback emulation: just hand out sequential non-zero names.
-        for i in 0..n {
-            env.mem.write(arrays + (i as GuestUSize), (i + 1) as GLuint);
-        }
+    if n <= 0 || arrays.is_null() {
+        return;
     }
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let count = n as GuestUSize;
+        if gles.supports_vao_oes() {
+            let slice = mem.bytes_at_mut(arrays.cast(), count * 4);
+            gles.GenVertexArraysOES(n, slice.as_mut_ptr().cast());
+        } else {
+            for index in 0..count {
+                let array = shadow.generate_software_vertex_array();
+                mem.write(arrays + index, array);
+            }
+        }
+    });
 }
 fn glIsVertexArrayOES(env: &mut Environment, array: GLuint) -> GLboolean {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         if gles.supports_vao_oes() {
             gles.IsVertexArrayOES(array)
         } else {
-            0
+            u8::from(shadow.is_software_vertex_array(array))
         }
     })
 }
@@ -1732,7 +1823,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         return;
     }
     static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let mut fbo: GLint = 0;
@@ -1753,7 +1844,7 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
     // Drain any error the queries raised so the guest doesn't inherit it.
     let mut err = gles.GetError();
     let mut errs = Vec::new();
-    while err != 0 && errs.len() < 4 {
+    while err != 0 && errs.len() < 8 {
         errs.push(err);
         err = gles.GetError();
     }
@@ -1784,10 +1875,99 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         } else { None };
         attribs.push((name, loc, enabled, size, type_, stride, buffer, ptr as usize, first));
     }
+    let mut active_count = 0;
+    gles.GetProgramiv(program as GLuint, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &mut active_count);
+    let mut active_attribs = Vec::new();
+    for index in 0..active_count.clamp(0, 32) as GLuint {
+        let mut name = [0_u8; 128];
+        let mut length: GLsizei = 0;
+        let mut size: GLint = 0;
+        let mut type_: GLenum = 0;
+        gles.GetActiveAttrib(
+            program as GLuint,
+            index,
+            name.len() as GLsizei,
+            &mut length,
+            &mut size,
+            &mut type_,
+            name.as_mut_ptr().cast(),
+        );
+        let used = length.clamp(0, name.len() as GLsizei) as usize;
+        active_attribs.push((String::from_utf8_lossy(&name[..used]).into_owned(), size, type_));
+    }
+    let mut enabled_attribs = Vec::new();
+    let mut max_attribs: GLint = 0;
+    gles.GetIntegerv(0x8869 /* GL_MAX_VERTEX_ATTRIBS */, &mut max_attribs);
+    for index in 0..max_attribs.clamp(0, 32) as GLuint {
+        let mut enabled = 0;
+        gles.GetVertexAttribiv(index, 0x8622 /* GL_VERTEX_ATTRIB_ARRAY_ENABLED */, &mut enabled);
+        if enabled == 0 { continue; }
+        let mut size = 0;
+        let mut type_ = 0;
+        let mut stride = 0;
+        let mut buffer = 0;
+        let mut ptr: *mut GLvoid = std::ptr::null_mut();
+        gles.GetVertexAttribiv(index, 0x8623 /* GL_VERTEX_ATTRIB_ARRAY_SIZE */, &mut size);
+        gles.GetVertexAttribiv(index, 0x8625 /* GL_VERTEX_ATTRIB_ARRAY_TYPE */, &mut type_);
+        gles.GetVertexAttribiv(index, 0x8624 /* GL_VERTEX_ATTRIB_ARRAY_STRIDE */, &mut stride);
+        gles.GetVertexAttribiv(index, 0x889F /* GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING */, &mut buffer);
+        gles.GetVertexAttribPointerv(index, 0x8645 /* GL_VERTEX_ATTRIB_ARRAY_POINTER */, &mut ptr);
+        let first = if buffer == 0 && type_ as u32 == 0x1406 && !ptr.is_null() && mem.is_host_ptr_in_guest_mem(ptr) {
+            Some(std::slice::from_raw_parts(ptr.cast::<f32>(), (size as usize).min(4)).to_vec())
+        } else { None };
+        enabled_attribs.push((index, size, type_, stride, buffer, ptr as usize, first));
+    }
+    let mut active_uniform_count: GLint = 0;
+    gles.GetProgramiv(program as GLuint, 0x8B86 /* GL_ACTIVE_UNIFORMS */, &mut active_uniform_count);
+    let mut active_uniforms = Vec::new();
+    for index in 0..active_uniform_count.clamp(0, 32) as GLuint {
+        let mut name = [0_u8; 128];
+        let mut length: GLsizei = 0;
+        let mut size: GLint = 0;
+        let mut type_: GLenum = 0;
+        gles.GetActiveUniform(
+            program as GLuint,
+            index,
+            name.len() as GLsizei,
+            &mut length,
+            &mut size,
+            &mut type_,
+            name.as_mut_ptr().cast(),
+        );
+        let used = length.clamp(0, name.len() as GLsizei) as usize;
+        let uniform_name = String::from_utf8_lossy(&name[..used]).into_owned();
+        let c_name = std::ffi::CString::new(uniform_name.as_str()).unwrap();
+        let location = gles.GetUniformLocation(program as GLuint, c_name.as_ptr());
+        let value = if location < 0 {
+            "unused".to_string()
+        } else if type_ == 0x8B5C {
+            let mut value = [0.0_f32; 16];
+            gles.GetUniformfv(program as GLuint, location, value.as_mut_ptr());
+            format!("{:?}", value)
+        } else if matches!(type_, 0x1406 | 0x8B50 | 0x8B51 | 0x8B52) {
+            let mut value = [0.0_f32; 4];
+            gles.GetUniformfv(program as GLuint, location, value.as_mut_ptr());
+            let components = match type_ {
+                0x8B50 => 2,
+                0x8B51 => 3,
+                0x8B52 => 4,
+                _ => 1,
+            };
+            format!("{:?}", &value[..components])
+        } else {
+            "non-float uniform".to_string()
+        };
+        active_uniforms.push((uniform_name, size, type_, location, value));
+    }
+    let mut err = gles.GetError();
+    while err != 0 && errs.len() < 16 {
+        errs.push(err);
+        err = gles.GetError();
+    }
     log!(
         "ES2 draw state: fbo={} status={:#x} program={} texture={} \
          array_buf={} elem_buf={} renderbuffer={} viewport={:?} color_mask={:?} states={:?} attribs={:?} \
-         generic_attribs_used={} err={:?}",
+         active_count={} active_attribs={:?} enabled_attribs={:?} active_uniform_count={} active_uniforms={:?} generic_attribs_used={} err={:?}",
         fbo,
         status,
         program,
@@ -1799,6 +1979,11 @@ unsafe fn log_es2_draw_state_once(gles: &mut dyn GLES, shadow: &GLShadowState, m
         color_mask,
         states,
         attribs,
+        active_count,
+        active_attribs,
+        enabled_attribs,
+        active_uniform_count,
+        active_uniforms,
         shadow.generic_attribs_used,
         errs,
     );
@@ -1841,6 +2026,12 @@ fn glDrawElements(
         return;
     }
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        if count > 0 && indices.is_null() && !buffer_is_bound(gles, shadow, ELEMENT_ARRAY_BUFFER) {
+            log_once!(
+                "Skipping glDrawElements with positive count and null indices because no element buffer is bound"
+            );
+            return;
+        }
         log_es2_draw_state_once(gles, shadow, mem);
         let disabled_arrays = guard_client_vertex_arrays(gles, mem, shadow);
         let fog_state_backup = clamp_fog_state_values(gles, shadow);

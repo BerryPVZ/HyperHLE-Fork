@@ -574,6 +574,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     current_time
 }
 
+- (NSTimeInterval)deviceCurrentTime {
+    env.guest_clock
+        .now()
+        .duration_since(env.startup_time)
+        .as_secs_f64()
+}
+
 - (())setCurrentTime:(NSTimeInterval)currentTime {
     let host_object = env.objc.borrow_mut::<AVAudioPlayerHostObject>(this);
     host_object.set_current_time = currentTime;
@@ -783,10 +790,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         .map(|f| if f.sample_rate > 0.0 { f.sample_rate } else { 44100.0 })
         .unwrap_or(44100.0);
     (host.write_offset / bytes_per_frame) as f64 / sample_rate
-}
-
-- (NSTimeInterval)deviceCurrentTime {
-    msg![env; this currentTime]
 }
 
 - (())setMeteringEnabled:(bool)enabled {

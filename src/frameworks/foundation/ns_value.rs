@@ -32,6 +32,7 @@ use crate::frameworks::core_foundation::cf_number::{
 };
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::gl_kit::{GLKMatrix4, GLKVector2, GLKVector3, GLKVector4};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutVoidPtr};
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports,
@@ -47,6 +48,7 @@ pub(super) enum NSValueHostObject {
     CGRect(CGRect),
     NSRange(NSRange),
     CATransform3D(CATransform3D),
+    RawStruct { encoding: String, bytes: Vec<u8> },
 }
 impl Default for NSValueHostObject {
     // Phantom-fallback value; an empty `NSRange` is the closest "no info"
@@ -159,8 +161,38 @@ fn decode_scalar_number(
     })
 }
 
+fn glk_raw_struct_size(encoding: &str) -> Option<usize> {
+    if encoding.contains("_GLKMatrix4=") {
+        Some(64)
+    } else if encoding.contains("_GLKVector4=") {
+        Some(16)
+    } else if encoding.contains("_GLKVector3=") {
+        Some(12)
+    } else if encoding.contains("_GLKVector2=") {
+        Some(8)
+    } else {
+        None
+    }
+}
+
 /// Decode a struct type encoding such as `{CGPoint=ff}` into a value for
 /// an `NSValueHostObject`. Returns `None` for types we don't model.
+fn new_glk_raw_value<T>(env: &mut Environment, class: Class, encoding: &str, value: T) -> id {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (&value as *const T).cast::<u8>(),
+            std::mem::size_of::<T>(),
+        )
+    }
+    .to_vec();
+    let host_object = Box::new(NSValueHostObject::RawStruct {
+        encoding: encoding.to_owned(),
+        bytes,
+    });
+    let new = env.objc.alloc_object(class, host_object, &mut env.mem);
+    autorelease(env, new)
+}
+
 fn decode_struct_value(
     env: &Environment,
     value: ConstVoidPtr,
@@ -185,6 +217,12 @@ fn decode_struct_value(
     } else if enc.contains("NSRange") {
         let range: NSRange = env.mem.read(value.cast::<NSRange>());
         Some(NSValueHostObject::NSRange(range))
+    } else if let Some(size) = glk_raw_struct_size(enc) {
+        let bytes = env.mem.get_bytes_fallible(value, size as u32)?.to_vec();
+        Some(NSValueHostObject::RawStruct {
+            encoding: enc.to_owned(),
+            bytes,
+        })
     } else {
         None
     }
@@ -241,6 +279,22 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSValueHostObject::CATransform3D(value));
     let new = env.objc.alloc_object(this, host_object, &mut env.mem);
     autorelease(env, new)
+}
+
++ (id)valueWithGLKMatrix4:(GLKMatrix4)value {
+    new_glk_raw_value(env, this, "(_GLKMatrix4={?=ffffffffffffffff}[16f])", value)
+}
+
++ (id)valueWithGLKVector2:(GLKVector2)value {
+    new_glk_raw_value(env, this, "(_GLKVector2={?=ff}{?=ff}[2f])", value)
+}
+
++ (id)valueWithGLKVector3:(GLKVector3)value {
+    new_glk_raw_value(env, this, "(_GLKVector3={?=fff}{?=fff}{?=fff}[3f])", value)
+}
+
++ (id)valueWithGLKVector4:(GLKVector4)value {
+    new_glk_raw_value(env, this, "(_GLKVector4={?=ffff}{?=ffff}{?=ffff}[4f])", value)
 }
 
 + (id)valueWithNonretainedObject:(id)object {
@@ -321,6 +375,16 @@ pub const CLASSES: ClassExports = objc_classes! {
         (NSValueHostObject::CATransform3D(a), NSValueHostObject::CATransform3D(b)) => {
             a.equal_to(*b)
         }
+        (
+            NSValueHostObject::RawStruct {
+                encoding: a_encoding,
+                bytes: a_bytes,
+            },
+            NSValueHostObject::RawStruct {
+                encoding: b_encoding,
+                bytes: b_bytes,
+            },
+        ) => a_encoding == b_encoding && a_bytes == b_bytes,
         _ => false,
     }
 }
@@ -362,6 +426,9 @@ pub const CLASSES: ClassExports = objc_classes! {
                 m31, m32, m33, m34,
                 m41, m42, m43, m44,
             )
+        }
+        NSValueHostObject::RawStruct { encoding, bytes } => {
+            format!("NSValue: {} ({} bytes)", encoding, bytes.len())
         }
     };
     let ns = from_rust_string(env, s);
@@ -453,16 +520,15 @@ pub const CLASSES: ClassExports = objc_classes! {
 // for scalar values, so this only runs for the struct kinds we model.
 // Apple returns strings such as `{CGPoint=ff}` from `@encode(CGPoint)`.
 - (ConstVoidPtr)objCType {
-    let enc: &[u8] = match env.objc.borrow::<NSValueHostObject>(this) {
-        NSValueHostObject::CGPoint(_) => b"{CGPoint=ff}",
-        NSValueHostObject::CGSize(_) => b"{CGSize=ff}",
-        NSValueHostObject::CGRect(_) => b"{CGRect={CGPoint=ff}{CGSize=ff}}",
-        NSValueHostObject::NSRange(_) => b"{NSRange=II}",
-        NSValueHostObject::CATransform3D(_) => {
-            b"{CATransform3D=ffffffffffffffff}"
-        }
+    let enc = match env.objc.borrow::<NSValueHostObject>(this) {
+        NSValueHostObject::CGPoint(_) => b"{CGPoint=ff}".to_vec(),
+        NSValueHostObject::CGSize(_) => b"{CGSize=ff}".to_vec(),
+        NSValueHostObject::CGRect(_) => b"{CGRect={CGPoint=ff}{CGSize=ff}}".to_vec(),
+        NSValueHostObject::NSRange(_) => b"{NSRange=II}".to_vec(),
+        NSValueHostObject::CATransform3D(_) => b"{CATransform3D=ffffffffffffffff}".to_vec(),
+        NSValueHostObject::RawStruct { encoding, .. } => encoding.as_bytes().to_vec(),
     };
-    env.mem.alloc_and_write_cstr(enc).cast_void().cast_const()
+    env.mem.alloc_and_write_cstr(&enc).cast_void().cast_const()
 }
 
 // Generic `-getValue:` for struct-valued NSValues; writes the raw struct
@@ -501,6 +567,14 @@ pub const CLASSES: ClassExports = objc_classes! {
             let value = env.objc.borrow::<NSValueHostObject>(this);
             if let NSValueHostObject::CATransform3D(t) = value {
                 env.mem.write(buffer.cast::<CATransform3D>(), *t);
+            }
+        }
+        NSValueHostObject::RawStruct { bytes, .. } => {
+            if let Some(destination) = env
+                .mem
+                .get_bytes_fallible_mut(buffer.cast_const(), bytes.len() as u32)
+            {
+                destination.copy_from_slice(bytes);
             }
         }
     }
@@ -1218,4 +1292,30 @@ pub fn is_conversion_lossless(env: &mut Environment, this: id, type_: CFNumberTy
         }
     };
     msg![env; this isEqualToNumber:num2]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::glk_raw_struct_size;
+
+    #[test]
+    fn glk_opaque_value_sizes_match_guest_encodings() {
+        assert_eq!(
+            glk_raw_struct_size(r"(_GLKMatrix4={?=ffffffffffffffff}[16f])"),
+            Some(64)
+        );
+        assert_eq!(
+            glk_raw_struct_size(r"(_GLKVector2={?=ff}{?=ff}[2f])"),
+            Some(8)
+        );
+        assert_eq!(
+            glk_raw_struct_size(r"(_GLKVector4={?=ffff}{?=ffff}{?=ffff}[4f])"),
+            Some(16)
+        );
+        assert_eq!(
+            glk_raw_struct_size(r"(_GLKVector3={?=fff}{?=fff}{?=fff}[3f])"),
+            Some(12)
+        );
+        assert_eq!(glk_raw_struct_size("{CGPoint=ff}"), None);
+    }
 }

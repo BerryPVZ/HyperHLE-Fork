@@ -16,11 +16,11 @@ use super::{
     IMP, SEL,
 };
 use crate::bundle;
+use crate::fastmap::FxHashMap;
 use crate::mach_o::MachO;
 use crate::mem::{
     guest_size_of, ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutVoidPtr, Ptr, SafeRead,
 };
-use crate::fastmap::FxHashMap;
 use std::collections::{HashMap, VecDeque};
 
 /// Generic pointer to an Objective-C class or metaclass.
@@ -31,6 +31,13 @@ use std::collections::{HashMap, VecDeque};
 /// We could do the same thing here, but it doesn't seem worth it, as we can't
 /// get the same unidirectional type safety.
 pub type Class = id;
+
+#[derive(Copy, Clone)]
+pub(super) struct IvarInfo {
+    pub(super) offset: ConstPtr<GuestUSize>,
+    pub(super) alignment: u32,
+    pub(super) metadata: ConstVoidPtr,
+}
 
 /// Our internal representation of a class, e.g. this is where `objc_msgSend`
 /// will look up method implementations.
@@ -43,9 +50,8 @@ pub(super) struct ClassHostObject {
     pub(super) superclass: Class,
     pub(super) methods: FxHashMap<SEL, IMP>,
     pub(super) guest_method_signatures: FxHashMap<SEL, ConstPtr<u8>>,
-    /// Maps ivar name to a tuple of an offset (as pointer) and an alignment.
-    /// (Alignment is used during ivar reconciliation.)
-    pub(super) ivars: HashMap<String, (ConstPtr<GuestUSize>, u32)>,
+    /// Maps ivar names to metadata used by Objective-C runtime ivar APIs.
+    pub(super) ivars: HashMap<String, IvarInfo>,
     /// Scalar encodings/sizes for read-only trainer field identification.
     pub(super) scalar_ivars: HashMap<String, (u8, u32)>,
     /// Maps declared @property name to the guest-memory pointer of its
@@ -896,14 +902,38 @@ impl ObjC {
         while !queue.is_empty() {
             let next = queue.pop_front().unwrap();
             let (need, mut diff) = self.need_ivar_reconciliation(next);
+            if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") {
+                let (class_name, superclass, instance_start, instance_size) = {
+                    let host = self.borrow::<ClassHostObject>(next);
+                    (host.name.clone(), host.superclass, host.instance_start, host.instance_size)
+                };
+                if class_name.starts_with("CC") {
+                    let superclass_size = if superclass == nil {
+                        0
+                    } else {
+                        self.borrow::<ClassHostObject>(superclass).instance_size
+                    };
+                    log!(
+                        "IVAR-LAYOUT class={} start={} size={} superclass_size={} need={} diff={}",
+                        class_name,
+                        instance_start,
+                        instance_size,
+                        superclass_size,
+                        need,
+                        diff
+                    );
+                }
+            }
             if need {
-                let ClassHostObject {
-                    name, superclass, ..
-                } = self.borrow(next);
-                log_dbg!(
+                let (name, superclass) = {
+                    let host = self.borrow::<ClassHostObject>(next);
+                    (host.name.clone(), host.superclass)
+                };
+                let superclass_name = self.borrow::<ClassHostObject>(superclass).name.clone();
+                log!(
                     "Class {} need ivar reconciliation with superclass {}!",
                     name,
-                    &self.borrow::<ClassHostObject>(*superclass).name
+                    superclass_name
                 );
                 let ClassHostObject {
                     ref mut instance_start,
@@ -914,18 +944,37 @@ impl ObjC {
 
                 if !ivars.is_empty() {
                     let mut max_alignment: u32 = 1;
-                    for (offset, align) in ivars.values() {
-                        if !offset.is_null() {
-                            max_alignment = max_alignment.max(*align);
+                    for ivar in ivars.values() {
+                        if !ivar.offset.is_null() {
+                            max_alignment = max_alignment.max(ivar.alignment);
                         }
                     }
 
                     let align_mask = max_alignment - 1;
                     diff = (diff + align_mask) & !align_mask;
 
-                    for (offset, _) in ivars.values_mut() {
-                        if !offset.is_null() {
-                            *offset = Ptr::from_bits((*offset).to_bits() + diff);
+                    for ivar in ivars.values() {
+                        if !ivar.offset.is_null() {
+                            let old_offset = mem.read(ivar.offset);
+                            if let Some(adjusted_offset) = old_offset.checked_add(diff) {
+                                if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") && name.starts_with("CC") {
+                                    log!(
+                                        "IVAR-OFFSET class={} slot={:?} old={} diff={} new={}",
+                                        name,
+                                        ivar.offset,
+                                        old_offset,
+                                        diff,
+                                        adjusted_offset
+                                    );
+                                }
+                                mem.write(ivar.offset.cast_mut(), adjusted_offset);
+                            } else {
+                                log!(
+                                    "Warning: class {} ivar offset overflow while reconciling by {} bytes; leaving offset unchanged.",
+                                    name,
+                                    diff
+                                );
+                            }
                         }
                     }
                 }
@@ -1498,6 +1547,26 @@ fn imp_to_guest_ptr(env: &mut crate::Environment, cls: Class, sel: SEL, imp: IMP
     }
 }
 
+fn imp_to_callable_guest_ptr(
+    env: &mut crate::Environment,
+    imp: IMP,
+    message_send_symbol: &str,
+) -> ConstVoidPtr {
+    match imp {
+        IMP::Guest(guest_function) => guest_function.to_ptr(),
+        IMP::Host(_) => {
+            let dyld = &mut env.dyld;
+            let mem = &mut env.mem;
+            let cpu = &mut env.cpu;
+            dyld.create_proc_address(mem, cpu, message_send_symbol)
+                .map(|guest_function| {
+                    ConstVoidPtr::from_bits(guest_function.addr_with_thumb_bit())
+                })
+                .unwrap_or_else(|_| ConstVoidPtr::null())
+        }
+    }
+}
+
 /// Convert a guest `IMP` pointer received from the guest back into an [IMP].
 /// A pointer previously handed out for a host implementation is looked up in
 /// the token registry; anything else is treated as a guest code address.
@@ -2026,10 +2095,16 @@ pub fn objc_msgForward_stret(
 /// and new objects stay consistent with how a non-ARC manual
 /// retain/release would have managed them.
 pub fn objc_storeStrong(env: &mut crate::Environment, location: crate::mem::MutPtr<id>, obj: id) {
+    static TRACE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     if location.is_null() {
         return;
     }
     let prev = env.mem.read(location);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS")
+        && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 256
+    {
+        log!("ARC-STORE location={:?} prev={:?} new={:?}", location, prev, obj);
+    }
     if prev == obj {
         return;
     }
@@ -2073,7 +2148,7 @@ pub fn class_getMethodImplementation(
         return ConstVoidPtr::null();
     }
     match imp_at(env, defining, name) {
-        Some(imp) => imp_to_guest_ptr(env, defining, name, imp),
+        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend"),
         None => ConstVoidPtr::null(),
     }
 }
@@ -2086,7 +2161,17 @@ pub fn class_getMethodImplementation_stret(
     cls: Class,
     name: crate::objc::SEL,
 ) -> ConstVoidPtr {
-    class_getMethodImplementation(env, cls, name)
+    if cls.is_null() || name.is_null() {
+        return ConstVoidPtr::null();
+    }
+    let defining = find_defining_class(env, cls, name);
+    if defining.is_null() {
+        return ConstVoidPtr::null();
+    }
+    match imp_at(env, defining, name) {
+        Some(imp) => imp_to_callable_guest_ptr(env, imp, "_objc_msgSend_stret"),
+        None => ConstVoidPtr::null(),
+    }
 }
 
 pub fn objc_retainAutorelease(env: &mut crate::Environment, obj: id) -> id {
@@ -2640,12 +2725,10 @@ pub fn class_copyMethodList(
     buf
 }
 
-/// `Ivar *class_copyIvarList(Class cls, unsigned int *outCount)` — Apple's
-/// documented contract is the same NULL-terminated/malloc'd shape as the
-/// other `class_copy*List` calls. touchHLE doesn't model ivars as opaque
-/// `Ivar` structs (they're stored in a plain `host_object` map keyed by
-/// name), so we return NULL with `*outCount = 0`, which is the documented
-/// behaviour for a class that declares no ivars.
+/// `Ivar *class_copyIvarList(Class cls, unsigned int *outCount)` —
+/// `class_getInstanceVariable` and `object_getIvar` use the original opaque
+/// metadata pointers, but this class representation does not retain ivars in
+/// declaration order, so this list API currently returns NULL with `*outCount = 0`.
 pub fn class_copyIvarList(
     env: &mut crate::Environment,
     _cls: Class,
@@ -2761,6 +2844,7 @@ mod class_registration_tests {
     #[test]
     fn reconciliation_preserves_independent_roots_and_visits_their_children() {
         let (mut objc, mut mem) = runtime();
+        let offset = mem.alloc_and_write(8u32).cast_const();
         // Synthetic graph nodes: reconciliation uses class metadata, not isa.
         let root = objc.alloc_static_object(
             nil,
@@ -2783,6 +2867,14 @@ mod class_registration_tests {
             }),
             &mut mem,
         );
+        objc.borrow_mut::<ClassHostObject>(child).ivars.insert(
+            "_field".to_string(),
+            IvarInfo {
+                offset,
+                alignment: 4,
+                metadata: ConstVoidPtr::null(),
+            },
+        );
         objc.classes.insert("IndependentRoot".to_string(), root);
         objc.classes.insert("IndependentChild".to_string(), child);
         assert!(objc.get_class("NSObject", false, &mem).is_none());
@@ -2791,11 +2883,13 @@ mod class_registration_tests {
 
         assert!(objc.borrow::<ClassHostObject>(root).superclass == nil);
         let child_host = objc.borrow::<ClassHostObject>(child);
-        assert!(child_host.superclass == root);
+        assert_eq!(child_host.superclass, root);
         assert_eq!(child_host.instance_start, 16);
         assert_eq!(child_host.instance_size, 20);
-        // A second reconciliation must not grow the child a second time.
+        assert_eq!(mem.read(offset), 20);
+        assert_eq!(child_host.ivars["_field"].offset, offset);
         objc.reconcile_bin_class_ivars(&mut mem);
         assert_eq!(objc.borrow::<ClassHostObject>(child).instance_size, 20);
+        assert_eq!(mem.read(offset), 20);
     }
 }

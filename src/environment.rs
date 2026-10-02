@@ -2611,6 +2611,38 @@ impl Environment {
                 // exact `fault_pc` instead.
                 let pc = legacy_pc;
                 let lr = self.cpu.regs()[cpu::Cpu::LR];
+                if is_undefined_instruction
+                    && crate::env_flag_cached!("TOUCHHLE_TRACE_UDF_REGS")
+                {
+                    static TRACE_COUNT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    if pc >= 0x700000
+                        && TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+                    {
+                        let regs = self.cpu.regs();
+                        log_no_panic!(
+                            "UDF-REGS pc={:#x} lr={:#x} cpsr={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x} r7={:#x} r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} sp={:#x}",
+                            pc,
+                            lr,
+                            self.cpu.cpsr(),
+                            regs[0],
+                            regs[1],
+                            regs[2],
+                            regs[3],
+                            regs[4],
+                            regs[5],
+                            regs[6],
+                            regs[7],
+                            regs[8],
+                            regs[9],
+                            regs[10],
+                            regs[11],
+                            regs[12],
+                            regs[cpu::Cpu::SP],
+                        );
+                        self.stack_trace_current();
+                    }
+                }
                 // Potato Story Android hard fallback applies only to UDFs:
                 //
                 // The generic decoder did not match on-device, but Android

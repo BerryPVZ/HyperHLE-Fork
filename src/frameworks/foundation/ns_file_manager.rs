@@ -911,6 +911,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     nil
 }
 
+- (id)ubiquityIdentityToken {
+    nil
+}
+
 - (bool)isUbiquitousItemAtURL:(id)_url {
     // iCloud not supported
     false
@@ -950,9 +954,23 @@ pub const CLASSES: ClassExports = objc_classes! {
         return false;
     }
     let path = ns_string::to_rust_string(env, path);
-    env.fs
+    let exists = env
+        .fs
         .resolve_case_insensitive_path(GuestPath::new(&path))
-        .is_some()
+        .is_some();
+    let lower_path = path.to_ascii_lowercase();
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES")
+        && [".fnt", ".png", ".plist", ".jpg", ".jpeg"]
+            .iter()
+            .any(|extension| lower_path.ends_with(extension))
+    {
+        static RESOURCE_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if RESOURCE_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+            log!("[RESOURCE-TRACE] fileExists path={:?} exists={}", path, exists);
+        }
+    }
+    exists
 }
 
 - (bool)fileExistsAtPath:(id)path

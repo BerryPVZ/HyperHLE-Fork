@@ -436,16 +436,24 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
-- (bool)preflightAndReturnError:(id)_error { true }  // NSError**
+- (bool)preflightAndReturnError:(MutPtr<id>)error {
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
+    true
+}
 
 // `- (BOOL)loadAndReturnError:(NSError **)error;`
 //
 // Per Apple's [NSBundle Reference](https://developer.apple.com/documentation/foundation/nsbundle/1417447-loadandreturnerror):
 // "On output, if the bundle was not loaded successfully, this contains
 // an error object describing why; otherwise, it contains no value."
-// touchHLE always treats the bundle as loaded (see -load above), so we
-// never populate the out-error and return YES.
-- (bool)loadAndReturnError:(id)_error { // NSError**
+// touchHLE always treats the bundle as loaded (see -load above), so the
+// error out-parameter is explicitly set to nil.
+- (bool)loadAndReturnError:(MutPtr<id>)error {
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
     true
 }
 

@@ -9,6 +9,7 @@
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::foundation::ns_string;
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
+use crate::mem::MutPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
@@ -61,6 +62,12 @@ struct NSManagedObjectContextHostObject {
     merge_policy: id,
 }
 impl HostObject for NSManagedObjectContextHostObject {}
+
+fn clear_error_out_parameter(env: &mut crate::Environment, error: MutPtr<id>) {
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
+}
 
 // MARK: - NSManagedObject
 
@@ -352,7 +359,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)metadataForPersistentStoreOfType:(id)_store_type // NSString*
                                    URL:(id)_url        // NSURL*
-                                 error:(id)_error {    // NSError**
+                                 error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error);    // NSError**
     log!("NSPersistentStoreCoordinator metadataForPersistentStoreOfType:URL:error: stubbed");
     nil
 }
@@ -360,7 +368,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (bool)setMetadata:(id)_metadata               // NSDictionary*
     forPersistentStoreOfType:(id)_store_type    // NSString*
                          URL:(id)_url           // NSURL*
-                       error:(id)_error {       // NSError**
+                       error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error);       // NSError**
     log!("NSPersistentStoreCoordinator setMetadata:forPersistentStoreOfType:URL:error: stubbed");
     false
 }
@@ -414,7 +423,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                    configuration:(id)_configuration // NSString*
                               URL:(id)url            // NSURL*
                           options:(id)options        // NSDictionary*
-                            error:(id)_error {       // NSError**
+                            error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error);       // NSError**
     let type_str = if store_type != nil {
         ns_string::to_rust_string(env, store_type).into_owned()
     } else {
@@ -443,7 +453,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (bool)removePersistentStore:(id)store  // NSPersistentStore*
-                        error:(id)_error { // NSError**
+                        error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error); // NSError**
     let stores = env.objc.borrow::<NSPersistentStoreCoordinatorHostObject>(this).persistent_stores;
     () = msg![env; stores removeObject:store];
     true
@@ -453,7 +464,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                          toURL:(id)_url    // NSURL*
                        options:(id)_opts  // NSDictionary*
                        withType:(id)_type // NSString*
-                          error:(id)_err { // NSError**
+                          error:(MutPtr<id>)_err {
+    clear_error_out_parameter(env, _err); // NSError**
     log!("NSPersistentStoreCoordinator migratePersistentStore: stubbed -> false");
     false
 }
@@ -481,7 +493,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)executeRequest:(id)_request          // NSPersistentStoreRequest*
          withContext:(id)_context          // NSManagedObjectContext*
-               error:(id)_error {         // NSError**
+               error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error);         // NSError**
     log!("NSPersistentStoreCoordinator executeRequest:withContext:error: stubbed -> nil");
     nil
 }
@@ -726,7 +739,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     false
 }
 
-- (bool)save:(id)_error { // NSError**
+- (bool)save:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error); // NSError**
     log!("NSManagedObjectContext save: stubbed -> true");
     true
 }
@@ -748,19 +762,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)executeFetchRequest:(id)_request // NSFetchRequest*
-                    error:(id)_error { // NSError**
+                    error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error); // NSError**
     log!("NSManagedObjectContext executeFetchRequest:error: stubbed -> empty array");
     let arr: id = msg_class![env; NSArray new];
     autorelease(env, arr)
 }
 
 - (NSUInteger)countForFetchRequest:(id)_request // NSFetchRequest*
-                              error:(id)_error { // NSError**
+                              error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error); // NSError**
     0
 }
 
 - (id)existingObjectWithID:(id)_object_id // NSManagedObjectID*
-                     error:(id)_error {   // NSError**
+                     error:(MutPtr<id>)_error {
+    clear_error_out_parameter(env, _error);   // NSError**
     nil
 }
 

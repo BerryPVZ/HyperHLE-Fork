@@ -502,6 +502,27 @@ pub fn open_direct(env: &mut Environment, path: ConstPtr<u8>, flags: i32) -> Fil
         flags,
         res
     );
+    let lower_path = path_string.to_ascii_lowercase();
+    if lower_path.ends_with(".fnt")
+        || lower_path.ends_with(".png")
+        || lower_path.ends_with(".plist")
+        || lower_path.ends_with(".jpg")
+        || lower_path.ends_with(".jpeg")
+    {
+        static RESOURCE_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES")
+            && RESOURCE_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300
+        {
+            log!(
+                "[RESOURCE-TRACE] requested={:?} resolved={:?} flags={:#x} fd={}",
+                path_string,
+                actual_path_string,
+                flags,
+                res
+            );
+        }
+    }
     res
 }
 

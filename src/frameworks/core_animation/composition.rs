@@ -92,11 +92,12 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             .borrow::<CALayerHostObject>(fullscreen_eagl_layer)
             .presented_pixels
             .is_some();
-        if !force || !has_presented_pixels {
-            // No composition is needed during the normal run-loop tick:
-            // EAGLContext presents the fullscreen drawable directly. A forced
-            // tick only composes this layer when native ES1 readback has stored
-            // a resolved frame in its RAM-backed pixel buffer.
+        if (!force || !has_presented_pixels)
+            && !crate::frameworks::media_player::has_active_video(env)
+        {
+            // EAGLContext normally presents the fullscreen drawable directly.
+            // Native ES1 readback and movie overlays are the exceptions that
+            // need the Core Animation compositor.
             log_dbg!("Using CAEAGLLayer fast path, skipping composition");
             return None;
         }

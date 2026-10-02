@@ -11,6 +11,7 @@ use crate::frameworks::core_graphics::cg_context::CGContextSetRGBFillColor;
 use crate::frameworks::core_graphics::{cg_color, CGFloat};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::gl_kit::GLKVector4;
 use crate::mem::MutPtr;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
@@ -103,6 +104,12 @@ pub const CLASSES: ClassExports = objc_classes! {
              alpha:(CGFloat)a {
     let new: id = msg![env; this alloc];
     let new: id = msg![env; new initWithRed:r green:g blue:b alpha:a];
+    autorelease(env, new)
+}
+
++ (id)colorWithGLKVector4:(GLKVector4)value {
+    let new: id = msg![env; this alloc];
+    let new: id = msg![env; new initWithGLKVector4:value];
     autorelease(env, new)
 }
 
@@ -301,6 +308,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<UIColorHostObject>(this).cg_color =
         cg_color::from_rgba(env, (r, g, b, a));
     this
+}
+
+- (id)initWithGLKVector4:(GLKVector4)value {
+    let (red, green, blue, alpha) = (value.x, value.y, value.z, value.w);
+    msg![env; this initWithRed:red green:green blue:blue alpha:alpha]
 }
 
 // NSCoding implementation

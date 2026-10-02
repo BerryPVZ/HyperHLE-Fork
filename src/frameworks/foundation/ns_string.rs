@@ -2205,10 +2205,19 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithContentsOfFile:(id)path encoding:(NSStringEncoding)encoding error:(MutPtr<id>)error {
     if path == nil {
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
+        if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES") {
+            log!("[RESOURCE-TRACE] NSString initWithContentsOfFile:encoding:error: received nil path");
+        }
         release(env, this);
         return nil;
     }
     let path_str = to_rust_string(env, path);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES") && path_str.to_ascii_lowercase().ends_with(".fnt") {
+        log!("[RESOURCE-TRACE] NSString fnt path={:?} encoding={} error_out={:?}", path_str, encoding, error);
+    }
     let bytes = match env.fs.read(GuestPath::new(&path_str)) {
         Ok(b) => b,
         Err(_) => {
@@ -2220,6 +2229,24 @@ pub const CLASSES: ClassExports = objc_classes! {
             return nil;
         }
     };
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES")
+        && path_str.to_ascii_lowercase().ends_with(".fnt")
+    {
+        log!(
+            "[RESOURCE-TRACE] NSString read path={:?} bytes={} requested_encoding={} first_bytes={:02x?}",
+            path_str,
+            bytes.len(),
+            encoding,
+            &bytes[..bytes.len().min(16)]
+        );
+    }
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES") && path_str.to_ascii_lowercase().ends_with(".fnt") {
+        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(96)]);
+        log!("[RESOURCE-TRACE] NSString fnt bytes={} preview={:?}", bytes.len(), preview);
+    }
+    if !error.is_null() {
+        env.mem.write(error, nil);
+    }
     let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
     *env.objc.borrow_mut(this) = host_object;
     this
@@ -2227,6 +2254,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)initWithContentsOfFile:(id)path usedEncoding:(MutPtr<NSUInteger>)enc error:(MutPtr<id>)error {
     if path == nil {
+        if !error.is_null() {
+            env.mem.write(error, nil);
+        }
         release(env, this);
         return nil;
     }
@@ -2252,6 +2282,9 @@ pub const CLASSES: ClassExports = objc_classes! {
     };
     if !enc.is_null() {
         env.mem.write(enc, encoding);
+    }
+    if !error.is_null() {
+        env.mem.write(error, nil);
     }
     let host_object = StringHostObject::decode(Cow::Owned(bytes), encoding);
     *env.objc.borrow_mut(this) = host_object;

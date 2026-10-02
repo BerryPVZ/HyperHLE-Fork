@@ -1232,6 +1232,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.borrow_mut::<ArrayHostObject>(this).array = array;
 }
 
+- (())sortWithOptions:(NSUInteger)_options usingComparator:(id)block {
+    () = msg![env; this sortUsingComparator:block];
+}
+
 - (())sortUsingDescriptors:(id)descriptors { // NSArray* of NSSortDescriptor*
     super::ns_sort_descriptor::sort_with_descriptors(env, this, descriptors);
 }

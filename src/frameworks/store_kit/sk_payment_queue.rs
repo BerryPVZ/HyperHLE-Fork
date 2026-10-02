@@ -10,8 +10,8 @@
 //! `TOUCHHLE_IAP_EMULATION` environment variable), `addPayment:` completes the
 //! transaction locally as `SKPaymentTransactionStatePurchased`, so games that
 //! gate content behind StoreKit unlock it without any App Store contact.
-//! This only affects the emulated app inside touchHLE: no App Store, receipts
-//! or Apple servers are involved, and nothing outside this process changes.
+//! The emulator never contacts Apple or creates a genuine signed receipt.
+//! Apps may still make their usual network calls with the synthetic receipt.
 //!
 //! With emulation disabled (Cheat Engine inactive — the default), every
 //! entry point behaves exactly like the original pre-emulation stubs:
@@ -21,21 +21,33 @@
 
 use crate::frameworks::foundation::{ns_string, NSInteger, NSUInteger};
 use crate::frameworks::store_kit::{
-    emulation_enabled, SK_PAYMENT_TRANSACTION_STATE_PURCHASED, SK_PAYMENT_TRANSACTION_STATE_RESTORED,
+    emulation_enabled, SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
+    SK_PAYMENT_TRANSACTION_STATE_RESTORED,
 };
-use crate::objc::{autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr};
+use crate::objc::{
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    NSZonePtr,
+};
 use crate::Environment;
+
+const PURCHASE_PRODUCT_IDENTIFIERS_KEY: &str = "touchHLE.IAP.EmulatedProductIdentifiers.v1";
+const PURCHASE_TRANSACTION_IDENTIFIERS_KEY: &str = "touchHLE.IAP.EmulatedTransactionIdentifiers.v1";
 
 // MARK: - Per-process state
 
-/// Singleton cache and purchase history for `[SKPaymentQueue defaultQueue]`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PurchaseRecord {
+    product_identifier: String,
+    transaction_identifier: String,
+}
+
+/// Singleton cache and local purchase history for `[SKPaymentQueue defaultQueue]`.
 #[derive(Default)]
 pub struct State {
     default_queue: Option<id>,
     transaction_counter: u64,
-    /// Product identifiers "bought" this session; used by
-    /// `restoreCompletedTransactions`.
-    purchased: Vec<String>,
+    purchase_history_loaded: bool,
+    purchased: Vec<PurchaseRecord>,
 }
 
 impl State {
@@ -53,14 +65,26 @@ struct SKPaymentQueueHostObject {
 }
 impl HostObject for SKPaymentQueueHostObject {}
 
-/// Generate a fresh transaction identifier for emulated purchases.
-fn next_transaction_identifier(env: &mut Environment, prefix: &str) -> id {
+/// Generate a fresh, process-unique identifier for an emulated transaction.
+fn next_transaction_identifier(env: &mut Environment, prefix: &str) -> (String, id) {
     let number = {
         let state = State::get(env);
         state.transaction_counter += 1;
         state.transaction_counter
     };
-    ns_string::from_rust_string(env, format!("touchHLE.{prefix}.{number}"))
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let identifier = format!(
+        "touchHLE.{}.{}.{}.{}",
+        env.bundle.bundle_identifier(),
+        prefix,
+        timestamp,
+        number
+    );
+    let object = ns_string::from_rust_string(env, identifier.clone());
+    (identifier, object)
 }
 
 /// Read a guest NSString as an owned Rust string (empty if nil).
@@ -69,6 +93,100 @@ fn identifier_string(env: &mut Environment, string: id) -> String {
         return String::new();
     }
     ns_string::to_rust_string(env, string).into_owned()
+}
+
+fn purchase_history_from_identifiers(
+    product_identifiers: &[String],
+    transaction_identifiers: &[String],
+) -> Vec<PurchaseRecord> {
+    let mut purchases = Vec::new();
+    for (product_identifier, transaction_identifier) in
+        product_identifiers.iter().zip(transaction_identifiers)
+    {
+        remember_purchase_record(&mut purchases, product_identifier, transaction_identifier);
+    }
+    purchases
+}
+
+fn remember_purchase_record(
+    purchases: &mut Vec<PurchaseRecord>,
+    product_identifier: &str,
+    transaction_identifier: &str,
+) -> bool {
+    if product_identifier.is_empty()
+        || transaction_identifier.is_empty()
+        || purchases
+            .iter()
+            .any(|purchase| purchase.product_identifier == product_identifier)
+    {
+        return false;
+    }
+    purchases.push(PurchaseRecord {
+        product_identifier: product_identifier.to_owned(),
+        transaction_identifier: transaction_identifier.to_owned(),
+    });
+    true
+}
+
+fn load_purchase_history(env: &mut Environment) -> Vec<PurchaseRecord> {
+    let defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+    let product_key = ns_string::get_static_str(env, PURCHASE_PRODUCT_IDENTIFIERS_KEY);
+    let transaction_key = ns_string::get_static_str(env, PURCHASE_TRANSACTION_IDENTIFIERS_KEY);
+    let products: id = msg![env; defaults stringArrayForKey:product_key];
+    let transactions: id = msg![env; defaults stringArrayForKey:transaction_key];
+    let product_count: NSUInteger = msg![env; products count];
+    let transaction_count: NSUInteger = msg![env; transactions count];
+    if product_count != transaction_count {
+        log!(
+            "SKPaymentQueue: saved local purchase history has mismatched product/transaction counts ({} vs {}); keeping complete pairs only.",
+            product_count,
+            transaction_count
+        );
+    }
+    let mut product_identifiers = Vec::with_capacity(product_count as usize);
+    let mut transaction_identifiers = Vec::with_capacity(transaction_count as usize);
+    for index in 0..product_count {
+        let identifier: id = msg![env; products objectAtIndex:index];
+        product_identifiers.push(identifier_string(env, identifier));
+    }
+    for index in 0..transaction_count {
+        let identifier: id = msg![env; transactions objectAtIndex:index];
+        transaction_identifiers.push(identifier_string(env, identifier));
+    }
+    purchase_history_from_identifiers(&product_identifiers, &transaction_identifiers)
+}
+
+fn ensure_purchase_history_loaded(env: &mut Environment) {
+    if State::get(env).purchase_history_loaded {
+        return;
+    }
+    State::get(env).purchase_history_loaded = true;
+    let purchases = load_purchase_history(env);
+    State::get(env).purchased = purchases;
+}
+
+fn persist_purchase_history(env: &mut Environment) {
+    let purchases = State::get(env).purchased.clone();
+    let defaults: id = msg_class![env; NSUserDefaults standardUserDefaults];
+    let products: id = msg_class![env; NSMutableArray array];
+    let transactions: id = msg_class![env; NSMutableArray array];
+    for purchase in purchases {
+        let product_identifier = ns_string::from_rust_string(env, purchase.product_identifier);
+        let transaction_identifier =
+            ns_string::from_rust_string(env, purchase.transaction_identifier);
+        () = msg![env; products addObject:product_identifier];
+        () = msg![env; transactions addObject:transaction_identifier];
+        release(env, product_identifier);
+        release(env, transaction_identifier);
+    }
+    let product_key = ns_string::get_static_str(env, PURCHASE_PRODUCT_IDENTIFIERS_KEY);
+    let transaction_key = ns_string::get_static_str(env, PURCHASE_TRANSACTION_IDENTIFIERS_KEY);
+    () = msg![env; defaults setObject:products forKey:product_key];
+    () = msg![env; defaults setObject:transactions forKey:transaction_key];
+    let saved: bool = msg![env; defaults synchronize];
+    if !saved {
+        log!("Warning: failed to persist local StoreKit purchase history.");
+    }
 }
 
 /// Fields of an `SKPaymentTransaction`. Retained on assignment.
@@ -93,7 +211,9 @@ fn make_transaction(
 ) -> id {
     let transaction: id = msg_class![env; SKPaymentTransaction alloc];
     {
-        let host = env.objc.borrow_mut::<SKPaymentTransactionHostObject>(transaction);
+        let host = env
+            .objc
+            .borrow_mut::<SKPaymentTransactionHostObject>(transaction);
         host.state = state;
         host.transaction_identifier = transaction_identifier;
         host.payment = payment;
@@ -134,14 +254,19 @@ fn deliver_transactions(env: &mut Environment, queue: id, transactions: &[id]) {
     }
 }
 
-/// Remember a purchased identifier for later restore calls.
-fn remember_purchase(env: &mut Environment, identifier: &str) {
-    if identifier.is_empty() {
-        return;
-    }
-    let state = State::get(env);
-    if !state.purchased.iter().any(|seen| seen == identifier) {
-        state.purchased.push(identifier.to_owned());
+/// Remember a local purchase and persist it for later restore calls.
+fn remember_purchase(
+    env: &mut Environment,
+    product_identifier: &str,
+    transaction_identifier: &str,
+) {
+    ensure_purchase_history_loaded(env);
+    if remember_purchase_record(
+        &mut State::get(env).purchased,
+        product_identifier,
+        transaction_identifier,
+    ) {
+        persist_purchase_history(env);
     }
 }
 
@@ -156,10 +281,23 @@ fn payment_for_identifier(env: &mut Environment, identifier: &str) -> id {
 
 // MARK: - SKPayment
 
-#[derive(Default)]
 struct SKPaymentHostObject {
-    /// Retained identifier string, or nil.
     product_identifier: id,
+    application_username: id,
+    request_data: id,
+    quantity: NSInteger,
+    simulates_ask_to_buy_in_sandbox: bool,
+}
+impl Default for SKPaymentHostObject {
+    fn default() -> Self {
+        Self {
+            product_identifier: nil,
+            application_username: nil,
+            request_data: nil,
+            quantity: 1,
+            simulates_ask_to_buy_in_sandbox: false,
+        }
+    }
 }
 impl HostObject for SKPaymentHostObject {}
 
@@ -261,8 +399,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    remember_purchase(env, &identifier);
-    let transaction_identifier = next_transaction_identifier(env, "iap");
+    let (transaction_identifier_string, transaction_identifier) =
+        next_transaction_identifier(env, "iap");
+    remember_purchase(env, &identifier, &transaction_identifier_string);
     let transaction = make_transaction(
         env,
         SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
@@ -270,6 +409,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         transaction_identifier,
         nil,
     );
+    release(env, transaction_identifier);
     // The pending queue owns one reference; the pool guards the delivery call.
     retain(env, transaction);
     autorelease(env, transaction);
@@ -299,18 +439,31 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
         return;
     }
+    ensure_purchase_history_loaded(env);
     let purchased = State::get(env).purchased.clone();
     let mut restored: Vec<id> = Vec::new();
-    for identifier in &purchased {
-        let payment = payment_for_identifier(env, identifier);
-        let transaction_identifier = next_transaction_identifier(env, "restore");
+    for purchase in &purchased {
+        let payment = payment_for_identifier(env, &purchase.product_identifier);
+        let original_identifier =
+            ns_string::from_rust_string(env, purchase.transaction_identifier.clone());
+        let original_transaction = make_transaction(
+            env,
+            SK_PAYMENT_TRANSACTION_STATE_PURCHASED,
+            payment,
+            original_identifier,
+            nil,
+        );
+        release(env, original_identifier);
+        autorelease(env, original_transaction);
+        let (_, transaction_identifier) = next_transaction_identifier(env, "restore");
         let transaction = make_transaction(
             env,
             SK_PAYMENT_TRANSACTION_STATE_RESTORED,
             payment,
             transaction_identifier,
-            nil,
+            original_transaction,
         );
+        release(env, transaction_identifier);
         // The pending queue owns one reference; the pool guards delivery.
         retain(env, transaction);
         autorelease(env, transaction);
@@ -403,7 +556,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)paymentWithProductIdentifier:(id)identifier { // NSString*
-    let payment: id = msg_class![env; SKPayment alloc];
+    let payment: id = msg![env; this alloc];
     let payment: id = msg![env; payment initWithProductIdentifier:identifier];
     autorelease(env, payment)
 }
@@ -413,17 +566,22 @@ pub const CLASSES: ClassExports = objc_classes! {
         return nil;
     }
     let identifier: id = msg![env; product productIdentifier];
-    msg_class![env; SKPayment paymentWithProductIdentifier:identifier]
+    let payment: id = msg![env; this paymentWithProductIdentifier:identifier];
+    release(env, identifier);
+    payment
 }
 
 - (id)initWithProductIdentifier:(id)identifier {
-    {
+    let previous = {
         let host = env.objc.borrow_mut::<SKPaymentHostObject>(this);
+        let previous = host.product_identifier;
         host.product_identifier = identifier;
-    }
+        previous
+    };
     if identifier != nil {
         retain(env, identifier);
     }
+    release(env, previous);
     this
 }
 
@@ -441,16 +599,89 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (NSInteger)quantity {
-    1
+    env.objc.borrow::<SKPaymentHostObject>(this).quantity
+}
+
+- (id)applicationUsername {
+    let username = env
+        .objc
+        .borrow::<SKPaymentHostObject>(this)
+        .application_username;
+    if username != nil {
+        retain(env, username);
+    }
+    username
+}
+
+- (id)requestData {
+    let data = env.objc.borrow::<SKPaymentHostObject>(this).request_data;
+    if data != nil {
+        retain(env, data);
+    }
+    data
+}
+
+- (bool)simulatesAskToBuyInSandbox {
+    env.objc
+        .borrow::<SKPaymentHostObject>(this)
+        .simulates_ask_to_buy_in_sandbox
 }
 
 - (())dealloc {
-    let identifier = env
-        .objc
-        .borrow::<SKPaymentHostObject>(this)
-        .product_identifier;
+    let (identifier, username, request_data) = {
+        let host = env.objc.borrow::<SKPaymentHostObject>(this);
+        (
+            host.product_identifier,
+            host.application_username,
+            host.request_data,
+        )
+    };
     release(env, identifier);
+    release(env, username);
+    release(env, request_data);
     env.objc.dealloc_object(this, &mut env.mem)
+}
+
+@end
+
+@implementation SKMutablePayment: SKPayment
+
+- (())setQuantity:(NSInteger)quantity {
+    env.objc
+        .borrow_mut::<SKPaymentHostObject>(this)
+        .quantity = quantity.max(1);
+}
+
+- (())setApplicationUsername:(id)username {
+    let previous = {
+        let host = env.objc.borrow_mut::<SKPaymentHostObject>(this);
+        let previous = host.application_username;
+        host.application_username = username;
+        previous
+    };
+    if username != nil {
+        retain(env, username);
+    }
+    release(env, previous);
+}
+
+- (())setRequestData:(id)request_data {
+    let previous = {
+        let host = env.objc.borrow_mut::<SKPaymentHostObject>(this);
+        let previous = host.request_data;
+        host.request_data = request_data;
+        previous
+    };
+    if request_data != nil {
+        retain(env, request_data);
+    }
+    release(env, previous);
+}
+
+- (())setSimulatesAskToBuyInSandbox:(bool)simulates_ask_to_buy {
+    env.objc
+        .borrow_mut::<SKPaymentHostObject>(this)
+        .simulates_ask_to_buy_in_sandbox = simulates_ask_to_buy;
 }
 
 @end
@@ -563,3 +794,57 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{purchase_history_from_identifiers, remember_purchase_record, PurchaseRecord};
+
+    #[test]
+    fn purchase_history_keeps_one_stable_original_transaction_per_product() {
+        let products = ["coins.small", "coins.small", "unlock.pro"].map(str::to_owned);
+        let transactions = ["tx.first", "tx.second", "tx.pro"].map(str::to_owned);
+
+        assert_eq!(
+            purchase_history_from_identifiers(&products, &transactions),
+            vec![
+                PurchaseRecord {
+                    product_identifier: "coins.small".to_owned(),
+                    transaction_identifier: "tx.first".to_owned(),
+                },
+                PurchaseRecord {
+                    product_identifier: "unlock.pro".to_owned(),
+                    transaction_identifier: "tx.pro".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn purchase_history_ignores_empty_or_unpaired_identifiers() {
+        let products = ["", "valid.product", "unpaired.product"].map(str::to_owned);
+        let transactions = ["tx.empty", "tx.valid"].map(str::to_owned);
+        let mut history = purchase_history_from_identifiers(&products, &transactions);
+
+        assert_eq!(history.len(), 1);
+        assert!(!remember_purchase_record(&mut history, "", "tx.invalid"));
+        assert!(remember_purchase_record(
+            &mut history,
+            "new.product",
+            "tx.new"
+        ));
+        assert!(!remember_purchase_record(
+            &mut history,
+            "valid.product",
+            "tx.duplicate"
+        ));
+        assert_eq!(history.len(), 2);
+    }
+
+    #[test]
+    fn new_payments_default_to_one_item_without_ask_to_buy() {
+        let payment = super::SKPaymentHostObject::default();
+
+        assert_eq!(payment.quantity, 1);
+        assert!(!payment.simulates_ask_to_buy_in_sandbox);
+    }
+}

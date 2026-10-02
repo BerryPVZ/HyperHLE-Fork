@@ -185,7 +185,24 @@ pub const CLASSES: ClassExports = objc_classes! {
         return this;
     }
     let path_str = ns_string::to_rust_string(env, path);
-    let Ok(bytes) = env.fs.read(GuestPath::new(&path_str)) else {
+    let bytes = env.fs.read(GuestPath::new(&path_str));
+    let lower_path = path_str.to_ascii_lowercase();
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_RESOURCES")
+        && [".fnt", ".png", ".plist", ".jpg", ".jpeg"]
+            .iter()
+            .any(|extension| lower_path.ends_with(extension))
+    {
+        static RESOURCE_TRACE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        if RESOURCE_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+            log!(
+                "[RESOURCE-TRACE] UIImage path={:?} bytes={:?}",
+                path_str,
+                bytes.as_ref().map(Vec::len)
+            );
+        }
+    }
+    let Ok(bytes) = bytes else {
         env.objc.borrow_mut::<UIImageHostObject>(this).cg_image = get_dummy_cg_image(env);
         return this;
     };

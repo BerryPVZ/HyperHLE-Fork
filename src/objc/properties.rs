@@ -5,21 +5,33 @@
  */
 //! Handling of Objective-C properties.
 //!
-//! Note that these are not the same as instance variables (ivars), though
-//! they're closely related, so maybe this file will end up being used for those
-//! too.
+//! Objective-C properties and instance variables (ivars) are distinct, but
+//! both use class metadata. This module parses that metadata and implements the
+//! corresponding runtime accessors.
 //!
 //! Resources:
 //! - `objc_setProperty` and friends are not documented, so [reading the source code](https://opensource.apple.com/source/objc4/objc4-551.1/runtime/Accessors.subproj/objc-accessors.mm.auto.html) is useful.
 //!
 //! See also: [crate::frameworks::foundation::ns_object].
 
+use super::classes::IvarInfo;
 use super::{id, msg, nil, release, retain, Class, ClassHostObject, ObjC, SEL};
 use crate::mem::{
     guest_size_of, ConstPtr, ConstVoidPtr, GuestISize, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr,
     SafeRead,
 };
 use crate::{Environment, MutexType};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static IVAR_ACCESS_DIAGNOSTICS: AtomicUsize = AtomicUsize::new(0);
+
+fn trace_ivar_access(message: &str) {
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS")
+        && IVAR_ACCESS_DIAGNOSTICS.fetch_add(1, Ordering::Relaxed) < 96
+    {
+        log!("OBJC-IVAR {}", message);
+    }
+}
 
 /// The layout of a property list in an app binary.
 ///
@@ -114,7 +126,14 @@ impl ClassHostObject {
                     self.scalar_ivars.insert(name_string.into(), (code, width));
                 }
             }
-            self.ivars.insert(name_string.into(), (offset, alignment));
+            self.ivars.insert(
+                name_string.into(),
+                IvarInfo {
+                    offset,
+                    alignment,
+                    metadata: ivar_ptr.cast_void(),
+                },
+            );
         }
     }
 
@@ -171,32 +190,96 @@ impl ObjC {
     /// never messages guest objects or invokes the permissive fake-borrow path.
     /// The caller supplies the live allocation containing the candidate.
     pub(crate) fn diagnostic_scalar_field(
-        &self, mem: &Mem, base: u32, allocation_size: u32, addr: u32,
-        width: u32, encoding: u8,
+        &self,
+        mem: &Mem,
+        base: u32,
+        allocation_size: u32,
+        addr: u32,
+        width: u32,
+        encoding: u8,
     ) -> Option<&str> {
         let object = id::from_bits(base);
         self.get_host_object(object)?;
         let offset = addr.checked_sub(base)?;
-        if offset < 4 || offset.checked_add(width)? > allocation_size { return None; }
+        if offset < 4 || offset.checked_add(width)? > allocation_size {
+            return None;
+        }
         let bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(base), 4)?;
         let mut class = id::from_bits(u32::from_le_bytes(bytes.try_into().ok()?));
         let mut budget = 256usize;
         for _ in 0..16 {
-            let host = self.get_host_object(class)?.as_any()
+            let host = self
+                .get_host_object(class)?
+                .as_any()
                 .downcast_ref::<ClassHostObject>()?;
-            if host.is_metaclass { return None; }
+            if host.is_metaclass {
+                return None;
+            }
             for (name, &(code, size)) in &host.scalar_ivars {
                 budget = budget.checked_sub(1)?;
-                let code = match code { b'l' => b'i', b'L' => b'I', _ => code };
-                if code != encoding || size != width { continue; }
-                let (pointer, _) = host.ivars.get(name)?;
-                let bytes = mem.get_bytes_fallible(pointer.cast(), 4)?;
+                let code = match code {
+                    b'l' => b'i',
+                    b'L' => b'I',
+                    _ => code,
+                };
+                if code != encoding || size != width {
+                    continue;
+                }
+                let ivar = host.ivars.get(name)?;
+                let bytes = mem.get_bytes_fallible(ivar.offset.cast(), 4)?;
                 let field_offset = u32::from_le_bytes(bytes.try_into().ok()?);
                 if field_offset == offset && offset.checked_add(width)? <= host.instance_size {
                     return Some(name);
                 }
             }
-            if host.superclass == nil { break; }
+            if host.superclass == nil {
+                break;
+            }
+            class = host.superclass;
+        }
+        None
+    }
+
+    pub(crate) fn class_lookup_ivar(&self, mut class: Class, name: &str) -> Option<ConstVoidPtr> {
+        for _ in 0..256 {
+            if class == nil {
+                return None;
+            }
+            let host = self
+                .get_host_object(class)?
+                .as_any()
+                .downcast_ref::<ClassHostObject>()?;
+            if let Some(ivar) = host.ivars.get(name) {
+                return Some(ivar.metadata);
+            }
+            class = host.superclass;
+        }
+        None
+    }
+
+    pub(crate) fn class_lookup_ivar_offset_by_metadata(
+        &self,
+        mut class: Class,
+        metadata: ConstVoidPtr,
+    ) -> Option<ConstPtr<GuestUSize>> {
+        if metadata.is_null() {
+            return None;
+        }
+        for _ in 0..256 {
+            if class == nil {
+                return None;
+            }
+            let host = self
+                .get_host_object(class)?
+                .as_any()
+                .downcast_ref::<ClassHostObject>()?;
+            if let Some(ivar) = host
+                .ivars
+                .values()
+                .find(|ivar| ivar.metadata.to_bits() == metadata.to_bits())
+            {
+                return Some(ivar.offset);
+            }
             class = host.superclass;
         }
         None
@@ -218,10 +301,10 @@ impl ObjC {
                 ref ivars,
                 ..
             } = self.borrow(class);
-            if let Some((ivar_offset_ptr, _)) = ivars.get(name) {
-                let ivar_offset = mem.read(*ivar_offset_ptr);
-                let ivar_ptr = MutVoidPtr::from_bits(obj.to_bits() + ivar_offset);
-                return Some(ivar_ptr.cast());
+            if let Some(ivar) = ivars.get(name) {
+                let ivar_offset = mem.read(ivar.offset);
+                let address = obj.to_bits().checked_add(ivar_offset)?;
+                return Some(MutVoidPtr::from_bits(address).cast());
             } else if superclass == nil {
                 return None;
             } else {
@@ -249,6 +332,70 @@ impl ObjC {
         }
         ivars_strings
     }
+}
+
+fn object_ivar_value(objc: &ObjC, mem: &Mem, object: id, ivar: ConstVoidPtr) -> Option<id> {
+    if object == nil || ivar.is_null() {
+        return None;
+    }
+    let class = ObjC::read_isa(object, mem);
+    let offset_pointer = objc.class_lookup_ivar_offset_by_metadata(class, ivar)?;
+    if offset_pointer.is_null() {
+        return None;
+    }
+    let offset_bytes = mem.get_bytes_fallible(offset_pointer.cast(), 4)?;
+    let offset = u32::from_le_bytes(offset_bytes.try_into().ok()?);
+    let field_address = object.to_bits().checked_add(offset)?;
+    let value_bytes = mem.get_bytes_fallible(ConstVoidPtr::from_bits(field_address), 4)?;
+    Some(id::from_bits(u32::from_le_bytes(
+        value_bytes.try_into().ok()?,
+    )))
+}
+
+/// Returns the named ivar metadata, searching the class and its superclasses.
+pub fn class_getInstanceVariable(
+    env: &mut Environment,
+    class: Class,
+    name: ConstPtr<u8>,
+) -> MutVoidPtr {
+    if class == nil || name.is_null() {
+        return MutVoidPtr::null();
+    }
+    let Ok(name) = env.mem.cstr_at_utf8(name) else {
+        return MutVoidPtr::null();
+    };
+    let class_name = env.objc.get_class_name(class).to_string();
+    let ivar = env.objc.class_lookup_ivar(class, name);
+    trace_ivar_access(&format!(
+        "class_getInstanceVariable class={} name={} metadata={:?}",
+        class_name, name, ivar
+    ));
+    ivar.map(ConstVoidPtr::cast_mut)
+        .unwrap_or_else(MutVoidPtr::null)
+}
+
+/// Reads an object reference from the specified ivar, returning nil for nil or invalid inputs.
+pub fn object_getIvar(env: &mut Environment, object: id, ivar: MutVoidPtr) -> id {
+    let class_name = if object == nil {
+        "nil".to_string()
+    } else {
+        env.objc
+            .get_class_name(ObjC::read_isa(object, &env.mem))
+            .to_string()
+    };
+    let offset = if object == nil || ivar.is_null() {
+        None
+    } else {
+        env.objc
+            .class_lookup_ivar_offset_by_metadata(ObjC::read_isa(object, &env.mem), ivar.cast_const())
+            .map(|pointer| env.mem.read(pointer))
+    };
+    let value = object_ivar_value(&env.objc, &env.mem, object, ivar.cast_const()).unwrap_or(nil);
+    trace_ivar_access(&format!(
+        "object_getIvar class={} object={:?} ivar={:?} offset={:?} value={:?}",
+        class_name, object, ivar, offset, value
+    ));
+    value
 }
 
 /// Acquire the per-object recursive mutex used to protect `atomic`
@@ -320,6 +467,23 @@ pub(super) fn objc_getProperty(
         None
     };
 
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") && this != nil {
+        let class_name = env
+            .objc
+            .get_class_name(ObjC::read_isa(this, &env.mem))
+            .to_string();
+        if class_name.contains("CCDirector") {
+            trace_ivar_access(&format!(
+                "objc_getProperty class={} selector={} this={:?} offset={} atomic={}",
+                class_name,
+                _cmd.as_str(&env.mem),
+                this,
+                offset,
+                atomic
+            ));
+        }
+    }
+
     let Some(addr) = this.to_bits().checked_add_signed(offset) else {
         log!(
             "Warning: objc_getProperty: overflow computing ivar address for this={:#x}, offset={}; returning nil.",
@@ -331,6 +495,21 @@ pub(super) fn objc_getProperty(
     };
     let ivar: MutPtr<id> = Ptr::from_bits(addr);
     let value = env.mem.read(ivar);
+    if crate::env_flag_cached!("TOUCHHLE_TRACE_IVARS") && this != nil {
+        let class_name = env
+            .objc
+            .get_class_name(ObjC::read_isa(this, &env.mem))
+            .to_string();
+        if class_name.contains("CCDirector") {
+            trace_ivar_access(&format!(
+                "objc_getProperty result class={} selector={} offset={} value={:?}",
+                class_name,
+                _cmd.as_str(&env.mem),
+                offset,
+                value
+            ));
+        }
+    }
     unlock_property_atomic(env, lock);
     value
 }
@@ -613,29 +792,133 @@ mod trainer_metadata_tests {
         mem.set_null_segment_size(PAGE_SIZE);
         let mut objc = ObjC::new();
         let offset = mem.alloc_and_write(8u32).cast_const();
-        let mut host = ClassHostObject { instance_size: 16, ..Default::default() };
-        host.ivars.insert("_coins".into(), (offset, 2));
+        let mut host = ClassHostObject {
+            instance_size: 16,
+            ..Default::default()
+        };
+        host.ivars.insert(
+            "_coins".into(),
+            IvarInfo {
+                offset,
+                alignment: 2,
+                metadata: ConstVoidPtr::null(),
+            },
+        );
         host.scalar_ivars.insert("_coins".into(), (b'i', 4));
         let class = objc.alloc_static_object(nil, Box::new(host), &mut mem);
         let object = objc.alloc_object_sized(class, 16, Box::new(TrivialHostObject), &mut mem);
         let base = object.to_bits();
-        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'i'), Some("_coins"));
-        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 9, 4, b'i'), None);
-        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 1, b'C'), None);
-        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'f'), None);
-        assert_eq!(objc.diagnostic_scalar_field(&mem, base, 8, base + 8, 4, b'i'), None);
-        let subclass = objc.alloc_static_object(nil, Box::new(ClassHostObject {
-            superclass: class, instance_size: 16, ..Default::default()
-        }), &mut mem);
-        let inherited = objc.alloc_object_sized(subclass, 16, Box::new(TrivialHostObject), &mut mem).to_bits();
-        assert_eq!(objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 8, 4, b'i'), Some("_coins"));
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'i'),
+            Some("_coins")
+        );
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, base, 16, base + 9, 4, b'i'),
+            None
+        );
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 1, b'C'),
+            None
+        );
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, base, 16, base + 8, 4, b'f'),
+            None
+        );
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, base, 8, base + 8, 4, b'i'),
+            None
+        );
+        let subclass = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                superclass: class,
+                instance_size: 16,
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+        let inherited = objc
+            .alloc_object_sized(subclass, 16, Box::new(TrivialHostObject), &mut mem)
+            .to_bits();
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 8, 4, b'i'),
+            Some("_coins")
+        );
         // A corrupt superclass cycle is bounded instead of hanging the trainer.
         objc.borrow_mut::<ClassHostObject>(class).superclass = subclass;
-        assert_eq!(objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 12, 4, b'i'), None);
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, inherited, 16, inherited + 12, 4, b'i'),
+            None
+        );
         // Same isa bytes in an arbitrary allocation are NOT proof of an object.
         let raw = mem.alloc(16);
         mem.write(raw.cast(), class);
-        assert_eq!(objc.diagnostic_scalar_field(&mem, raw.to_bits(), 16, raw.to_bits() + 8, 4, b'i'), None);
+        assert_eq!(
+            objc.diagnostic_scalar_field(&mem, raw.to_bits(), 16, raw.to_bits() + 8, 4, b'i'),
+            None
+        );
+    }
+
+    #[test]
+    fn ivar_lookup_walks_superclasses_and_object_get_ivar_reads_guest_storage() {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        let mut objc = ObjC::new();
+        let original_offset = mem.alloc_and_write(8u32).cast_const();
+        let adjusted_offset = mem.alloc_and_write(12u32).cast_const();
+        let name = mem.alloc_and_write_cstr(b"_context").cast_const();
+        let type_ = mem.alloc_and_write_cstr(b"@").cast_const();
+        let entry_size = guest_size_of::<ivar_t>();
+        let list: MutPtr<ivar_list_t> = mem
+            .alloc(guest_size_of::<ivar_list_t>() + entry_size)
+            .cast();
+        mem.write(
+            list,
+            ivar_list_t {
+                entsize: entry_size,
+                count: 1,
+            },
+        );
+        mem.write(
+            (list + 1).cast(),
+            ivar_t {
+                offset: original_offset,
+                name,
+                type_,
+                alignment: 2,
+                size: 4,
+            },
+        );
+        let mut superclass_host = ClassHostObject {
+            instance_size: 12,
+            ..Default::default()
+        };
+        superclass_host.add_ivars_from_bin(list.cast_const(), &mem);
+        let expected_ivar_metadata = superclass_host.ivars.get("_context").unwrap().metadata;
+        superclass_host.ivars.get_mut("_context").unwrap().offset = adjusted_offset;
+        let superclass = objc.alloc_static_object(nil, Box::new(superclass_host), &mut mem);
+        let subclass = objc.alloc_static_object(
+            nil,
+            Box::new(ClassHostObject {
+                superclass,
+                instance_size: 16,
+                ..Default::default()
+            }),
+            &mut mem,
+        );
+        let object = objc.alloc_object_sized(subclass, 16, Box::new(TrivialHostObject), &mut mem);
+        let expected = id::from_bits(0x1234_5678);
+        mem.write(MutPtr::<id>::from_bits(object.to_bits() + 12), expected);
+
+        let ivar = objc.class_lookup_ivar(subclass, "_context").unwrap();
+        assert_eq!(ivar.to_bits(), expected_ivar_metadata.to_bits());
+        assert_eq!(object_ivar_value(&objc, &mem, object, ivar), Some(expected));
+        assert_eq!(objc.class_lookup_ivar(subclass, "_missing"), None);
+        assert_eq!(object_ivar_value(&objc, &mem, nil, ivar), None);
+        assert_eq!(
+            object_ivar_value(&objc, &mem, object, ConstVoidPtr::null()),
+            None
+        );
     }
 
     #[test]
@@ -646,11 +929,30 @@ mod trainer_metadata_tests {
         let name = mem.alloc_and_write_cstr(b"_money").cast_const();
         let size = guest_size_of::<ivar_t>();
         let list: MutPtr<ivar_list_t> = mem.alloc(guest_size_of::<ivar_list_t>() + size).cast();
-        mem.write(list, ivar_list_t { entsize: size, count: 1 });
+        mem.write(
+            list,
+            ivar_list_t {
+                entsize: size,
+                count: 1,
+            },
+        );
         let mut host = ClassHostObject::default();
-        for (encoding, expected) in [(b"i".as_slice(), true), (b"@".as_slice(), false), (b"^i".as_slice(), false)] {
+        for (encoding, expected) in [
+            (b"i".as_slice(), true),
+            (b"@".as_slice(), false),
+            (b"^i".as_slice(), false),
+        ] {
             let type_ = mem.alloc_and_write_cstr(encoding).cast_const();
-            mem.write((list + 1).cast(), ivar_t { offset, name, type_, alignment: 2, size: 4 });
+            mem.write(
+                (list + 1).cast(),
+                ivar_t {
+                    offset,
+                    name,
+                    type_,
+                    alignment: 2,
+                    size: 4,
+                },
+            );
             host.add_ivars_from_bin(list.cast_const(), &mem);
             assert_eq!(host.scalar_ivars.contains_key("_money"), expected);
         }

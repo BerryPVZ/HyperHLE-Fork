@@ -22,8 +22,8 @@
 use crate::dyld::{
     export_c_func, export_c_func_aliased, ConstantExports, FunctionExports, HostConstant, HostDylib,
 };
-use crate::MutexId;
 use crate::fastmap::{FxHashMap, FxHashSet};
+use crate::MutexId;
 
 mod classes;
 mod messages;
@@ -38,7 +38,7 @@ pub use classes::{
     __objc_deallocOnMainThreadHelper, class_addMethod, class_copyIvarList, class_copyMethodList,
     class_copyPropertyList, class_copyProtocolList, class_getClassMethod, class_getInstanceMethod,
     class_getInstanceSize, class_getMethodImplementation, class_getMethodImplementation_stret,
-    class_isMetaClass, class_getName, class_getProperty, class_getSuperclass, class_replaceMethod,
+    class_getName, class_getProperty, class_getSuperclass, class_isMetaClass, class_replaceMethod,
     class_respondsToSelector, class_setSuperclass, method_exchangeImplementations,
     method_getImplementation, method_getName, method_getTypeEncoding, method_setImplementation,
     objc_alloc, objc_allocWithZone, objc_allocateClassPair, objc_autorelease,
@@ -60,7 +60,7 @@ pub use methods::{HostIMP, IMP};
 pub use objects::{
     id, impl_HostObject_with_superclass, nil, AnyHostObject, HostObject, TrivialHostObject,
 };
-pub use properties::todo_objc_setter;
+pub use properties::{class_getInstanceVariable, object_getIvar, todo_objc_setter};
 pub use selectors::{selector, SEL};
 
 use crate::objc::classes::___objc_personality_v0;
@@ -418,6 +418,8 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_end_catch(_)),
     export_c_func!(class_getSuperclass(_)),
     export_c_func!(class_getInstanceSize(_, _)),
+    export_c_func!(class_getInstanceVariable(_, _)),
+    export_c_func!(object_getIvar(_, _)),
     export_c_func!(class_isMetaClass(_)),
     export_c_func!(class_getInstanceMethod(_, _)),
     export_c_func!(class_getClassMethod(_, _)),

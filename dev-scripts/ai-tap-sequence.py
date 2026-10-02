@@ -89,6 +89,7 @@ def tap(hwnd, fx, fy, tap_count=1):
             if n + 1 < tap_count:
                 time.sleep(0.08)
     else:
+        subprocess.run(["xdotool", "windowfocus", "--sync", str(hwnd)], check=True)
         subprocess.run(
             ["xdotool", "mousemove", "--sync", "--window", str(hwnd), str(x), str(y)],
             check=True,
@@ -169,6 +170,8 @@ def main():
     log = open(log_path, "w", encoding="utf-8", errors="replace")
     env = os.environ.copy()
     env["RUST_BACKTRACE"] = "full"
+    if args.require_touch_delivery:
+        env["TOUCHHLE_TRACE_TOUCHES"] = "1"
     try:
         proc = subprocess.Popen(
             [str(exe), str(app), "--print-fps", *extra],

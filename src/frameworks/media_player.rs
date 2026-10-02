@@ -51,3 +51,7 @@ pub struct State {
 pub fn handle_players(env: &mut crate::Environment) {
     movie_player::handle_players(env);
 }
+
+pub fn has_active_video(env: &mut crate::Environment) -> bool {
+    movie_player::has_active_video(env)
+}

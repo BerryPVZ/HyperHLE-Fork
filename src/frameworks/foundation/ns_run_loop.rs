@@ -383,7 +383,8 @@ pub fn run_run_loop(
             let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
-            let next_due = core_animation::recomposite_if_necessary(env, false);
+            let force_video_composition = media_player::has_active_video(env);
+            let next_due = core_animation::recomposite_if_necessary(env, force_video_composition);
             limit_sleep_time(&mut sleep_until, next_due);
         }
 

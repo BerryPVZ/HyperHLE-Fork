@@ -120,22 +120,41 @@ fn CFBinaryHeapGetMinimum(env: &mut Environment, heap: MutVoidPtr) -> ConstVoidP
     heap_vec.first().copied().unwrap_or(Ptr::null())
 }
 
+fn remove_minimum(heap: &mut Vec<ConstVoidPtr>) {
+    if !heap.is_empty() {
+        heap.remove(0);
+    }
+}
+
 fn CFBinaryHeapRemoveMinimum(env: &mut Environment, heap: MutVoidPtr) {
     if heap.is_null() {
         return;
     }
     let id: u32 = env.mem.read(heap.cast::<u32>());
-    let Some(heap_vec) = env
+    if let Some(heap_vec) = env
         .framework_state
         .core_foundation
         .cf_binary_heap
         .heaps
         .get_mut(&id)
-    else {
+    {
+        remove_minimum(heap_vec);
+    }
+}
+
+fn CFBinaryHeapRemoveMinimumValue(env: &mut Environment, heap: MutVoidPtr) {
+    if heap.is_null() {
         return;
-    };
-    if !heap_vec.is_empty() {
-        heap_vec.remove(0);
+    }
+    let id: u32 = env.mem.read(heap.cast::<u32>());
+    if let Some(heap_vec) = env
+        .framework_state
+        .core_foundation
+        .cf_binary_heap
+        .heaps
+        .get_mut(&id)
+    {
+        remove_minimum(heap_vec);
     }
 }
 
@@ -161,5 +180,26 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFBinaryHeapGetCount(_)),
     export_c_func!(CFBinaryHeapGetMinimum(_)),
     export_c_func!(CFBinaryHeapRemoveMinimum(_)),
+    export_c_func!(CFBinaryHeapRemoveMinimumValue(_)),
     export_c_func!(CFBinaryHeapRemoveAllValues(_)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::remove_minimum;
+    use crate::mem::ConstVoidPtr;
+
+    #[test]
+    fn remove_minimum_value_removes_first_value() {
+        let first = ConstVoidPtr::from_bits(0x1000);
+        let second = ConstVoidPtr::from_bits(0x2000);
+        let mut heap = vec![first, second];
+
+        remove_minimum(&mut heap);
+        assert_eq!(heap, vec![second]);
+        remove_minimum(&mut heap);
+        assert!(heap.is_empty());
+        remove_minimum(&mut heap);
+        assert!(heap.is_empty());
+    }
+}

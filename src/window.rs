@@ -48,6 +48,49 @@ fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> b
     !gles_native && !angle_unavailable
 }
 
+#[cfg(any(target_os = "android", test))]
+fn angle_backend_unsafe_on_power_vr_bxm_8_256(description: &str) -> bool {
+    let description = description.to_ascii_lowercase();
+    description.contains("angle")
+        && description.contains("vulkan")
+        && description.contains("bxm-8-256")
+}
+
+#[cfg(test)]
+mod android_angle_fallback_tests {
+    use super::angle_backend_unsafe_on_power_vr_bxm_8_256;
+
+    #[test]
+    fn rejects_power_vr_bxm_8_256_vulkan_angle() {
+        let renderer = concat!(
+            "OpenGL ES 1.1 (ANGLE) / Google Inc. (Imagination Technologies) / ",
+            "ANGLE (Vulkan 1.1.170 (PowerVR BXM-8-256 (0x35010101)))",
+        );
+        assert!(angle_backend_unsafe_on_power_vr_bxm_8_256(renderer));
+    }
+
+    #[test]
+    fn accepts_other_angle_renderers() {
+        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (Qualcomm) / ANGLE (Vulkan 1.3 (Adreno))"
+        ));
+    }
+
+    #[test]
+    fn accepts_other_power_vr_vulkan_renderers() {
+        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+            "OpenGL ES 3.2 (ANGLE) / Google Inc. (Imagination Technologies) / ANGLE (Vulkan 1.1 (PowerVR Rogue GE8320))"
+        ));
+    }
+
+    #[test]
+    fn accepts_native_power_vr_bxm_8_256_renderer() {
+        assert!(!angle_backend_unsafe_on_power_vr_bxm_8_256(
+            "OpenGL ES 3.2 / Imagination Technologies / PowerVR BXM-8-256"
+        ));
+    }
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum DeviceFamily {
@@ -773,7 +816,8 @@ impl Window {
         }
     }
 
-    /// Create the window, retrying with native GLES if bundled ANGLE fails.
+    /// Create the window, retrying with native GLES if bundled ANGLE is unavailable
+    /// or unsafe.
     pub fn new(
         title: &str,
         icon: Option<Image>,
@@ -820,7 +864,7 @@ impl Window {
                         Err(angle_error) => {
                             ANDROID_ANGLE_UNAVAILABLE.store(true, Ordering::Relaxed);
                             log!(
-                                "Bundled ANGLE initialization failed: {}. Retrying with the Android native GLES driver.",
+                                "Bundled ANGLE could not be used: {}. Retrying with the Android native GLES driver.",
                                 angle_error
                             );
                             configure_android_angle_driver(false);
@@ -832,7 +876,7 @@ impl Window {
                             )
                             .map_err(|native_error| {
                                 format!(
-                                    "Bundled ANGLE initialization failed ({}); native GLES fallback failed ({})",
+                                    "Bundled ANGLE could not be used ({}); native GLES fallback failed ({})",
                                     angle_error, native_error
                                 )
                             });
@@ -1136,6 +1180,14 @@ impl Window {
         window.gl_driver_description = gl_driver_description;
         window.internal_gl_ins = Some(gl_ins);
 
+        #[cfg(target_os = "android")]
+        if angle_backend_unsafe_on_power_vr_bxm_8_256(&window.gl_driver_description) {
+            return Err(format!(
+                "ANGLE's Vulkan backend is disabled for PowerVR BXM-8-256 after its startup crash: {}",
+                window.gl_driver_description
+            ));
+        }
+
         // Swap interval. EGL's swap interval is a property of the window
         // surface, which every context created for this window shares, so
         // setting it once here (with the internal context current) covers the
@@ -1177,8 +1229,8 @@ impl Window {
 
         // Detect the host GL stack once, up front, so we can auto-apply the
         // known Adreno black-screen workarounds. Android uses bundled ANGLE
-        // whenever its libraries are available; the system driver is only a
-        // fallback if ANGLE cannot be loaded.
+        // only when its active renderer passes the startup compatibility check;
+        // otherwise Window::new retries with the system OpenGL ES driver.
         window.log_gpu_backend_hints();
 
         if window.splash_image.is_some() {
@@ -1416,6 +1468,9 @@ impl Window {
                     }
                     let coords = transform_input_coords(self, abs_coords, false);
                     log_dbg!("MouseButtonDown x {}, y {}, coords {:?}", x, y, coords);
+                    if crate::env_flag_cached!("TOUCHHLE_TRACE_TOUCHES") {
+                        log!("SDL mouse-down delivered at ({}, {}) -> {:?}", x, y, coords);
+                    }
                     Event::TouchesDown(HashMap::from([(FingerId::Mouse, coords)]))
                 }
                 E::MouseMotion {

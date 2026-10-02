@@ -26,7 +26,7 @@ use crate::objc::{
 use crate::options::{Options, PresentMode};
 use crate::Environment;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -158,6 +158,10 @@ pub(super) struct GLShadowState {
     pub(super) guest_bound_attribs: HashMap<GLuint, std::collections::HashSet<String>>,
     /// Dimensions and format for PVRTC levels expanded to RGBA storage.
     pub(super) pvrtc_texture_levels: HashMap<(GLenum, GLuint, GLint), (GLsizei, GLsizei, GLenum)>,
+    pub(super) current_vertex_array: GLuint,
+    pub(super) software_vertex_arrays: HashSet<GLuint>,
+    pub(super) software_vao_element_array_buffers: HashMap<GLuint, GLuint>,
+    pub(super) next_software_vertex_array: GLuint,
 }
 impl Default for GLShadowState {
     fn default() -> Self {
@@ -171,6 +175,10 @@ impl Default for GLShadowState {
             generic_attribs_used: false,
             guest_bound_attribs: HashMap::new(),
             pvrtc_texture_levels: HashMap::new(),
+            current_vertex_array: 0,
+            software_vertex_arrays: HashSet::new(),
+            software_vao_element_array_buffers: HashMap::new(),
+            next_software_vertex_array: 1,
         }
     }
 }
@@ -190,6 +198,11 @@ impl GLShadowState {
         }
         if self.element_array_buffer == Some(deleted) {
             self.element_array_buffer = Some(0);
+        }
+        for (_, buffer) in self.software_vao_element_array_buffers.iter_mut() {
+            if *buffer == deleted {
+                *buffer = 0;
+            }
         }
     }
     pub(super) fn record_pvrtc_texture_level(
@@ -225,6 +238,54 @@ impl GLShadowState {
     pub(super) fn forget_pvrtc_texture(&mut self, texture: GLuint) {
         self.pvrtc_texture_levels
             .retain(|key, _| key.1 != texture);
+    }
+    pub(super) fn record_element_array_buffer_binding(&mut self, buffer: GLuint) {
+        self.element_array_buffer = Some(buffer);
+        self.software_vao_element_array_buffers
+            .insert(self.current_vertex_array, buffer);
+    }
+    pub(super) fn bind_software_vertex_array(&mut self, array: GLuint) -> GLuint {
+        if let Some(binding) = self.element_array_buffer {
+            self.software_vao_element_array_buffers
+                .insert(self.current_vertex_array, binding);
+        }
+        self.current_vertex_array = array;
+        let binding = *self
+            .software_vao_element_array_buffers
+            .entry(array)
+            .or_insert(0);
+        self.element_array_buffer = Some(binding);
+        binding
+    }
+    pub(super) fn generate_software_vertex_array(&mut self) -> GLuint {
+        let mut name = self.next_software_vertex_array.max(1);
+        while self.software_vertex_arrays.contains(&name) {
+            name = name.wrapping_add(1).max(1);
+        }
+        self.next_software_vertex_array = name.wrapping_add(1).max(1);
+        self.software_vertex_arrays.insert(name);
+        self.software_vao_element_array_buffers.entry(name).or_insert(0);
+        name
+    }
+    pub(super) fn is_software_vertex_array(&self, array: GLuint) -> bool {
+        array != 0 && self.software_vertex_arrays.contains(&array)
+    }
+    pub(super) fn delete_software_vertex_array(&mut self, array: GLuint) -> Option<GLuint> {
+        if array == 0 || !self.software_vertex_arrays.remove(&array) {
+            return None;
+        }
+        self.software_vao_element_array_buffers.remove(&array);
+        if self.current_vertex_array == array {
+            self.current_vertex_array = 0;
+            let binding = *self
+                .software_vao_element_array_buffers
+                .entry(0)
+                .or_insert(0);
+            self.element_array_buffer = Some(binding);
+            Some(binding)
+        } else {
+            None
+        }
     }
 }
 
@@ -803,6 +864,12 @@ pub const CLASSES: ClassExports = objc_classes! {
     // plain log!() would flood, but the very first call is a key signal that
     // the app actually got past splash/init and is rendering.
     log_once!("[EAGLContext presentRenderbuffer:] first call (app reached first frame)");
+    {
+        static INPUT_POLL_THREAD_LOGGED: std::sync::Once = std::sync::Once::new();
+        INPUT_POLL_THREAD_LOGGED.call_once(|| {
+            log!("EAGL event polling first reached on guest thread {}", env.current_thread);
+        });
+    }
 
     // Frame-count milestones. presentRenderbuffer is called every frame, so we
     // want a small, fixed number of log lines that prove the render loop is
@@ -1042,12 +1109,42 @@ pub const CLASSES: ClassExports = objc_classes! {
             // it, there's no point in presenting the output because it won't be
             // seen. Using a noisy log because it's a weird scenario and might
             // indicate a bug.
-            log!(
-                "Layer {:?} is not the fullscreen layer {:?}, skipping presentation of renderbuffer {:?}!",
-                drawable,
-                fullscreen_layer,
-                renderbuffer,
-            );
+            static LAYER_MISMATCH_DIAGNOSTIC_LOGGED: std::sync::Once = std::sync::Once::new();
+            LAYER_MISMATCH_DIAGNOSTIC_LOGGED.call_once(|| {
+                let drawable_view: id = msg![env; drawable delegate];
+                let fullscreen_view: id = msg![env; fullscreen_layer delegate];
+                let drawable_view_class = if drawable_view == nil {
+                    "(nil)".to_string()
+                } else {
+                    let class: crate::objc::Class = msg![env; drawable_view class];
+                    env.objc.get_class_name(class).to_owned()
+                };
+                let fullscreen_view_class = if fullscreen_view == nil {
+                    "(nil)".to_string()
+                } else {
+                    let class: crate::objc::Class = msg![env; fullscreen_view class];
+                    env.objc.get_class_name(class).to_owned()
+                };
+                let drawable_view_hidden = if drawable_view == nil {
+                    false
+                } else {
+                    msg![env; drawable_view isHidden]
+                };
+                let fullscreen_view_hidden = if fullscreen_view == nil {
+                    false
+                } else {
+                    msg![env; fullscreen_view isHidden]
+                };
+                log!(
+                    "EAGL layer mismatch: drawable {:?} owner={} hidden={}, selected fullscreen layer {:?} owner={} hidden={}",
+                    drawable,
+                    drawable_view_class,
+                    drawable_view_hidden,
+                    fullscreen_layer,
+                    fullscreen_view_class,
+                    fullscreen_view_hidden
+                );
+            });
             if let Some(frame_due) = frame_due {
                 pace_frame(env, frame_due);
             }
