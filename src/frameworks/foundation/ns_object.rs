@@ -694,7 +694,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     // counting colons and declaring every argument an object loses that ABI.
     let types = env.objc.object_get_method_signature(&env.mem, this, selector).copied();
     if let Some(types) = types {
-        return msg_class![env; NSMethodSignature signatureWithObjCTypes:(types.cast_mut().cast())];
+        let types: MutVoidPtr = types.cast_mut().cast();
+        return msg_class![env; NSMethodSignature signatureWithObjCTypes:types];
     }
     let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
     let sel_str = selector.as_str(&env.mem);
