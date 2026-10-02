@@ -335,6 +335,10 @@ fn objc_msgSend_inner(
         }
     }
 
+    if super2.is_none() && super::runtime_hooks::intercept(env, orig_class, selector) {
+        return;
+    }
+
     // ULTRAHLE_MINIONJUMP_TAP_BRIDGE_BEGIN
     // Minion Jump / SheepEscape: map Cocos2D GrowButton/GrowStarButton objects
     // to their real target+selector callbacks. This is app-gated so Potato and

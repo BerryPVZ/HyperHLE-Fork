@@ -30,6 +30,7 @@ mod messages;
 mod methods;
 mod objects;
 mod properties;
+pub(crate) mod runtime_hooks;
 mod selectors;
 mod synchronization;
 mod weak;
