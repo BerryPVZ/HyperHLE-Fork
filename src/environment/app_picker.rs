@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 struct AppInfo {
     path: PathBuf,
     display_name: String,
+    bundle_identifier: String,
     icon: Option<Image>,
     /// `NSString*`
     display_name_ns_string: Option<id>,
@@ -92,7 +93,7 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
                 };
 
                 let display_name = bundle.display_name().to_owned();
-                let icon = match bundle.load_icon(&fs) {
+                let icon = match bundle.load_icon_with_sheen(&fs, true) {
                     Ok(icon) => Some(icon),
                     Err(e) => {
                         log!("Warning: couldn't load icon for app bundle {}: {} (displaying placeholder instead)", app_path.display(), e);
@@ -103,6 +104,7 @@ fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
                 apps.push(AppInfo {
                     path: app_path,
                     display_name,
+                    bundle_identifier: bundle.bundle_identifier().to_owned(),
                     icon,
                     display_name_ns_string: None,
                     icon_ui_image: None,
@@ -162,6 +164,19 @@ struct AppPickerDelegateHostObject {
     add_ipa: bool,
     quick_options_show: bool,
     quick_options_hide: bool,
+    flex_show: bool,
+    flex_hide: bool,
+    flex_save: bool,
+    flex_page: i32,
+    flex_enabled: Option<bool>,
+    page_swipe: i32,
+    flex_browse: bool,
+    browser_close: bool,
+    browser_back: bool,
+    browser_filter: bool,
+    browser_page: i32,
+    browser_row: Option<usize>,
+    browser_return: Option<&'static str>,
     scale_hack_default: bool,
     scale_hack1: bool,
     scale_hack2: bool,
@@ -222,6 +237,31 @@ const CLASSES: ClassExports = objc_classes! {
 - (())quickOptionsHide {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).quick_options_hide = true;
 }
+- (())flexShow { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_show = true; }
+- (())flexHide { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_hide = true; }
+- (())flexSave { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_save = true; }
+- (())flexPrevious { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_page = -1; }
+- (())flexNext { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_page = 1; }
+- (())flexBrowse { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_browse = true; }
+- (())flexBrowserClose { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_close = true; }
+- (())flexBrowserBack { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_back = true; }
+- (())flexBrowserFilter { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_filter = true; }
+- (())flexBrowserPrevious { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_page = -1; }
+- (())flexBrowserNext { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_page = 1; }
+- (())flexBrowserSelect:(id)sender {
+    let row: NSInteger = msg![env; sender tag];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_row = Some(row as usize);
+}
+- (())flexBrowserFalse { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("false"); }
+- (())flexBrowserTrue { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("true"); }
+- (())flexBrowserNil { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("nil"); }
+- (())flexBrowserSkip { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).browser_return = Some("skip"); }
+- (())flexEnabled:(id)sender {
+    let enabled: bool = msg![env; sender isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).flex_enabled = Some(enabled);
+}
+- (())pickerSwipeLeft:(id)_sender { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).page_swipe = 1; }
+- (())pickerSwipeRight:(id)_sender { env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).page_swipe = -1; }
 - (())scaleHackDefault {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).scale_hack_default = true;
 }
@@ -560,6 +600,27 @@ fn app_picker_inner(
         quick_options_gles_native,
         quick_options_gles_native_switch_enabled,
     );
+    let flex_panel = setup_flex_panel(env, delegate, quick_options_stuff.main_view, app_frame);
+    let browser_panel = setup_flex_browser(env, delegate, flex_panel.view, app_frame);
+    let mut browser = FlexBrowserState::default();
+    let mut flex_index = 0usize;
+    let mut flex_open = false;
+    let mut flex_enabled = env.options.runtime_hooks_enabled;
+    () = msg![env; (flex_panel.toggle) setOn:flex_enabled];
+    use crate::frameworks::uikit::ui_gesture_recognizer::{
+        UISwipeGestureRecognizerDirectionLeft, UISwipeGestureRecognizerDirectionRight,
+    };
+    for (direction, action) in [
+        (UISwipeGestureRecognizerDirectionLeft, "pickerSwipeLeft:"),
+        (UISwipeGestureRecognizerDirectionRight, "pickerSwipeRight:"),
+    ] {
+        let gesture: id = msg_class![env; UISwipeGestureRecognizer alloc];
+        let action = env.objc.lookup_selector(action).unwrap();
+        let gesture: id = msg![env; gesture initWithTarget:delegate action:action];
+        () = msg![env; gesture setDirection:direction];
+        () = msg![env; main_view addGestureRecognizer:gesture];
+        release(env, gesture);
+    }
     let mut quick_options_scale_hack: Option<NonZeroU32> = None;
     let mut quick_options_fullscreen: Option<()> = None;
     let mut quick_options_orientation: Option<DeviceOrientation> = None;
@@ -631,36 +692,113 @@ fn app_picker_inner(
     // process exits.
     let app_path = loop {
         run_run_loop_single_iteration(env, main_run_loop);
+        let (show, hide, save, step, enabled, swipe) = {
+            let h = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+            (
+                std::mem::take(&mut h.flex_show),
+                std::mem::take(&mut h.flex_hide),
+                std::mem::take(&mut h.flex_save),
+                std::mem::take(&mut h.flex_page),
+                h.flex_enabled.take(),
+                std::mem::take(&mut h.page_swipe),
+            )
+        };
+        if let Some(enabled) = enabled {
+            flex_enabled = enabled;
+        }
+        if show {
+            flex_open = true;
+            flex_index = 0;
+            refresh_flex_panel(
+                env,
+                &flex_panel,
+                apps.as_ref().ok().map(|a| a.as_slice()),
+                flex_index,
+            );
+            () = msg![env; (flex_panel.view) setHidden:false];
+        }
+        if hide {
+            let _: bool = msg![env; (flex_panel.editor) resignFirstResponder];
+            () = msg![env; (flex_panel.view) setHidden:true];
+            flex_open = false;
+        }
+        if save || (step != 0 && flex_open) {
+            if let Some(app) = apps.as_ref().ok().and_then(|a| a.get(flex_index)) {
+                let text: id = msg![env; (flex_panel.editor) text];
+                let text = ns_string::to_rust_string(env, text).into_owned();
+                match crate::objc::runtime_hooks::save(&app.bundle_identifier, &text) {
+                    Ok(()) => {
+                        set_flex_label(
+                            env,
+                            flex_panel.status,
+                            "Saved. # disables a rule; delete its line to remove it.",
+                        );
+                        if step != 0 {
+                            let count = apps.as_ref().unwrap().len();
+                            flex_index =
+                                (flex_index as i32 + step).rem_euclid(count as i32) as usize;
+                            refresh_flex_panel(
+                                env,
+                                &flex_panel,
+                                apps.as_ref().ok().map(|a| a.as_slice()),
+                                flex_index,
+                            );
+                        }
+                    }
+                    Err(e) => set_flex_label(env, flex_panel.status, &e),
+                }
+            }
+        }
+        handle_flex_browser(
+            env,
+            delegate,
+            &browser_panel,
+            &mut browser,
+            &flex_panel,
+            apps.as_ref().ok().and_then(|a| a.get(flex_index)),
+        );
+        if swipe != 0 && !flex_open {
+            let hidden: bool = msg![env; (quick_options_stuff.main_view) isHidden];
+            if hidden {
+                if let (Some(grid), Ok(apps)) = (&mut icon_grid_stuff, &mut apps) {
+                    let page = current_page as i32 + swipe;
+                    if page >= 0 && (page as usize) < grid.pages.len() {
+                        animate_icon_page(
+                            env,
+                            grid,
+                            apps,
+                            current_page,
+                            page as usize,
+                            app_frame.size.width,
+                            main_run_loop,
+                        );
+                        current_page = page as usize;
+                    }
+                }
+            }
+        }
         let host_obj = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
         let icon_tapped = std::mem::take(&mut host_obj.icon_tapped);
         if icon_tapped != nil {
             match icon_grid_stuff.as_ref().unwrap().icon_map.get(&icon_tapped) {
                 Some(&TappedIcon::App(app_idx)) => {
-                    // Provide visual feedback that the app has been picked
-                    // (it may take a while for the splash screen to appear etc)
-                    () = msg![env; icon_tapped setAlpha:(0.5 as CGFloat)];
-                    // Redraw screen, even if this makes the next frame early
-                    // (the app picker will never be redrawn after this).
-                    crate::frameworks::core_animation::recomposite_if_necessary(
-                        env, /* force: */ true,
-                    );
-                    // Ensure touchHLE is responsive from the OS perspective,
-                    // otherwise screen redraw might not show up? (Unclear if
-                    // this explanation is correct.)
-                    run_run_loop_single_iteration(env, main_run_loop);
+                    animate_icon_launch(env, main_view, icon_tapped, app_frame, main_run_loop);
 
                     let app_path = &apps.as_ref().unwrap()[app_idx].path;
                     echo!("Picked: {}", app_path.display());
                     break app_path.clone();
                 }
                 Some(&TappedIcon::ChangePage(page_idx)) => {
-                    current_page = page_idx;
-                    update_icon_grid(
+                    animate_icon_page(
                         env,
                         icon_grid_stuff.as_mut().unwrap(),
                         apps.as_mut().unwrap(),
+                        current_page,
                         page_idx,
+                        app_frame.size.width,
+                        main_run_loop,
                     );
+                    current_page = page_idx;
                 }
                 Some(&TappedIcon::AddIpa) => {
                     // Handled by the main loop body below (next iteration).
@@ -888,6 +1026,7 @@ fn app_picker_inner(
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
+    option_args.push(if flex_enabled { "--flex" } else { "--no-flex" }.to_string());
     if quick_options_show_fps {
         // Reuse existing CLI flag to enable FPS logging/counter behaviour.
         option_args.push("--print-fps".to_string());
@@ -954,12 +1093,250 @@ fn app_picker_quick_options_button_top(app_height: CGFloat) -> CGFloat {
 }
 
 fn app_picker_icon_grid_num_rows(app_height: CGFloat, label_height: CGFloat) -> usize {
-    let grid_bottom = app_picker_quick_options_button_top(app_height)
-        - APP_PICKER_GRID_TO_BUTTON_GAP;
+    let grid_bottom =
+        app_picker_quick_options_button_top(app_height) - APP_PICKER_GRID_TO_BUTTON_GAP;
     let cell_content_height = ICON_SIZE.height + ICON_LABEL_TOP_GAP + label_height;
     let cell_step_y = cell_content_height + ICON_ROW_GAP;
     let available_height = (grid_bottom - APP_PICKER_GRID_TOP - cell_content_height).max(0.0);
     ((available_height / cell_step_y).floor() as usize + 1).clamp(1, APP_PICKER_ICON_ROWS)
+}
+
+struct FlexPanel {
+    view: id,
+    title: id,
+    status: id,
+    editor: id,
+    toggle: id,
+}
+fn set_flex_label(env: &mut Environment, label: id, text: &str) {
+    let text = ns_string::from_rust_string(env, text.to_owned());
+    () = msg![env; label setText:text];
+    release(env, text);
+}
+fn flex_label(env: &mut Environment, parent: id, frame: CGRect, size: CGFloat) -> id {
+    let label: id = msg_class![env; UILabel alloc];
+    let label: id = msg![env; label initWithFrame:frame];
+    let font: id = msg_class![env; UIFont systemFontOfSize:size];
+    let color: id = msg_class![env; UIColor blackColor];
+    () = msg![env; label setFont:font];
+    () = msg![env; label setTextColor:color];
+    () = msg![env; label setNumberOfLines:0];
+    () = msg![env; parent addSubview:label];
+    release(env, label);
+    label
+}
+fn setup_flex_panel(env: &mut Environment, delegate: id, parent: id, frame: CGRect) -> FlexPanel {
+    let view: id = msg_class![env; UIView alloc];
+    let view: id = msg![env; view initWithFrame:frame];
+    let white: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; view setBackgroundColor:white];
+    () = msg![env; parent addSubview:view];
+    () = msg![env; view setHidden:true];
+    let width = frame.size.width;
+    let rect = |y, height| CGRect {
+        origin: CGPoint { x: 10.0, y },
+        size: CGSize {
+            width: width - 20.0,
+            height,
+        },
+    };
+    let title = flex_label(env, view, rect(8.0, 42.0), 16.0);
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        70.0,
+        &[
+            ("Previous", "flexPrevious"),
+            ("Next", "flexNext"),
+            ("Save", "flexSave"),
+            ("Back", "flexHide"),
+        ],
+        Some(12.0),
+    );
+    let enabled_label = flex_label(env, view, rect(95.0, 30.0), 15.0);
+    set_flex_label(env, enabled_label, "Enable Flex");
+    let toggle: id = msg_class![env; UISwitch alloc];
+    let toggle: id = msg![env; toggle init];
+    let toggle_frame = CGRect {
+        origin: CGPoint {
+            x: width - 100.0,
+            y: 95.0,
+        },
+        size: CGSize {
+            width: 80.0,
+            height: 30.0,
+        },
+    };
+    () = msg![env; toggle setFrame:toggle_frame];
+    let action = env.objc.lookup_selector("flexEnabled:").unwrap();
+    () = msg![env; toggle addTarget:delegate action:action forControlEvents:UIControlEventValueChanged];
+    () = msg![env; view addSubview:toggle];
+    let help = flex_label(env, view, rect(130.0, 65.0), 12.0);
+    set_flex_label(env, help, "One rule per line: - Class selector false\n+ Class selector nil (class method)\nReturns: nil, true, false, integer, skip (void). # disables.");
+    let editor: id = msg_class![env; UITextView alloc];
+    let editor_frame = rect(200.0, (frame.size.height - 310.0).max(50.0));
+    let editor: id = msg![env; editor initWithFrame:editor_frame];
+    let font: id = msg_class![env; UIFont systemFontOfSize:(14.0 as CGFloat)];
+    () = msg![env; editor setFont:font];
+    () = msg![env; editor setEditable:true];
+    () = msg![env; view addSubview:editor];
+    let status = flex_label(env, view, rect(frame.size.height - 100.0, 45.0), 12.0);
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        frame.size.height - 30.0,
+        &[("Browse methods", "flexBrowse"), ("Save hooks", "flexSave")],
+        Some(16.0),
+    );
+    release(env, view);
+    release(env, toggle);
+    release(env, editor);
+    FlexPanel {
+        view,
+        title,
+        status,
+        editor,
+        toggle,
+    }
+}
+fn refresh_flex_panel(
+    env: &mut Environment,
+    panel: &FlexPanel,
+    apps: Option<&[AppInfo]>,
+    index: usize,
+) {
+    if let Some(app) = apps.and_then(|a| a.get(index)) {
+        set_flex_label(env, panel.title, &format!("Flex: {}", app.display_name));
+        match crate::objc::runtime_hooks::load(&app.bundle_identifier) {
+            Ok(text) => {
+                set_flex_label(env, panel.editor, &text);
+                set_flex_label(env, panel.status, &app.bundle_identifier);
+            }
+            Err(e) => {
+                set_flex_label(env, panel.editor, "");
+                set_flex_label(env, panel.status, &e);
+            }
+        }
+    } else {
+        set_flex_label(env, panel.title, "Flex: no installed apps");
+        set_flex_label(env, panel.editor, "");
+    }
+}
+
+fn animate_picker(
+    env: &mut Environment,
+    run_loop: id,
+    duration: f32,
+    mut draw: impl FnMut(&mut Environment, CGFloat),
+) {
+    let start = Instant::now();
+    loop {
+        let t = (start.elapsed().as_secs_f32() / duration).min(1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        draw(env, eased as CGFloat);
+        crate::frameworks::core_animation::recomposite_if_necessary(env, true);
+        run_run_loop_single_iteration(env, run_loop);
+        if t >= 1.0 {
+            break;
+        }
+    }
+}
+fn animate_icon_page(
+    env: &mut Environment,
+    grid: &mut IconGridStuff,
+    apps: &mut [AppInfo],
+    old: usize,
+    new: usize,
+    width: CGFloat,
+    run_loop: id,
+) {
+    if old == new {
+        return;
+    }
+    let views: Vec<(id, CGRect)> = grid
+        .icon_buttons_and_labels
+        .iter()
+        .flat_map(|&(button, label)| [button, label])
+        .map(|view| {
+            let frame: CGRect = msg![env; view frame];
+            (view, frame)
+        })
+        .collect();
+    for &(view, _) in &views {
+        () = msg![env; view setUserInteractionEnabled:false];
+    }
+    let direction = if new > old { -1.0 } else { 1.0 };
+    animate_picker(env, run_loop, 0.14, |env, t| {
+        for &(view, mut frame) in &views {
+            frame.origin.x += direction * width * t;
+            () = msg![env; view setFrame:frame];
+        }
+    });
+    update_icon_grid(env, grid, apps, new);
+    animate_picker(env, run_loop, 0.14, |env, t| {
+        for &(view, mut frame) in &views {
+            frame.origin.x -= direction * width * (1.0 - t);
+            () = msg![env; view setFrame:frame];
+        }
+    });
+    for &(view, _) in &views {
+        () = msg![env; view setUserInteractionEnabled:true];
+    }
+}
+fn animate_icon_launch(
+    env: &mut Environment,
+    parent: id,
+    button: id,
+    screen: CGRect,
+    run_loop: id,
+) {
+    () = msg![env; parent setUserInteractionEnabled:false];
+    let overlay: id = msg_class![env; UIView alloc];
+    let overlay: id = msg![env; overlay initWithFrame:screen];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; overlay setBackgroundColor:black];
+    () = msg![env; parent addSubview:overlay];
+    let image: id = msg![env; button imageForState:UIControlStateNormal];
+    let icon: id = msg_class![env; UIImageView alloc];
+    let icon: id = msg![env; icon initWithImage:image];
+    let mut start: CGRect = msg![env; button frame];
+    start.origin.x += ICON_IMAGE_INSET;
+    start.origin.y += ICON_IMAGE_INSET;
+    start.size.width -= ICON_IMAGE_INSET * 2.0;
+    start.size.height -= ICON_IMAGE_INSET * 2.0;
+    () = msg![env; overlay addSubview:icon];
+    let side = screen.size.width.max(screen.size.height) * 1.5;
+    let end = CGRect {
+        origin: CGPoint {
+            x: (screen.size.width - side) / 2.0,
+            y: (screen.size.height - side) / 2.0,
+        },
+        size: CGSize {
+            width: side,
+            height: side,
+        },
+    };
+    animate_picker(env, run_loop, 0.32, |env, t| {
+        let frame = CGRect {
+            origin: CGPoint {
+                x: start.origin.x + (end.origin.x - start.origin.x) * t,
+                y: start.origin.y + (end.origin.y - start.origin.y) * t,
+            },
+            size: CGSize {
+                width: start.size.width + (end.size.width - start.size.width) * t,
+                height: start.size.height + (end.size.height - start.size.height) * t,
+            },
+        };
+        () = msg![env; icon setFrame:frame];
+        let alpha: CGFloat = 1.0 - ((t - 0.7) / 0.3).max(0.0);
+        () = msg![env; icon setAlpha:alpha];
+    });
+    release(env, icon);
+    release(env, overlay);
 }
 
 #[cfg(test)]
@@ -969,7 +1346,10 @@ mod layout_tests {
     #[test]
     fn classic_phone_picker_has_four_icon_rows() {
         // A visible status bar leaves `UIScreen.applicationFrame` at 320x460.
-        assert_eq!(app_picker_icon_grid_num_rows(460.0, 12.0), APP_PICKER_ICON_ROWS);
+        assert_eq!(
+            app_picker_icon_grid_num_rows(460.0, 12.0),
+            APP_PICKER_ICON_ROWS
+        );
     }
 }
 
@@ -1503,6 +1883,7 @@ fn setup_quick_options(
         ]),
         RowKind::Label("Device model"),
         RowKind::DeviceDropdown,
+        RowKind::Buttons(&[("Flex runtime hooks", "flexShow")]),
         RowKind::Label("Cheat Engine"),
         RowKind::Switch("cheatEngine:", cheat_engine_enabled, true),
         RowKind::Label("Network access"),
@@ -1962,5 +2343,370 @@ mod quick_options_gles_native_tests {
             quick_options_gles_native_argument(enabled),
             "--no-gles-native"
         );
+    }
+}
+
+#[derive(Default)]
+struct FlexBrowserState {
+    classes: Vec<crate::mach_o::objc_browser::ClassInfo>,
+    class: Option<usize>,
+    methods: Vec<crate::mach_o::objc_browser::MethodInfo>,
+    selected: Option<usize>,
+    query: String,
+    page: usize,
+    visible: Vec<usize>,
+    error: Option<String>,
+}
+struct FlexBrowserPanel {
+    view: id,
+    title: id,
+    filter: id,
+    rows: Vec<id>,
+    returns: Vec<id>,
+}
+fn setup_flex_browser(
+    env: &mut Environment,
+    delegate: id,
+    parent: id,
+    frame: CGRect,
+) -> FlexBrowserPanel {
+    let view: id = msg_class![env; UIView alloc];
+    let view: id = msg![env; view initWithFrame:frame];
+    let white: id = msg_class![env; UIColor whiteColor];
+    () = msg![env; view setBackgroundColor:white];
+    () = msg![env; parent addSubview:view];
+    () = msg![env; view setHidden:true];
+    let title = flex_label(
+        env,
+        view,
+        CGRect {
+            origin: CGPoint { x: 10.0, y: 5.0 },
+            size: CGSize {
+                width: frame.size.width - 20.0,
+                height: 45.0,
+            },
+        },
+        14.0,
+    );
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        68.0,
+        &[("Classes", "flexBrowserBack"), ("Done", "flexBrowserClose")],
+        Some(14.0),
+    );
+    let filter: id = msg_class![env; UITextField alloc];
+    let filter_frame = CGRect {
+        origin: CGPoint { x: 10.0, y: 88.0 },
+        size: CGSize {
+            width: frame.size.width - 20.0,
+            height: 28.0,
+        },
+    };
+    let filter: id = msg![env; filter initWithFrame:filter_frame];
+    let placeholder = ns_string::get_static_str(env, "Filter classes or methods");
+    () = msg![env; filter setPlaceholder:placeholder];
+    let gray: id = msg_class![env; UIColor lightGrayColor];
+    () = msg![env; filter setBackgroundColor:gray];
+    let black: id = msg_class![env; UIColor blackColor];
+    () = msg![env; filter setTextColor:black];
+    () = msg![env; view addSubview:filter];
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        136.0,
+        &[("Apply filter", "flexBrowserFilter")],
+        Some(13.0),
+    );
+    let count = ((frame.size.height - 255.0) / 34.0).floor().max(1.0) as usize;
+    let mut rows = Vec::new();
+    for index in 0..count {
+        let button = make_button_row(
+            env,
+            delegate,
+            view,
+            frame.size,
+            171.0 + index as CGFloat * 34.0,
+            &[("", "flexBrowserSelect:")],
+            Some(12.0),
+        )[0];
+        let tag = index as NSInteger;
+        () = msg![env; button setTag:tag];
+        rows.push(button);
+    }
+    make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        frame.size.height - 65.0,
+        &[
+            ("Previous page", "flexBrowserPrevious"),
+            ("Next page", "flexBrowserNext"),
+        ],
+        Some(12.0),
+    );
+    let returns = make_button_row(
+        env,
+        delegate,
+        view,
+        frame.size,
+        frame.size.height - 25.0,
+        &[
+            ("false", "flexBrowserFalse"),
+            ("true", "flexBrowserTrue"),
+            ("nil", "flexBrowserNil"),
+            ("skip", "flexBrowserSkip"),
+        ],
+        Some(13.0),
+    );
+    release(env, filter);
+    release(env, view);
+    FlexBrowserPanel {
+        view,
+        title,
+        filter,
+        rows,
+        returns,
+    }
+}
+fn refresh_flex_browser(
+    env: &mut Environment,
+    panel: &FlexBrowserPanel,
+    state: &mut FlexBrowserState,
+) {
+    let query = state.query.to_lowercase();
+    let filtered: Vec<usize> = if state.class.is_some() {
+        state
+            .methods
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.selector.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        state
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let pages = filtered.len().div_ceil(panel.rows.len()).max(1);
+    state.page = state.page.min(pages - 1);
+    state.visible = filtered
+        .into_iter()
+        .skip(state.page * panel.rows.len())
+        .take(panel.rows.len())
+        .collect();
+    let title = if let Some(error) = &state.error {
+        error.clone()
+    } else if let Some(method) = state.selected.and_then(|i| state.methods.get(i)) {
+        format!(
+            "{} {}\nReturn: {}",
+            if method.class_method { "+" } else { "-" },
+            method.selector,
+            method.return_description()
+        )
+    } else if let Some(index) = state.class {
+        format!(
+            "{}: methods ({}/{})",
+            state.classes[index].name,
+            state.page + 1,
+            pages
+        )
+    } else {
+        format!(
+            "{} classes ({}/{})",
+            state.classes.len(),
+            state.page + 1,
+            pages
+        )
+    };
+    set_flex_label(env, panel.title, &title);
+    for (slot, &button) in panel.rows.iter().enumerate() {
+        let index = state.visible.get(slot).copied();
+        let hidden = index.is_none();
+        () = msg![env; button setHidden:hidden];
+        if let Some(index) = index {
+            let title = if state.class.is_some() {
+                let method = &state.methods[index];
+                format!(
+                    "{} {}  [{}]",
+                    if method.class_method { "+" } else { "-" },
+                    method.selector,
+                    method.encoding
+                )
+            } else {
+                state.classes[index].name.clone()
+            };
+            let title = ns_string::from_rust_string(env, title);
+            () = msg![env; button setTitle:title forState:UIControlStateNormal];
+            release(env, title);
+            let color: id = if state.class.is_some() && state.selected == Some(index) {
+                msg_class![env; UIColor blueColor]
+            } else {
+                msg_class![env; UIColor grayColor]
+            };
+            () = msg![env; button setBackgroundColor:color];
+        }
+    }
+    for (&button, value) in panel.returns.iter().zip(["false", "true", "nil", "skip"]) {
+        let enabled = state
+            .selected
+            .and_then(|i| state.methods.get(i))
+            .map_or(false, |m| m.accepts(value));
+        () = msg![env; button setEnabled:enabled];
+        let alpha: CGFloat = if enabled { 1.0 } else { 0.35 };
+        () = msg![env; button setAlpha:alpha];
+    }
+}
+fn handle_flex_browser(
+    env: &mut Environment,
+    delegate: id,
+    panel: &FlexBrowserPanel,
+    state: &mut FlexBrowserState,
+    flex: &FlexPanel,
+    app: Option<&AppInfo>,
+) {
+    let (open, close, back, filter, page, row, value) = {
+        let h = env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate);
+        (
+            std::mem::take(&mut h.flex_browse),
+            std::mem::take(&mut h.browser_close),
+            std::mem::take(&mut h.browser_back),
+            std::mem::take(&mut h.browser_filter),
+            std::mem::take(&mut h.browser_page),
+            h.browser_row.take(),
+            h.browser_return.take(),
+        )
+    };
+    if open {
+        let _: bool = msg![env; (flex.editor) resignFirstResponder];
+        *state = FlexBrowserState::default();
+        let result = app
+            .ok_or_else(|| "No installed app selected".to_string())
+            .and_then(|app| {
+                let data = BundleData::open_any(&app.path)?;
+                let (bundle, fs) = Bundle::new_bundle_and_fs_from_host_path(data, true)?;
+                let bytes = fs
+                    .read(&bundle.executable_path())
+                    .map_err(|_| "Cannot read the selected app executable".to_string())?;
+                crate::mach_o::objc_browser::browse(&bytes)
+            });
+        match result {
+            Ok(classes) => {
+                state.classes = classes;
+                if state.classes.is_empty() {
+                    state.error = Some("No Objective-C 2 classes in this executable".into());
+                }
+            }
+            Err(e) => state.error = Some(e),
+        }
+        set_flex_label(env, panel.filter, "");
+        refresh_flex_browser(env, panel, state);
+        () = msg![env; (panel.view) setHidden:false];
+    }
+    if close {
+        let _: bool = msg![env; (panel.filter) resignFirstResponder];
+        () = msg![env; (panel.view) setHidden:true];
+    }
+    if back {
+        state.class = None;
+        state.methods.clear();
+        state.selected = None;
+        state.query.clear();
+        state.page = 0;
+        set_flex_label(env, panel.filter, "");
+        refresh_flex_browser(env, panel, state);
+    }
+    if filter {
+        let text: id = msg![env; (panel.filter) text];
+        state.query = if text == nil {
+            String::new()
+        } else {
+            ns_string::to_rust_string(env, text).into_owned()
+        };
+        state.page = 0;
+        state.selected = None;
+        let _: bool = msg![env; (panel.filter) resignFirstResponder];
+        refresh_flex_browser(env, panel, state);
+    }
+    if page != 0 {
+        state.page = (state.page as i32 + page).max(0) as usize;
+        state.selected = None;
+        refresh_flex_browser(env, panel, state);
+    }
+    if let Some(index) = row.and_then(|slot| state.visible.get(slot).copied()) {
+        if state.class.is_none() {
+            state.class = Some(index);
+            state.methods = crate::mach_o::objc_browser::methods_for(&state.classes, index);
+            state.page = 0;
+            state.query.clear();
+            set_flex_label(env, panel.filter, "");
+        } else {
+            state.selected = Some(index);
+        }
+        refresh_flex_browser(env, panel, state);
+    }
+    if let (Some(value), Some(class), Some(method)) = (
+        value,
+        state.class,
+        state.selected.and_then(|i| state.methods.get(i)),
+    ) {
+        if method.accepts(value) {
+            let current: id = msg![env; (flex.editor) text];
+            let current = ns_string::to_rust_string(env, current).into_owned();
+            let rule = format!(
+                "{} {} {} {}",
+                if method.class_method { "+" } else { "-" },
+                state.classes[class].name,
+                method.selector,
+                value
+            );
+            let text = insert_flex_rule(&current, &rule);
+            set_flex_label(env, flex.editor, &text);
+            set_flex_label(env, flex.status, "Rule inserted. Press Save to apply it.");
+            () = msg![env; (panel.view) setHidden:true];
+        }
+    }
+}
+/// Replace an existing active rule for this method instead of creating duplicates.
+fn insert_flex_rule(text: &str, rule: &str) -> String {
+    let key: Vec<_> = rule.split_whitespace().take(3).collect();
+    let mut lines: Vec<_> = text
+        .lines()
+        .filter(|line| {
+            let fields: Vec<_> = line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .take(3)
+                .collect();
+            fields != key
+        })
+        .map(str::to_owned)
+        .collect();
+    lines.push(rule.to_owned());
+    lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod flex_browser_rule_tests {
+    use super::insert_flex_rule;
+    #[test]
+    fn selection_replaces_rule_and_preserves_disabled_rules() {
+        let text = "# - Gate online true\n- Gate online true # old\n+ Gate online nil\n- Other online true\n";
+        let updated = insert_flex_rule(text, "- Gate online false");
+        assert!(!updated.contains("# old"));
+        assert!(updated.contains("# - Gate online true"));
+        assert!(updated.contains("+ Gate online nil"));
+        assert!(updated.ends_with("- Gate online false\n"));
     }
 }
