@@ -42,10 +42,13 @@ pub struct MachO {
     pub dynamic_libraries: Vec<String>,
     /// Metadata related to sections.
     pub sections: Vec<Section>,
-    /// Defined symbols in the binary (both external and local). This is a
-    /// hashmap so the dynamic linker can look things up quickly. Thumb function
-    /// symbols always have the Thumb bit set.
+    /// All defined symbols in the binary, including local symbols. Use
+    /// `external_symbols` for dependent-dylib resolution. Thumb function symbols
+    /// always have the Thumb bit set.
     pub exported_symbols: HashMap<String, u32>,
+    /// Defined symbols marked external in the Mach-O symbol table, used for
+    /// dependent-dylib resolution.
+    pub external_symbols: HashMap<String, u32>,
     /// List of addresses and names of external relocations for the dynamic
     /// linker to resolve.
     pub external_relocations: Vec<(u32, String)>,
@@ -277,6 +280,19 @@ fn cpu_subtype_to_str(ty: cpu_subtype_t) -> &'static str {
     }
 }
 
+fn record_defined_symbol(
+    defined_symbols: &mut HashMap<String, u32>,
+    external_symbols: &mut HashMap<String, u32>,
+    name: &str,
+    address: u32,
+    external: bool,
+) {
+    defined_symbols.insert(name.to_string(), address);
+    if external {
+        external_symbols.insert(name.to_string(), address);
+    }
+}
+
 /// Only the virtual tail (vmsize - filesize) is zero-filled. Missing bytes
 /// inside the declared file range are corruption, not BSS.
 fn validate_segment_file_range(
@@ -475,6 +491,7 @@ impl MachO {
         // Info used for the result
         let mut dynamic_libraries = Vec::new();
         let mut exported_symbols = HashMap::new();
+        let mut external_symbols = HashMap::new();
         let mut indirect_undef_symbols: Vec<Option<String>> = Vec::new();
         let mut external_relocations: Vec<(u32, String)> = Vec::new();
         let mut entry_point_pc: Option<u32> = None;
@@ -622,6 +639,7 @@ impl MachO {
                             }
                             if let Symbol::Defined {
                                 name: Some(name),
+                                external,
                                 entry,
                                 desc,
                                 ..
@@ -633,7 +651,13 @@ impl MachO {
                                 } else {
                                     entry
                                 };
-                                exported_symbols.insert(name.to_string(), slide + entry);
+                                record_defined_symbol(
+                                    &mut exported_symbols,
+                                    &mut external_symbols,
+                                    name,
+                                    slide + entry,
+                                    external,
+                                );
                             };
                         }
                     }
@@ -1065,6 +1089,7 @@ impl MachO {
             dynamic_libraries,
             sections,
             exported_symbols,
+            external_symbols,
             external_relocations,
             entry_point_pc,
             entry_point_is_lc_main,
@@ -1272,5 +1297,35 @@ mod segment_validation_tests {
             let image = MachO::load_from_bytes(&bytes, &mut mem, "supported".into(), 0).unwrap();
             assert_eq!(image.text_base, 0x9000);
         }
+    }
+}
+
+#[cfg(test)]
+mod symbol_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn local_symbols_are_not_visible_to_dependent_dylibs() {
+        let mut defined_symbols = HashMap::new();
+        let mut external_symbols = HashMap::new();
+
+        record_defined_symbol(
+            &mut defined_symbols,
+            &mut external_symbols,
+            "_log2",
+            0x0048_85c0,
+            false,
+        );
+        record_defined_symbol(
+            &mut defined_symbols,
+            &mut external_symbols,
+            "_memcpy",
+            0x0030_1001,
+            true,
+        );
+
+        assert_eq!(defined_symbols.get("_log2"), Some(&0x0048_85c0));
+        assert!(!external_symbols.contains_key("_log2"));
+        assert_eq!(external_symbols.get("_memcpy"), Some(&0x0030_1001));
     }
 }

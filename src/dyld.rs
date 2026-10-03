@@ -519,7 +519,7 @@ impl Dyld {
         assert!(self.thread_exit_routine.is_none());
         self.guest_sjlj_runtime_available = has_guest_sjlj_runtime(|symbol| {
             bins.iter()
-                .any(|bin| bin.exported_symbols.contains_key(symbol))
+                .any(|bin| bin.external_symbols.contains_key(symbol))
         });
         log!(
             "Guest C++ SjLj runtime available: {}",
@@ -691,7 +691,7 @@ impl Dyld {
                 continue 'sym;
             }
             for dylib in bins.iter() {
-                if dylib.exported_symbols.contains_key(symbol) {
+                if dylib.external_symbols.contains_key(symbol) {
                     writeln!(
                         file,
                         "        {{ \"symbol\": \"{}\", \"linked_to\": \"dylib\", \"dylib\": \"{}\"}}{}",
@@ -903,7 +903,7 @@ impl Dyld {
             let guest_cxxabi_export =
                 if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(name) {
                     bins.iter()
-                        .find_map(|other_bin| other_bin.exported_symbols.get(name))
+                        .find_map(|other_bin| other_bin.external_symbols.get(name))
                         .copied()
                 } else {
                     None
@@ -1189,7 +1189,7 @@ impl Dyld {
                 }
             } else if let Some(&external_addr) = bins
                 .iter()
-                .flat_map(|other_bin| other_bin.exported_symbols.get(name))
+                .flat_map(|other_bin| other_bin.external_symbols.get(name))
                 .next()
             {
                 // Often used for C++ RTTI
@@ -1266,7 +1266,7 @@ impl Dyld {
 
             let ptr_ptr: MutPtr<ConstVoidPtr> = Ptr::from_bits(ptrs.addr + i * entry_size);
             for other_bin in bins {
-                if let Some(&addr) = other_bin.exported_symbols.get(symbol) {
+                if let Some(&addr) = other_bin.external_symbols.get(symbol) {
                     register_cxxabi_typeinfo_vtable(
                         symbol,
                         addr,
@@ -1777,7 +1777,7 @@ impl Dyld {
         if self.guest_sjlj_runtime_available && is_guest_cxxabi_symbol(symbol) {
             if let Some(&addr) = bins
                 .iter()
-                .find_map(|dylib| dylib.exported_symbols.get(symbol))
+                .find_map(|dylib| dylib.external_symbols.get(symbol))
             {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
@@ -1856,7 +1856,7 @@ impl Dyld {
         // matches iOS dyld's behaviour of preferring the app's own linked
         // dylibs over fallback implementations.
         for dylib in bins.iter() {
-            if let Some(&addr) = dylib.exported_symbols.get(symbol) {
+            if let Some(&addr) = dylib.external_symbols.get(symbol) {
                 register_cxxabi_typeinfo_vtable(
                     symbol,
                     addr,
