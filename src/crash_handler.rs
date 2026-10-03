@@ -120,21 +120,66 @@ mod imp {
         }
     }
 
-    pub fn native_backtrace_lines() -> String {
+    /// The interrupted thread's `(PC, LR, SP)`, when the platform hands them
+    /// to the signal handler (see `interrupted_frame`).
+    pub type InterruptedFrame = Option<(usize, usize, usize)>;
+
+    pub fn native_backtrace_lines(fault: InterruptedFrame) -> String {
+        // bionic's backtrace() cannot unwind past the signal frame, so on
+        // Android every frame it reports belongs to *this handler*. The
+        // register state of the interrupted thread — which is what actually
+        // identifies the crash — only comes from the `ucontext_t` the kernel
+        // passed to the SA_SIGINFO handler.
+        let mut lines = match fault {
+            Some((pc, lr, sp)) => {
+                let mut s = format!(
+                    "faulting frame: PC {:#x}, LR {:#x}, SP {:#x}\n",
+                    pc, lr, sp
+                );
+                if pc == 0 {
+                    s.push_str(
+                        "(PC is 0: control was transferred through a NULL \
+                         function pointer, e.g. a bogus vtable/`extern` slot \
+                         — this is not a data access)\n",
+                    );
+                }
+                s.push_str(
+                    "(the frames below are the crash handler's own; \
+                     symbolize PC/LR against the maps entry that contains \
+                     them)\n",
+                );
+                s
+            }
+            None => String::new(),
+        };
         let fptr = BACKTRACE_SYM.load(Ordering::Relaxed);
         if fptr == 0 {
-            return "(native backtrace() not available on this device)\n".to_string();
+            lines.push_str("(native backtrace() not available on this device)\n");
+            lines.push_str(&maps_for(&fault_addrs(fault)));
+            return lines;
         }
         type BacktraceFn = unsafe extern "C" fn(*mut *mut libc::c_void, libc::c_int) -> libc::c_int;
         let bt: BacktraceFn = unsafe { std::mem::transmute(fptr) };
         let mut addrs = [std::ptr::null_mut::<libc::c_void>(); 64];
         let n = unsafe { bt(addrs.as_mut_ptr(), 64) };
-        let mut lines = format!("native backtrace ({} frames):\n", n);
+        lines.push_str(&format!("native backtrace ({} frames):\n", n));
         for i in 0..n as usize {
             lines.push_str(&format!("  #{}: {:#x}\n", i, addrs[i] as usize));
         }
-        lines.push_str(&maps_for(&addrs[..n as usize]));
+        let mut map_addrs = addrs[..n as usize].to_vec();
+        map_addrs.extend_from_slice(&fault_addrs(fault));
+        lines.push_str(&maps_for(&map_addrs));
         lines
+    }
+
+    /// The interrupted PC/LR as addresses, so `maps_for` attributes them to a
+    /// loaded library (and reports the libtouchHLE.so load base needed to
+    /// symbolize them).
+    fn fault_addrs(fault: InterruptedFrame) -> Vec<*mut libc::c_void> {
+        match fault {
+            Some((pc, lr, _)) => vec![pc as *mut libc::c_void, lr as *mut libc::c_void],
+            None => Vec::new(),
+        }
     }
 
     /// Dump the /proc/self/maps lines whose ranges contain one of `addrs`,
@@ -230,7 +275,48 @@ mod imp {
     const NAME_ILL: &[u8] = b"SIGILL\0";
     const NAME_ABORT: &[u8] = b"SIGABRT\0";
 
-    extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, _uc: *mut libc::c_void) {
+    /// The register state of the interrupted thread, as `(PC, LR, SP)`.
+    ///
+    /// This is the only reliable way to learn *where* the host died: the
+    /// guest PC ring tracks the emulated CPU, and `backtrace()` on bionic
+    /// stops at the signal frame (so it returns this handler's own frames).
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    fn interrupted_frame(uc: *mut libc::c_void) -> InterruptedFrame {
+        if uc.is_null() {
+            return None;
+        }
+        // The kernel/bionic arm64 `struct sigcontext`, which is what
+        // `mcontext_t` is a typedef of. Read through this mirror rather than
+        // through `libc::mcontext_t`'s own field names, which are not stable
+        // across libc versions. The field order is the ABI and must be kept
+        // even for the fields this handler does not report.
+        #[repr(C)]
+        #[allow(dead_code)]
+        struct Aarch64Sigcontext {
+            fault_address: u64,
+            regs: [u64; 31],
+            sp: u64,
+            pc: u64,
+            pstate: u64,
+        }
+        // SAFETY: the kernel passes a valid `ucontext_t` as the third
+        // argument of a SA_SIGINFO handler, and `uc_mcontext` is this
+        // architecture's `sigcontext`. Only reads are performed, and the
+        // mirror covers a prefix of that (larger) kernel structure.
+        let ctx = unsafe { &*(uc as *const libc::ucontext_t) };
+        let sc = unsafe { &*(&ctx.uc_mcontext as *const _ as *const Aarch64Sigcontext) };
+        // x30 is the link register on arm64.
+        Some((sc.pc as usize, sc.regs[30] as usize, sc.sp as usize))
+    }
+
+    /// Platforms whose `ucontext_t` layout this handler does not know: no
+    /// extra information, but the rest of the report is unchanged.
+    #[cfg(not(all(target_os = "android", target_arch = "aarch64")))]
+    fn interrupted_frame(_uc: *mut libc::c_void) -> InterruptedFrame {
+        None
+    }
+
+    extern "C" fn handler(sig: libc::c_int, info: *mut libc::siginfo_t, uc: *mut libc::c_void) {
         let name: &[u8] = match sig {
             libc::SIGSEGV => NAME_SEGV,
             libc::SIGBUS => NAME_BUS,
@@ -272,7 +358,11 @@ mod imp {
             // libc::gettid is Linux-only; pthread_self works everywhere.
             unsafe { libc::pthread_self() as u64 }
         );
-        let msg = format!("{}{}", msg, native_backtrace_lines());
+        let msg = format!(
+            "{}{}",
+            msg,
+            native_backtrace_lines(interrupted_frame(uc))
+        );
         let msg = format!(
             "{}recent guest PCs:{}\n",
             msg,

@@ -1080,6 +1080,10 @@ impl Window {
         // on a coroutine stack.
         crate::android_web_view::populate_jni_cache();
 
+        // And for the camera/microphone bridge, whose HostMedia lookups need
+        // the app class loader just as much as the WebView ones do.
+        crate::android_media::populate_jni_cache();
+
         #[cfg(target_os = "macos")]
         let max_height = window.size().1;
 

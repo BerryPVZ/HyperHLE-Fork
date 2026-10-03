@@ -91,35 +91,52 @@ mod imp {
             }
         }
 
-        /// `self.env` is a `JNIEnv*`: it points at the JNIEnv struct, whose
-        /// only field is the pointer to the `JNINativeInterface_` function
-        /// table. One dereference is needed to reach the table (this is the
-        /// `(*env)->Fn(env, ...)` idiom from C). Indexing `env` itself would
-        /// read JNIEnv-internal fields and try to call them as function
-        /// pointers, crashing the host process with SIGSEGV.
-        fn slot<F>(&self, index: usize) -> F {
-            unsafe {
-                let table = *(self.env as *mut *mut c_void) as *mut *mut c_void;
-                std::mem::transmute_copy::<*mut c_void, F>(&*table.add(index))
-            }
+        /// Resolve a JNI function pointer from the function table reachable
+        /// from `self.env`, via the shared walk in `crate::android_jni`.
+        ///
+        /// `self.env` is a `JNIEnv*`: it points at a struct whose only field
+        /// is the pointer to the `JNINativeInterface_` function table, so one
+        /// dereference is needed to reach the table (the `(*env)->Fn(env, ...)`
+        /// idiom from C). Indexing `env` itself would read neighbouring bytes
+        /// and call them as function pointers, crashing the host process with
+        /// SIGSEGV.
+        ///
+        /// [None] means the slot could not be resolved; callers disable the
+        /// bridge (they already cope with "no WebView available").
+        fn slot<F>(&self, index: usize) -> Option<F> {
+            // SAFETY: `self.env` came from SDL_AndroidGetJNIEnv() and was
+            // checked for null in `attach()`; `index` is one of the `slots`
+            // constants, whose numbers are taken from jni.h.
+            unsafe { crate::android_jni::table_fn(self.env, index) }
         }
 
         fn exception_pending(&self) -> bool {
-            let f: unsafe extern "C" fn(*mut c_void) -> *mut c_void =
-                self.slot(slots::EXCEPTION_OCCURRED);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void) -> *mut c_void> =
+                self.slot(slots::EXCEPTION_OCCURRED)
+            else {
+                return false;
+            };
             let thrown = unsafe { f(self.env) };
             !thrown.is_null()
         }
 
         fn clear_exception(&self) {
-            let f: unsafe extern "C" fn(*mut c_void) = self.slot(slots::EXCEPTION_CLEAR);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void)> =
+                self.slot(slots::EXCEPTION_CLEAR)
+            else {
+                return;
+            };
             unsafe { f(self.env) }
         }
 
         fn find_main_activity_class(&self) -> Option<*mut c_void> {
             let name = CString::new("org/touchhle/android/MainActivity").ok()?;
-            let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
-                self.slot(slots::FIND_CLASS);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+            > = self.slot(slots::FIND_CLASS)
+            else {
+                return None;
+            };
             let class = unsafe { f(self.env, name.as_ptr()) };
             if class.is_null() {
                 self.clear_exception();
@@ -136,12 +153,17 @@ mod imp {
         ) -> Option<*mut c_void> {
             let name = CString::new(name).ok()?;
             let sig = CString::new(sig).ok()?;
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *const c_char,
-                *const c_char,
-            ) -> *mut c_void = self.slot(slots::GET_STATIC_METHOD_ID);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const c_char,
+                    *const c_char,
+                ) -> *mut c_void,
+            > = self.slot(slots::GET_STATIC_METHOD_ID)
+            else {
+                return None;
+            };
             let method = unsafe { f(self.env, class, name.as_ptr(), sig.as_ptr()) };
             if method.is_null() {
                 self.clear_exception();
@@ -154,8 +176,12 @@ mod imp {
             if obj.is_null() {
                 return std::ptr::null_mut();
             }
-            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-                self.slot(slots::NEW_GLOBAL_REF);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+            > = self.slot(slots::NEW_GLOBAL_REF)
+            else {
+                return std::ptr::null_mut();
+            };
             unsafe { f(self.env, obj) }
         }
 
@@ -163,8 +189,12 @@ mod imp {
             if obj.is_null() {
                 return std::ptr::null_mut();
             }
-            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
-                self.slot(slots::GET_OBJECT_CLASS);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+            > = self.slot(slots::GET_OBJECT_CLASS)
+            else {
+                return std::ptr::null_mut();
+            };
             unsafe { f(self.env, obj) }
         }
 
@@ -201,8 +231,12 @@ mod imp {
             let Ok(c) = CString::new(to_modified_utf8(s)) else {
                 return std::ptr::null_mut();
             };
-            let f: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void =
-                self.slot(slots::NEW_STRING_UTF);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void,
+            > = self.slot(slots::NEW_STRING_UTF)
+            else {
+                return std::ptr::null_mut();
+            };
             unsafe { f(self.env, c.as_ptr()) }
         }
 
@@ -210,10 +244,18 @@ mod imp {
             if js.is_null() {
                 return None;
             }
-            let get: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> *const c_char =
-                self.slot(slots::GET_STRING_UTF_CHARS);
-            let release: unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char) =
-                self.slot(slots::RELEASE_STRING_UTF_CHARS);
+            let Some(get): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> *const c_char,
+            > = self.slot(slots::GET_STRING_UTF_CHARS)
+            else {
+                return None;
+            };
+            let Some(release): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char),
+            > = self.slot(slots::RELEASE_STRING_UTF_CHARS)
+            else {
+                return None;
+            };
             let chars = unsafe { get(self.env, js, std::ptr::null_mut()) };
             if chars.is_null() {
                 return None;
@@ -229,18 +271,21 @@ mod imp {
             if obj.is_null() {
                 return;
             }
-            let f: unsafe extern "C" fn(*mut c_void, *mut c_void) =
-                self.slot(slots::DELETE_LOCAL_REF);
+            let Some(f): Option<unsafe extern "C" fn(*mut c_void, *mut c_void)> =
+                self.slot(slots::DELETE_LOCAL_REF)
+            else {
+                return;
+            };
             unsafe { f(self.env, obj) }
         }
 
         fn call_static_void(&self, class: *mut c_void, method: *mut c_void, args: &[JValue]) {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) = self.slot(slots::CALL_STATIC_VOID_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *const JValue),
+            > = self.slot(slots::CALL_STATIC_VOID_METHOD_A)
+            else {
+                return;
+            };
             unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -253,12 +298,17 @@ mod imp {
             method: *mut c_void,
             args: &[JValue],
         ) -> bool {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) -> u8 = self.slot(slots::CALL_STATIC_BOOLEAN_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *const JValue,
+                ) -> u8,
+            > = self.slot(slots::CALL_STATIC_BOOLEAN_METHOD_A)
+            else {
+                return false;
+            };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -272,12 +322,18 @@ mod imp {
             method: *mut c_void,
             args: &[JValue],
         ) -> c_int {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) -> c_int = self.slot(slots::CALL_STATIC_INT_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *const JValue,
+                ) -> c_int,
+            > = self.slot(slots::CALL_STATIC_INT_METHOD_A)
+            else {
+                // -1 is the bridge's existing "no overlay / failure" answer.
+                return -1;
+            };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();
@@ -291,12 +347,17 @@ mod imp {
             method: *mut c_void,
             args: &[JValue],
         ) -> *mut c_void {
-            let f: unsafe extern "C" fn(
-                *mut c_void,
-                *mut c_void,
-                *mut c_void,
-                *const JValue,
-            ) -> *mut c_void = self.slot(slots::CALL_STATIC_OBJECT_METHOD_A);
+            let Some(f): Option<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *const JValue,
+                ) -> *mut c_void,
+            > = self.slot(slots::CALL_STATIC_OBJECT_METHOD_A)
+            else {
+                return std::ptr::null_mut();
+            };
             let r = unsafe { f(self.env, class, method, args.as_ptr()) };
             if self.exception_pending() {
                 self.clear_exception();

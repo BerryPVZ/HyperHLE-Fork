@@ -31,6 +31,15 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- mDNS/Bonjour LAN discovery: MainActivity.onCreate() acquires a Wi-Fi
+         multicast lock, because Android Wi-Fi drivers drop multicast unless
+         an app holds one (GameKit / NSNetService / Gameloft LAN servers need
+         it). Acquiring the lock without declaring this permission throws a
+         SecurityException on every launch, so the lock was never actually
+         held and LAN discovery stayed broken. It is a normal (install-time)
+         permission: no runtime prompt, no user-visible change. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
     <uses-feature
         android:name="android.hardware.camera"
         android:required="false" />
