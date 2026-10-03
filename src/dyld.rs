@@ -655,7 +655,7 @@ impl Dyld {
     ///     "symbols": [
     ///         {
     ///             "symbol": ((name of symbol)),
-    ///             "linked_to": "host" | "dylib" | null,
+    ///             "linked_to": "host" | "dylib" | "local" | null,
     ///             "dylib": ((name of dylib)) | null,
     ///         },
     ///         ...
@@ -704,6 +704,16 @@ impl Dyld {
                 writeln!(
                     file,
                     "        {{ \"symbol\": \"{symbol}\", \"linked_to\": \"host\"}}{comma}"
+                )?;
+                continue;
+            }
+            if bins
+                .first()
+                .is_some_and(|bin| local_code_symbol(bin, symbol).is_some())
+            {
+                writeln!(
+                    file,
+                    "        {{ \"symbol\": \"{symbol}\", \"linked_to\": \"local\" }}{comma}"
                 )?;
                 continue;
             }
@@ -1726,13 +1736,13 @@ impl Dyld {
             (stub_function_ptr, la_symbol_ptr)
         }
 
-        let Some((stubs, pic_offset, offset)) = bins.iter().find_map(|bin| {
+        let Some((stub_bin, stubs, pic_offset, offset)) = bins.iter().find_map(|bin| {
             let stubs = bin.get_section(SectionType::SymbolStubs)?;
             let offset = lazy_stub_section_offset(stubs.addr, stubs.size, svc_pc)?;
             let pic_offset = bin
                 .get_section(SectionType::LazySymbolPointers)
                 .map_or(0, |lazy_ptrs| lazy_ptrs.addr - stubs.addr);
-            Some((stubs, pic_offset, offset))
+            Some((bin, stubs, pic_offset, offset))
         }) else {
             return fallback_for_unmapped_lazy_link(
                 cpu,
@@ -1903,6 +1913,20 @@ impl Dyld {
             // Return the host function so that we can call it now that we're
             // done.
             return Some(f);
+        }
+
+        if let Some(addr) = local_code_symbol(stub_bin, symbol) {
+            let (stub_function_ptr, la_symbol_ptr) =
+                link_by_restoring_stub(mem, cpu, addr, svc_pc, info.entry_size, pic_offset);
+            log!(
+                "Linked same-image private function {} at {:?}/{:?} to {:#x} from {}",
+                symbol,
+                stub_function_ptr,
+                la_symbol_ptr,
+                addr,
+                stub_bin.name
+            );
+            return None;
         }
 
         // Fallback: the symbol isn't implemented by any host dylib and isn't
@@ -2140,6 +2164,25 @@ fn unimplemented_function_stub(_env: &mut Environment) -> i32 {
     0
 }
 
+fn local_code_symbol(bin: &MachO, symbol: &str) -> Option<u32> {
+    if bin.external_symbols.contains_key(symbol) {
+        return None;
+    }
+    let &address = bin.exported_symbols.get(symbol)?;
+    let address_without_thumb_bit = address & !GuestFunction::THUMB_BIT;
+    bin.sections
+        .iter()
+        .any(|section| {
+            matches!(
+                section.name.as_str(),
+                "__text" | "__textcoal" | "__textcoal_nt"
+            ) && address_without_thumb_bit
+                .checked_sub(section.addr)
+                .is_some_and(|offset| offset < section.size)
+        })
+        .then_some(address)
+}
+
 fn lazy_stub_section_offset(section_addr: u32, section_size: u32, svc_pc: u32) -> Option<u32> {
     let offset = svc_pc.checked_sub(section_addr)?;
     (offset < section_size).then_some(offset)
@@ -2300,8 +2343,10 @@ mod cxxabi_runtime_detection_tests {
 
 #[cfg(test)]
 mod lazy_link_recovery_tests {
-    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset};
+    use super::{fallback_for_unmapped_lazy_link, lazy_stub_section_offset, local_code_symbol};
     use crate::cpu::Cpu;
+    use crate::mach_o::{MachO, Section, SectionType};
+    use std::collections::HashMap;
 
     #[test]
     fn lazy_stub_section_offset_checks_boundaries_without_overflow() {
@@ -2325,5 +2370,47 @@ mod lazy_link_recovery_tests {
             assert_eq!(cpu.regs()[Cpu::PC], expected_pc);
             assert_eq!(cpu.cpsr() & Cpu::CPSR_THUMB != 0, expected_thumb);
         }
+    }
+
+    fn mock_binary(symbol: &str, address: u32, section_name: &str, external: bool) -> MachO {
+        let mut exported_symbols = HashMap::new();
+        exported_symbols.insert(symbol.to_owned(), address);
+        let mut external_symbols = HashMap::new();
+        if external {
+            external_symbols.insert(symbol.to_owned(), address);
+        }
+
+        MachO {
+            name: "test".to_owned(),
+            dynamic_libraries: Vec::new(),
+            sections: vec![Section {
+                name: section_name.to_owned(),
+                addr: 0x1000,
+                size: 0x100,
+                type_: SectionType::Normal,
+                dyld_indirect_symbol_info: None,
+            }],
+            exported_symbols,
+            external_symbols,
+            external_relocations: Vec::new(),
+            entry_point_pc: None,
+            entry_point_is_lc_main: false,
+            last_segment_end: 0x2000,
+            text_base: 0x1000,
+        }
+    }
+
+    #[test]
+    fn same_image_private_code_symbols_are_resolved_without_exposing_data() {
+        let symbol = "__ZN8TMapBaseIP9UPropertyi14TSIMDAllocatorE6RehashEv";
+        let private_code = mock_binary(symbol, 0x1011, "__text", false);
+        assert_eq!(local_code_symbol(&private_code, symbol), Some(0x1011));
+
+        let private_data = mock_binary(symbol, 0x1011, "__const", false);
+        assert_eq!(local_code_symbol(&private_data, symbol), None);
+
+        let external_code = mock_binary(symbol, 0x1011, "__text", true);
+        assert_eq!(local_code_symbol(&external_code, symbol), None);
+        assert_eq!(local_code_symbol(&private_code, "__other"), None);
     }
 }
