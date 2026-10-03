@@ -50,8 +50,9 @@ pub struct GLES3OnGL3Context {
     pvrtc_native_checked: bool,
     /// One-shot initialization: in Core profile we must create and bind a
     /// default Vertex Array Object (VAO) before any vertex-array draw calls.
-    /// ES 3.0 also requires VAOs, but its default VAO name is 0. Core-profile
-    /// desktop GL needs a real nonzero VAO, so name 0 is mapped to this object.
+    /// ES 3.0 also requires VAOs, but apps that came from ES 2.0 often
+    /// expect implicit VAO 0 — emulate that by binding our internal one
+    /// every time we make the context current.
     default_vao: GLuint,
 }
 
@@ -72,7 +73,6 @@ impl GLESContext for GLES3OnGL3Context {
             return Box::new(GLES3OnGL3 {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
-                default_vao: self.default_vao,
                 advertise_es3: self.advertise_es3,
             });
         }
@@ -98,7 +98,6 @@ impl GLESContext for GLES3OnGL3Context {
         Box::new(GLES3OnGL3 {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
-            default_vao: self.default_vao,
             advertise_es3: self.advertise_es3,
         })
     }
@@ -112,7 +111,6 @@ impl GLESContext for GLES3OnGL3Context {
             return Box::new(GLES3OnGL3 {
                 _gl_lifetime: PhantomData,
                 pvrtc_native: self.pvrtc_native,
-                default_vao: self.default_vao,
                 advertise_es3: self.advertise_es3,
             });
         }
@@ -129,7 +127,6 @@ impl GLESContext for GLES3OnGL3Context {
         Box::new(GLES3OnGL3 {
             _gl_lifetime: PhantomData,
             pvrtc_native: self.pvrtc_native,
-            default_vao: self.default_vao,
             advertise_es3: self.advertise_es3,
         })
     }
@@ -222,7 +219,6 @@ unsafe fn detect_pvrtc_support() -> bool {
 pub struct GLES3OnGL3<'gl_ctx> {
     _gl_lifetime: PhantomData<&'gl_ctx ()>,
     pvrtc_native: bool,
-    default_vao: GLuint,
     /// Whether this backend instance should advertise itself as OpenGL ES 3.0
     /// via [`GLES::is_es3`]. The same desktop GL 3.3 Core code path serves
     /// both OpenGL ES 2.0 and OpenGL ES 3.0 EAGL APIs — the [crate::gles::gles2_on_gl3::GLES2OnGL3Context]
@@ -232,24 +228,6 @@ pub struct GLES3OnGL3<'gl_ctx> {
     /// an ES 2.0 string, and the present path not assuming ES 3.0‑only entry
     /// points are available even though the host driver would accept them).
     advertise_es3: bool,
-}
-
-impl GLES3OnGL3<'_> {
-    fn host_vao_name(&self, guest_name: GLuint) -> GLuint {
-        if guest_name == 0 {
-            self.default_vao
-        } else {
-            guest_name
-        }
-    }
-
-    fn guest_vao_name(&self, host_name: GLuint) -> GLuint {
-        if host_name == self.default_vao {
-            0
-        } else {
-            host_name
-        }
-    }
 }
 
 /// Returns `true` if `cap` is an ES 1.1 fixed-function capability that has
@@ -353,16 +331,7 @@ impl GLES for GLES3OnGL3<'_> {
         gl33::GetFloatv(pname, params)
     }
     unsafe fn GetIntegerv(&mut self, pname: GLenum, params: *mut GLint) {
-        if pname == gl33::VERTEX_ARRAY_BINDING && !params.is_null() {
-            let mut binding = 0;
-            gl33::GetIntegerv(pname, &mut binding);
-            if binding >= 0 {
-                binding = self.guest_vao_name(binding as GLuint) as GLint;
-            }
-            *params = binding;
-        } else {
-            gl33::GetIntegerv(pname, params);
-        }
+        gl33::GetIntegerv(pname, params)
     }
     unsafe fn Hint(&mut self, target: GLenum, mode: GLenum) {
         if is_es1_only_hint_target(target) {
@@ -1123,15 +1092,6 @@ impl GLES for GLES3OnGL3<'_> {
     ) {
         gl33::GetShaderInfoLog(shader, maxLength, length, infoLog)
     }
-    unsafe fn GetAttachedShaders(
-        &mut self,
-        program: GLuint,
-        max_count: GLsizei,
-        count: *mut GLsizei,
-        shaders: *mut GLuint,
-    ) {
-        gl33::GetAttachedShaders(program, max_count, count, shaders)
-    }
     unsafe fn GetShaderSource(
         &mut self,
         shader: GLuint,
@@ -1555,36 +1515,16 @@ impl GLES for GLES3OnGL3<'_> {
 
     // -- Vertex array objects --
     unsafe fn IsVertexArray(&mut self, array: GLuint) -> GLboolean {
-        if array == 0 {
-            gl33::FALSE
-        } else {
-            gl33::IsVertexArray(array)
-        }
+        gl33::IsVertexArray(array)
     }
     unsafe fn BindVertexArray(&mut self, array: GLuint) {
-        gl33::BindVertexArray(self.host_vao_name(array))
+        gl33::BindVertexArray(array)
     }
     unsafe fn DeleteVertexArrays(&mut self, n: GLsizei, arrays: *const GLuint) {
         gl33::DeleteVertexArrays(n, arrays)
     }
     unsafe fn GenVertexArrays(&mut self, n: GLsizei, arrays: *mut GLuint) {
         gl33::GenVertexArrays(n, arrays)
-    }
-
-    fn supports_vao_oes(&self) -> bool {
-        true
-    }
-    unsafe fn BindVertexArrayOES(&mut self, array: GLuint) {
-        self.BindVertexArray(array)
-    }
-    unsafe fn GenVertexArraysOES(&mut self, n: GLsizei, arrays: *mut GLuint) {
-        self.GenVertexArrays(n, arrays)
-    }
-    unsafe fn DeleteVertexArraysOES(&mut self, n: GLsizei, arrays: *const GLuint) {
-        self.DeleteVertexArrays(n, arrays)
-    }
-    unsafe fn IsVertexArrayOES(&mut self, array: GLuint) -> GLboolean {
-        self.IsVertexArray(array)
     }
 
     // -- Buffer object operations --
@@ -1797,16 +1737,6 @@ impl GLES for GLES3OnGL3<'_> {
     ) {
         gl33::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
     }
-    unsafe fn RenderbufferStorageMultisampleAPPLE(
-        &mut self,
-        target: GLenum,
-        samples: GLsizei,
-        internalformat: GLenum,
-        width: GLsizei,
-        height: GLsizei,
-    ) {
-        gl33::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
-    }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         let mut color_rb: GLint = 0;
         gl33::GetFramebufferAttachmentParameteriv(
@@ -1861,25 +1791,6 @@ impl GLES for GLES3OnGL3<'_> {
         attachments: *const GLenum,
     ) {
         gl33::InvalidateFramebuffer(target, num_attachments, attachments)
-    }
-    fn discard_ext_supported(&self) -> bool {
-        gl33::InvalidateFramebuffer::is_loaded()
-    }
-    unsafe fn DiscardFramebufferEXT(
-        &mut self,
-        target: GLenum,
-        num_attachments: GLsizei,
-        attachments: *const GLenum,
-    ) -> bool {
-        if !gl33::InvalidateFramebuffer::is_loaded()
-            || target != gl33::FRAMEBUFFER
-            || num_attachments <= 0
-            || attachments.is_null()
-        {
-            return false;
-        }
-        gl33::InvalidateFramebuffer(target, num_attachments, attachments);
-        true
     }
     unsafe fn InvalidateSubFramebuffer(
         &mut self,
@@ -2336,26 +2247,5 @@ impl GLES for GLES3OnGL3<'_> {
         params: *mut GLint,
     ) {
         gl33::GetInternalformativ(target, internalformat, pname, buf_size, params)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{GLES3OnGL3, GLES};
-    use std::marker::PhantomData;
-
-    #[test]
-    fn core_vertex_array_objects_back_the_oes_entry_points() {
-        let backend = GLES3OnGL3 {
-            _gl_lifetime: PhantomData,
-            pvrtc_native: false,
-            default_vao: 37,
-            advertise_es3: true,
-        };
-        assert!(backend.supports_vao_oes());
-        assert_eq!(backend.host_vao_name(0), 37);
-        assert_eq!(backend.host_vao_name(12), 12);
-        assert_eq!(backend.guest_vao_name(37), 0);
-        assert_eq!(backend.guest_vao_name(12), 12);
     }
 }

@@ -78,7 +78,6 @@ pub mod store_kit;
 pub mod system_configuration;
 pub mod tw_tweet_compose_view_controller;
 pub mod uikit;
-pub mod user_notifications;
 pub mod watch_connectivity;
 pub mod web_kit;
 pub mod xsapitcui;
@@ -99,7 +98,6 @@ pub struct State {
     opengles: opengles::State,
     replay_kit: replay_kit::State,
     uikit: uikit::State,
-    user_notifications: user_notifications::State,
     watch_connectivity: watch_connectivity::State,
 }
 

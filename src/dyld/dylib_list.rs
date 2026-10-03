@@ -268,7 +268,6 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::image_io::DYLIB,
     &frameworks::photos::DYLIB,
     &frameworks::replay_kit::DYLIB,
-    &frameworks::user_notifications::DYLIB,
     &frameworks::quick_look::DYLIB,
     &frameworks::watch_connectivity::DYLIB,
     &frameworks::xsapitcui::DYLIB,
@@ -335,44 +334,6 @@ mod tests {
             .any(|(function_name, _)| *function_name == "_strtoll_l");
 
         assert!(is_exported, "Missing libc export _strtoll_l");
-    }
-
-    #[test]
-    fn user_notification_center_math_and_shader_apis_are_exported() {
-        let has_notification_center = DYLIB_LIST
-            .iter()
-            .flat_map(|dylib| dylib.class_exports)
-            .copied()
-            .flatten()
-            .any(|(name, template)| {
-                *name == "UNUserNotificationCenter"
-                    && template
-                        .class_methods
-                        .iter()
-                        .any(|(selector, _)| *selector == "currentNotificationCenter")
-                    && template
-                        .instance_methods
-                        .iter()
-                        .any(|(selector, _)| {
-                            *selector == "requestAuthorizationWithOptions:completionHandler:"
-                        })
-            });
-        let has_exp10 = DYLIB_LIST
-            .iter()
-            .flat_map(|dylib| dylib.function_exports)
-            .copied()
-            .flatten()
-            .any(|(name, _)| *name == "___exp10");
-        let has_get_attached_shaders = DYLIB_LIST
-            .iter()
-            .flat_map(|dylib| dylib.function_exports)
-            .copied()
-            .flatten()
-            .any(|(name, _)| *name == "_glGetAttachedShaders");
-
-        assert!(has_notification_center, "UNUserNotificationCenter is missing");
-        assert!(has_exp10, "libm alias ___exp10 is missing");
-        assert!(has_get_attached_shaders, "OpenGL ES glGetAttachedShaders is missing");
     }
 
     #[test]

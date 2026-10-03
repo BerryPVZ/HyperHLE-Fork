@@ -1391,15 +1391,6 @@ impl GLES for GLES2Native<'_> {
     ) {
         gles2::GetShaderInfoLog(shader, maxLength, length, infoLog)
     }
-    unsafe fn GetAttachedShaders(
-        &mut self,
-        program: GLuint,
-        max_count: GLsizei,
-        count: *mut GLsizei,
-        shaders: *mut GLuint,
-    ) {
-        gles2::GetAttachedShaders(program, max_count, count, shaders)
-    }
     unsafe fn GetShaderSource(
         &mut self,
         shader: GLuint,
