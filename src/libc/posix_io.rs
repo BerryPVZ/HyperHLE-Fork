@@ -234,6 +234,17 @@ fn open(env: &mut Environment, path: ConstPtr<u8>, flags: i32, _args: DotDotDot)
     self::open_direct(env, path, flags)
 }
 
+fn open_dprotected_np(
+    env: &mut Environment,
+    path: ConstPtr<u8>,
+    flags: i32,
+    _class: i32,
+    _dpflags: i32,
+    args: DotDotDot,
+) -> FileDescriptor {
+    open(env, path, flags, args)
+}
+
 fn creat(env: &mut Environment, path: ConstPtr<u8>, _mode: u32) -> i32 {
     // creat(path, mode) == open(path, O_WRONLY|O_CREAT|O_TRUNC)
     // O_WRONLY=0x0001, O_CREAT=0x0200, O_TRUNC=0x0400
@@ -1670,6 +1681,7 @@ fn poll(env: &mut Environment, fds: MutPtr<PollFd>, nfds: u32, timeout: i32) -> 
 
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(open(_, _, _)),
+    export_c_func!(open_dprotected_np(_, _, _, _, _)),
     export_c_func!(creat(_, _)),
     export_c_func!(truncate(_, _)),
     export_c_func!(read(_, _, _)),

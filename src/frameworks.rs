@@ -68,6 +68,7 @@ pub mod openal;
 pub mod opengles;
 pub mod photos;
 pub mod quick_look;
+pub mod replay_kit;
 pub mod security;
 pub mod social;
 pub mod contacts;
@@ -95,6 +96,7 @@ pub struct State {
     pub media_toolbox: media_toolbox::State,
     openal: openal::State,
     opengles: opengles::State,
+    replay_kit: replay_kit::State,
     uikit: uikit::State,
     watch_connectivity: watch_connectivity::State,
 }

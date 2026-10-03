@@ -14,7 +14,13 @@ use crate::{export_c_func, Environment};
 // Специфичный для Apple флаг защиты от отладки
 const PT_DENY_ATTACH: i32 = 31;
 
-fn ptrace(env: &mut Environment, request: i32, pid: pid_t, addr: MutPtr<u8>, data: i32) -> i32 {
+pub(crate) fn ptrace(
+    env: &mut Environment,
+    request: i32,
+    pid: pid_t,
+    addr: MutPtr<u8>,
+    data: i32,
+) -> i32 {
     match request {
         PT_DENY_ATTACH => {
             log_dbg!("ptrace(PT_DENY_ATTACH) called by app for anti-debugging.");
