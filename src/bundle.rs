@@ -353,6 +353,10 @@ impl Bundle {
     /// Load icon and round off its corners (and add sheen if needed) for
     /// display.
     pub fn load_icon(&self, fs: &Fs) -> Result<Image, String> {
+        self.load_icon_with_sheen(fs, false)
+    }
+
+    pub fn load_icon_with_sheen(&self, fs: &Fs, force_sheen: bool) -> Result<Image, String> {
         let candidates = self.icon_path_candidates();
         let mut last_err: Option<String> = None;
         let bytes = candidates.iter().find_map(|path| match fs.read(path) {
@@ -374,7 +378,7 @@ impl Bundle {
         // should be boolean, but some apps use a string, so we check both.
         // See https://developer.apple.com/library/archive/qa/qa1614/_index.html
         // Default if it does not exist is NO/false.
-        let add_sheen = !self
+        let add_sheen = force_sheen || !self
             .plist
             .get("UIPrerenderedIcon")
             .and_then(|v| v.as_boolean().or(v.as_string().map(|s| s == "YES")))

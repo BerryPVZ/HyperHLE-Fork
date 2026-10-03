@@ -21,6 +21,8 @@
 use crate::abi::GuestFunction;
 use crate::fs::{Fs, GuestPath};
 use crate::mem::{GuestUSize, Mem, Ptr};
+pub(crate) mod objc_browser;
+
 use mach_object::{
     cpu_subtype_t, vm_prot_t, Bind, BindSymbolType, DyLib, LoadCommand, MachCommand, OFile, Rebase,
     Symbol, SymbolIter, ThreadState, N_ARM_THUMB_DEF, S_LAZY_SYMBOL_POINTERS,
