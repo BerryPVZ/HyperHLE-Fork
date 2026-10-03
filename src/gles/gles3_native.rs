@@ -1054,6 +1054,15 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::GetShaderInfoLog(shader, maxLength, length, infoLog)
     }
+    unsafe fn GetAttachedShaders(
+        &mut self,
+        program: GLuint,
+        max_count: GLsizei,
+        count: *mut GLsizei,
+        shaders: *mut GLuint,
+    ) {
+        gles30::GetAttachedShaders(program, max_count, count, shaders)
+    }
     unsafe fn GetShaderSource(
         &mut self,
         shader: GLuint,
@@ -1489,6 +1498,22 @@ impl GLES for GLES3Native<'_> {
         gles30::GenVertexArrays(n, arrays)
     }
 
+    fn supports_vao_oes(&self) -> bool {
+        true
+    }
+    unsafe fn BindVertexArrayOES(&mut self, array: GLuint) {
+        self.BindVertexArray(array)
+    }
+    unsafe fn GenVertexArraysOES(&mut self, n: GLsizei, arrays: *mut GLuint) {
+        self.GenVertexArrays(n, arrays)
+    }
+    unsafe fn DeleteVertexArraysOES(&mut self, n: GLsizei, arrays: *const GLuint) {
+        self.DeleteVertexArrays(n, arrays)
+    }
+    unsafe fn IsVertexArrayOES(&mut self, array: GLuint) -> GLboolean {
+        self.IsVertexArray(array)
+    }
+
     // -- Buffer object operations --
     unsafe fn MapBufferRange(
         &mut self,
@@ -1699,6 +1724,16 @@ impl GLES for GLES3Native<'_> {
     ) {
         gles30::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
     }
+    unsafe fn RenderbufferStorageMultisampleAPPLE(
+        &mut self,
+        target: GLenum,
+        samples: GLsizei,
+        internalformat: GLenum,
+        width: GLsizei,
+        height: GLsizei,
+    ) {
+        gles30::RenderbufferStorageMultisample(target, samples, internalformat, width, height)
+    }
     unsafe fn ResolveMultisampleFramebufferAPPLE(&mut self) {
         let mut color_rb: GLint = 0;
         gles30::GetFramebufferAttachmentParameteriv(
@@ -1757,6 +1792,25 @@ impl GLES for GLES3Native<'_> {
         attachments: *const GLenum,
     ) {
         gles30::InvalidateFramebuffer(target, num_attachments, attachments)
+    }
+    fn discard_ext_supported(&self) -> bool {
+        gles30::InvalidateFramebuffer::is_loaded()
+    }
+    unsafe fn DiscardFramebufferEXT(
+        &mut self,
+        target: GLenum,
+        num_attachments: GLsizei,
+        attachments: *const GLenum,
+    ) -> bool {
+        if !gles30::InvalidateFramebuffer::is_loaded()
+            || target != gles30::FRAMEBUFFER
+            || num_attachments <= 0
+            || attachments.is_null()
+        {
+            return false;
+        }
+        gles30::InvalidateFramebuffer(target, num_attachments, attachments);
+        true
     }
     unsafe fn InvalidateSubFramebuffer(
         &mut self,
@@ -2219,5 +2273,20 @@ impl GLES for GLES3Native<'_> {
         params: *mut GLint,
     ) {
         gles30::GetInternalformativ(target, internalformat, pname, buf_size, params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GLES3Native, GLES};
+    use std::marker::PhantomData;
+
+    #[test]
+    fn core_vertex_array_objects_back_the_oes_entry_points() {
+        let backend = GLES3Native {
+            _gl_lifetime: PhantomData,
+            pvrtc_native: false,
+        };
+        assert!(backend.supports_vao_oes());
     }
 }

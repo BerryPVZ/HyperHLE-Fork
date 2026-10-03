@@ -3976,6 +3976,44 @@ fn glGetShaderSource(
         }
     });
 }
+fn glGetAttachedShaders(
+    env: &mut Environment,
+    program: GLuint,
+    max_count: GLsizei,
+    count: MutPtr<GLsizei>,
+    shaders: MutPtr<GLuint>,
+) {
+    with_ctx_and_mem(env, |gles, mem| unsafe {
+        if max_count < 0 {
+            let mut host_count = 0;
+            gles.GetAttachedShaders(program, max_count, &mut host_count, std::ptr::null_mut());
+            if !count.is_null() {
+                mem.write(count, host_count);
+            }
+            return;
+        }
+        let mut attached_count: GLint = 0;
+        gles.GetProgramiv(program, 0x8B85, &mut attached_count);
+        let capacity = max_count.min(attached_count.max(0)) as usize;
+        let mut host_shaders = vec![0; capacity];
+        let mut host_count: GLsizei = 0;
+        let host_ptr = if host_shaders.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            host_shaders.as_mut_ptr()
+        };
+        gles.GetAttachedShaders(program, capacity as GLsizei, &mut host_count, host_ptr);
+        let written = host_count.max(0).min(capacity as GLsizei);
+        if !count.is_null() {
+            mem.write(count, written);
+        }
+        if !shaders.is_null() {
+            for index in 0..written as usize {
+                mem.write(shaders + index as u32, host_shaders[index]);
+            }
+        }
+    });
+}
 fn glGetShaderInfoLog(
     env: &mut Environment,
     shader: GLuint,
@@ -4462,9 +4500,8 @@ fn parse_varying_declarations(source: &str) -> Vec<(String, String)> {
 /// `glCreateShader` / `glShaderSource` / `glAttachShader` / `glDetachShader` /
 /// `glDeleteShader` / `glDeleteProgram` hooks below. `fix_fragment_only_varyings`
 /// reads this instead of calling `glGetAttachedShaders` / `glGetShaderSource`
-/// on the host backend — those entry points are optional and some backends
-/// (notably `GLES2Native`, whose `GetAttachedShaders` default panics) do not
-/// implement them.
+/// on the host backend — shader rewriting should not depend on optional
+/// backend introspection functions or their driver-specific source text.
 #[derive(Default)]
 struct ShaderBookkeeping {
     shader_types: HashMap<GLuint, GLuint>,
@@ -7644,6 +7681,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(glGetShaderiv(_, _, _)),
     export_c_func!(glGetShaderInfoLog(_, _, _, _)),
     export_c_func!(glGetShaderSource(_, _, _, _)),
+    export_c_func!(glGetAttachedShaders(_, _, _, _)),
     export_c_func!(glGetProgramiv(_, _, _)),
     export_c_func!(glGetProgramInfoLog(_, _, _, _)),
     export_c_func!(glGetActiveUniform(_, _, _, _, _, _, _)),
