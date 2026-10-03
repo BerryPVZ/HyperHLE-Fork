@@ -75,6 +75,7 @@ pub mod ns_port;
 pub mod ns_predicate;
 pub mod ns_process_info;
 pub mod ns_property_list_serialization;
+pub mod ns_proxy;
 pub mod ns_regular_expression;
 pub mod ns_run_loop;
 pub mod ns_scanner;
@@ -117,7 +118,7 @@ pub fn NSGetSizeAndAlignment(
     next_ptr
 }
 
-fn parse_objc_type(env: &mut Environment, mut ptr: ConstPtr<u8>) -> (ConstPtr<u8>, u32, u32) {
+fn parse_objc_type(env: &Environment, mut ptr: ConstPtr<u8>) -> (ConstPtr<u8>, u32, u32) {
     // Пропускаем модификаторы типа (const, in, out, inout, bycopy, byref,
     // oneway)
     loop {
@@ -1550,6 +1551,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         ns_process_info::CLASSES,
         ns_pointer_array::CLASSES,
         ns_property_list_serialization::CLASSES,
+        ns_proxy::CLASSES,
         ns_regular_expression::CLASSES,
         ns_run_loop::CLASSES,
         ns_scanner::CLASSES,
@@ -1657,6 +1659,13 @@ impl crate::abi::GuestArg for NSRange {
     }
 }
 
+fn NSUnionRange(_env: &mut Environment, first: NSRange, second: NSRange) -> NSRange {
+    let location = first.location.min(second.location);
+    let end = first.location.wrapping_add(first.length)
+        .max(second.location.wrapping_add(second.length));
+    NSRange { location, length: end.wrapping_sub(location) }
+}
+
 fn NSStringFromRange(env: &mut Environment, range: NSRange) -> id {
     let loc = range.location;
 
@@ -1726,6 +1735,7 @@ fn hash_helper<T: std::hash::Hash>(hashable: &T) -> NSUInteger {
 
 const FUNCTIONS: FunctionExports = &[
     export_c_func!(NSStringFromRange(_)),
+    export_c_func!(NSUnionRange(_, _)),
     export_c_func!(NSGetSizeAndAlignment(_, _, _)),
     export_c_func!(CFStringGetCharactersPtr(_)),
 ];

@@ -140,6 +140,18 @@ impl GLESContext for LoggingGLESContext {
 }
 
 impl<'a> GLES for LoggingGLES<'a> {
+    fn has_separate_framebuffer_bindings(&self) -> bool {
+        self.inner.has_separate_framebuffer_bindings()
+    }
+    fn is_es2(&self) -> bool {
+        self.inner.is_es2()
+    }
+    fn is_es3(&self) -> bool {
+        self.inner.is_es3()
+    }
+    fn is_translator(&self) -> bool {
+        self.inner.is_translator()
+    }
     fn is_native_es1(&self) -> bool {
         self.inner.is_native_es1()
     }

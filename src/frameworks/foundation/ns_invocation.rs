@@ -5,7 +5,7 @@
  */
 //! `NSInvocation` and `NSMethodSignature`.
 
-use crate::abi::{extend_stack_for_args, write_next_arg, GuestArg};
+use crate::abi::{extend_stack_for_args, write_next_arg};
 use crate::cpu::Cpu;
 use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::libc::string::strdup;
@@ -39,6 +39,7 @@ struct NSInvocationHostObject {
     sig: id,
     /// Строки типов аргументов, полученные из `sig` во время создания
     argument_types: Vec<String>,
+    argument_sizes: Vec<u32>,
     target: id,
     selector: Option<SEL>,
     /// Выделенный буфер для каждого аргумента. Option указывает, был ли
@@ -117,6 +118,16 @@ pub const CLASSES: ClassExports = objc_classes! {
                         else if sc == close {
                             depth -= 1;
                             if depth == 0 { break; }
+                        }
+                    }
+                } else if c == '@' {
+                    if chars.peek() == Some(&'?') {
+                        current_type.push(chars.next().unwrap());
+                    } else if chars.peek() == Some(&'"') {
+                        current_type.push(chars.next().unwrap());
+                        for sc in chars.by_ref() {
+                            current_type.push(sc);
+                            if sc == '"' { break; }
                         }
                     }
                 } else if c == '"' {
@@ -254,6 +265,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(NSInvocationHostObject {
         sig: nil,
         argument_types: Vec::new(),
+        argument_sizes: Vec::new(),
         target: nil,
         selector: None,
         arguments: Vec::new(),
@@ -268,15 +280,25 @@ pub const CLASSES: ClassExports = objc_classes! {
     retain(env, sig);
     let num_of_args: NSUInteger = msg![env; sig numberOfArguments];
     let mut argument_types: Vec<String> = Vec::with_capacity(num_of_args as usize);
+    let mut argument_sizes = Vec::with_capacity(num_of_args as usize);
 
     for i in 0..num_of_args {
         let type_ptr: ConstPtr<u8> = msg![env; sig getArgumentTypeAtIndex:i];
-        argument_types.push(env.mem.cstr_at_utf8(type_ptr).unwrap().to_string());
+        let (_, size, _) = super::parse_objc_type(env, type_ptr);
+        argument_sizes.push(size);
+        let encoding = env.mem.cstr_at_utf8(type_ptr).unwrap();
+        let encoding = encoding.trim_start_matches(['r', 'n', 'N', 'o', 'O', 'R', 'V']);
+        argument_types.push(if encoding.starts_with("@\"") {
+            "@".to_owned()
+        } else {
+            encoding.to_owned()
+        });
     }
 
     let host_object = Box::new(NSInvocationHostObject {
         sig,
         argument_types,
+        argument_sizes,
         target: nil,
         selector: None,
         arguments: vec![None; num_of_args as usize],
@@ -485,9 +507,11 @@ pub const CLASSES: ClassExports = objc_classes! {
             env.mem.alloc_and_write(arg).cast()
         }
         _ => {
-            let arg_loc: MutPtr<u32> = arg_loc.cast();
-            let arg = env.mem.read(arg_loc);
-            env.mem.alloc_and_write(arg).cast()
+            let size = env.objc.borrow::<NSInvocationHostObject>(this).argument_sizes[idx as usize];
+            let bytes = env.mem.bytes_at(arg_loc.cast(), size).to_vec();
+            let buffer = env.mem.alloc(size);
+            env.mem.bytes_at_mut(buffer.cast(), size).copy_from_slice(&bytes);
+            buffer
         }
     };
 
@@ -508,12 +532,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         return;
     }
 
-    let arguments: &Vec<Option<MutVoidPtr>> = env.objc.borrow::<NSInvocationHostObject>(this).arguments.as_ref();
-    let set_count = arguments.iter().flatten().count();
-    let all_count = arguments.len();
-
-    if set_count + 2 != all_count && all_count >= 2 {
-        log!("Warning: NSInvocation invoked without all arguments set");
+    let host = env.objc.borrow::<NSInvocationHostObject>(this);
+    if host.arguments.iter().skip(2).any(Option::is_none) {
+        log!("Warning: NSInvocation has unset arguments; using zero without shifting later arguments");
     }
 
     let sig = env.objc.borrow::<NSInvocationHostObject>(this).sig;
@@ -528,89 +549,20 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
-    let mut reg_count = 0;
-    let argument_types: &Vec<String> = env.objc.borrow::<NSInvocationHostObject>(this).argument_types.as_ref();
-
-    if argument_types.is_empty() {
-        reg_count = 2;
-    } else {
-        for arg_type in argument_types.iter() {
-            reg_count += match arg_type.as_str() {
-                "@" => <id as GuestArg>::REG_COUNT,
-                ":" => <SEL as GuestArg>::REG_COUNT,
-                "f" => <f32 as GuestArg>::REG_COUNT,
-                "c" => <u8 as GuestArg>::REG_COUNT,
-                "*" => <MutPtr<u8> as GuestArg>::REG_COUNT,
-                _ if arg_type.starts_with('^') => <MutVoidPtr as GuestArg>::REG_COUNT,
-                // Double/Long Long occupy 2 registers (8 bytes) on 32-bit ARM
-                "q" | "Q" | "d" => 2,
-                _ => <u32 as GuestArg>::REG_COUNT
-            }
-        }
+    let host = env.objc.borrow::<NSInvocationHostObject>(this);
+    let mut words = vec![host.target.to_bits(), host.selector.unwrap().to_bits()];
+    for i in 2..host.arguments.len() {
+        let size = host.argument_sizes[i] as usize;
+        let bytes = match host.arguments[i] {
+            Some(ptr) => env.mem.bytes_at(ptr.cast(), size as u32).to_vec(),
+            None => vec![0; size],
+        };
+        words.extend(argument_words(&host.argument_types[i], &bytes));
     }
-
-    let regs = env.cpu.regs_mut();
-    let old_sp = extend_stack_for_args(reg_count, regs);
-    let arguments: &Vec<Option<MutVoidPtr>> = env.objc.borrow::<NSInvocationHostObject>(this).arguments.as_ref();
-
-    let num_args = std::cmp::max(2, arguments.len());
+    let old_sp = extend_stack_for_args(words.len(), env.cpu.regs_mut());
     let mut reg_offset = 0;
-
-    for i in 0..num_args {
-        if i == 0 {
-            let target = env.objc.borrow::<NSInvocationHostObject>(this).target;
-            let regs = env.cpu.regs_mut();
-            write_next_arg::<id>(&mut reg_offset, regs, &mut env.mem, target);
-            continue;
-        }
-        if i == 1 {
-            let selector = env.objc.borrow::<NSInvocationHostObject>(this).selector.unwrap();
-            let regs = env.cpu.regs_mut();
-            write_next_arg::<SEL>(&mut reg_offset, regs, &mut env.mem, selector);
-            continue;
-        }
-
-        if let Some(arg_slot) = arguments.get(i).and_then(|a| *a) {
-            let arg_type = argument_types[i].as_str();
-            match arg_type {
-                "@" => {
-                    let arg: ConstPtr<id> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<id>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                },
-                "f" => {
-                    let arg: ConstPtr<f32> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<f32>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                },
-                "c" => {
-                    let arg: ConstPtr<u8> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<u8>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                }
-                "*" => {
-                    let arg: ConstPtr<MutPtr<u8>> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<MutPtr<u8>>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                }
-                _ if arg_type.starts_with('^') => {
-                    let arg: ConstPtr<MutVoidPtr> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<MutVoidPtr>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                }
-                _ => {
-                    let arg: ConstPtr<u32> = arg_slot.cast().cast_const();
-                    let arg_val = env.mem.read(arg);
-                    let regs = env.cpu.regs_mut();
-                    write_next_arg::<u32>(&mut reg_offset, regs, &mut env.mem, arg_val);
-                }
-            }
-        }
+    for word in words {
+        write_next_arg(&mut reg_offset, env.cpu.regs_mut(), &mut env.mem, word);
     }
 
     let &NSInvocationHostObject { target, selector, .. } = env.objc.borrow::<NSInvocationHostObject>(this);
@@ -652,3 +604,47 @@ pub const CLASSES: ClassExports = objc_classes! {
 @end
 
 };
+
+
+/// The iPhone OS ABI passes aggregates and wide scalars as consecutive words.
+/// Pad the last word, and extend signed narrow scalars to a full register.
+fn argument_words(encoding: &str, bytes: &[u8]) -> Vec<u32> {
+    match (encoding, bytes) {
+        ("c", [value]) => return vec![*value as i8 as i32 as u32],
+        ("s", [a, b]) => return vec![i16::from_le_bytes([*a, *b]) as i32 as u32],
+        _ => {}
+    }
+    bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = [0; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(word)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::argument_words;
+    #[test]
+    fn preserves_wide_and_aggregate_arguments() {
+        assert_eq!(
+            argument_words("d", &1.0_f64.to_le_bytes()),
+            vec![0, 0x3ff00000]
+        );
+        assert_eq!(
+            argument_words("q", &(-1_i64).to_le_bytes()),
+            vec![u32::MAX; 2]
+        );
+        assert_eq!(argument_words("{color=CCC}", &[1, 2, 3]), vec![0x030201]);
+        assert_eq!(argument_words("c", &[0xff]), vec![u32::MAX]);
+        assert_eq!(argument_words("s", &[0xfe, 0xff]), vec![u32::MAX - 1]);
+    }
+    #[test]
+    fn unset_wide_argument_keeps_following_argument_in_place() {
+        let mut words = argument_words("d", &[0; 8]);
+        words.extend(argument_words("i", &42_u32.to_le_bytes()));
+        assert_eq!(words, vec![0, 0, 42]);
+    }
+}

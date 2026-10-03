@@ -319,6 +319,7 @@ const GET_PARAMS: ParamTable = ParamTable(&[
     (gl21::VERTEX_ARRAY_TYPE, ParamType::Int, 1),
     // OES_framebuffer_object -> EXT_framebuffer_object
     (gl21::FRAMEBUFFER_BINDING_EXT, ParamType::Int, 1),
+    (0x8CAA, ParamType::Int, 1), // READ_FRAMEBUFFER_BINDING_EXT
     (gl21::RENDERBUFFER_BINDING_EXT, ParamType::Int, 1),
     // EXT_texture_lod_bias
     (gl21::MAX_TEXTURE_LOD_BIAS_EXT, ParamType::Float, 1),
@@ -1213,6 +1214,9 @@ fn weight_stride_or(stride: GLint) -> usize {
 }
 
 impl GLES for GLES1OnGL2<'_> {
+    fn has_separate_framebuffer_bindings(&self) -> bool {
+        gl21::BlitFramebufferEXT::is_loaded()
+    }
     fn is_gles1_on_gl2(&self) -> bool {
         true
     }
