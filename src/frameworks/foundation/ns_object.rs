@@ -379,6 +379,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (id)instanceMethodSignatureForSelector:(SEL)selector {
+    if let Some(types) = env.objc.class_get_method_signature(this, selector).copied() {
+        let types: MutVoidPtr = types.cast_mut().cast();
+        return msg_class![env; NSMethodSignature signatureWithObjCTypes:types];
+    }
     let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
     let sel_str = selector.as_str(&env.mem);
     let explicit_args = sel_str.chars().filter(|&c| c == ':').count() as NSUInteger;
@@ -691,6 +695,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)methodSignatureForSelector:(SEL)selector {
+    if let Some(types) = env.objc.object_get_method_signature(&env.mem, this, selector).copied() {
+        let types: MutVoidPtr = types.cast_mut().cast();
+        return msg_class![env; NSMethodSignature signatureWithObjCTypes:types];
+    }
     let sig: id = msg_class![env; NSMethodSignature signatureWithObjCTypes:(MutVoidPtr::null())];
     let sel_str = selector.as_str(&env.mem);
     let explicit_args = sel_str.chars().filter(|&c| c == ':').count() as NSUInteger;

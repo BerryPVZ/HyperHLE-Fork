@@ -17,8 +17,6 @@ use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
     NSZonePtr,
 };
-use std::ops::{Add, Sub};
-use std::time::SystemTime;
 
 // Time interval constants
 const SECS_PER_DAY: NSTimeInterval = 86400.0;
@@ -209,21 +207,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (NSTimeInterval)timeIntervalSince1970 {
     let time_interval = env.objc.borrow::<NSDateHostObject>(this).time_interval;
-    // Real Foundation tolerates ±inf/NaN/extremely large interval values
-    // produced by buggy apps without aborting the process. Use the safe
-    // helper instead of `Duration::from_secs_f64`, which panics on any
-    // negative/NaN/infinite/over-u64 input. See
-    // `frameworks::foundation::ns_time_interval_to_duration` for the
-    // discussion of which guests triggered this.
-    let new_time = if time_interval >= 0.0 {
-        apple_epoch().add(super::ns_time_interval_to_duration_or_zero(time_interval))
-    } else {
-        apple_epoch().sub(super::ns_time_interval_to_duration_or_zero(-time_interval))
-    };
-    new_time
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64()
+    time_interval + SECS_FROM_UNIX_TO_APPLE_EPOCHS as NSTimeInterval
 }
 
 // MARK: - Adding Time Intervals
