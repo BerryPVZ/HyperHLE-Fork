@@ -25,6 +25,7 @@ use crate::dyld::{
 use crate::fastmap::{FxHashMap, FxHashSet};
 use crate::MutexId;
 
+mod btc_content;
 mod classes;
 mod messages;
 mod methods;
@@ -98,6 +99,9 @@ pub type NSZonePtr = crate::mem::MutVoidPtr;
 
 /// Main type holding Objective-C runtime state.
 pub struct ObjC {
+    /// Nesting depth of BTC Sports classic background menu construction.
+    btc_classic_menu_depth: u32,
+
     /// Known selectors (interned method name strings).
     selectors: FxHashMap<String, SEL>,
 
@@ -215,6 +219,7 @@ pub struct ObjC {
 impl ObjC {
     pub fn new() -> ObjC {
         ObjC {
+            btc_classic_menu_depth: 0,
             selectors: FxHashMap::default(),
             objects: FxHashMap::default(),
             classes: FxHashMap::default(),

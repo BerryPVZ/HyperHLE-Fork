@@ -380,6 +380,15 @@ fn objc_msgSend_inner(
         return;
     }
 
+    if super2.is_none() && super::btc_content::intercept(env, orig_class, selector) {
+        return;
+    }
+    let btc_token = if super2.is_none() {
+        super::btc_content::before(env, receiver, orig_class, selector)
+    } else {
+        None
+    };
+
     // ULTRAHLE_MINIONJUMP_TAP_BRIDGE_BEGIN
     // Minion Jump / SheepEscape: map Cocos2D GrowButton/GrowStarButton objects
     // to their real target+selector callbacks. This is app-gated so Potato and
@@ -700,6 +709,8 @@ Type mismatch when sending message {} to {:?}!
                     // interfere with pass-through of stack arguments.
                     IMP::Guest(guest_imp) => guest_imp.call_without_pushing_stack_frame(env),
                 }
+
+                super::btc_content::after(env, btc_token);
 
                 // ULTRAHLE_MINIONJUMP_TAP_POSTCALL_BEGIN
                 if ultrahle_minionjump_active && ultrahle_minionjump_factory_should_map {
