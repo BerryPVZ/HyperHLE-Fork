@@ -45,7 +45,7 @@ use crate::frameworks::foundation::{unichar, NSRange, NSUInteger};
 use crate::frameworks::uikit::ui_font::{draw_font_glyph, font_from_uifont, is_uifont};
 use crate::mem::{ConstPtr, ConstVoidPtr, MutPtr, Ptr};
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, retain, ClassExports, HostObject,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
 };
 use crate::Environment;
 
@@ -127,42 +127,60 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 @implementation _touchHLE_CTFontDescriptor: NSObject
 - (())dealloc {
+    let attrs = env.objc.borrow::<CTFontDescriptorHostObject>(this).attrs;
+    release(env, attrs);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFont: NSObject
 - (())dealloc {
+    let font = env.objc.borrow::<CTFontHostObject>(this).font;
+    release(env, font);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CFAttributedString: NSObject
 - (())dealloc {
+    let string = env.objc.borrow::<CTAttributedStringHostObject>(this).string;
+    release(env, string);
+    let attrs = env.objc.borrow::<CTAttributedStringHostObject>(this).attrs;
+    release(env, attrs);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTTypesetter: NSObject
 - (())dealloc {
+    let attr_string = env.objc.borrow::<CTTypesetterHostObject>(this).attr_string;
+    release(env, attr_string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTLine: NSObject
 - (())dealloc {
+    let text = env.objc.borrow::<CTLineHostObject>(this).text;
+    release(env, text);
+    let font = env.objc.borrow::<CTLineHostObject>(this).font;
+    release(env, font);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFramesetter: NSObject
 - (())dealloc {
+    let attr_string = env.objc.borrow::<CTFramesetterHostObject>(this).attr_string;
+    release(env, attr_string);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
 
 @implementation _touchHLE_CTFrame: NSObject
 - (())dealloc {
+    let line = env.objc.borrow::<CTFrameHostObject>(this).line;
+    release(env, line);
     env.objc.dealloc_object(this, &mut env.mem)
 }
 @end
@@ -292,15 +310,27 @@ fn font_from_descriptor(
 }
 
 fn attributed_string_text(env: &mut Environment, attr_string: CFAttributedStringRef) -> id {
-    env.objc
-        .borrow::<CTAttributedStringHostObject>(attr_string)
-        .string
+    if let Some(host) = env.objc.get_host_object(attr_string)
+        .and_then(|h| h.as_any().downcast_ref::<CTAttributedStringHostObject>())
+    {
+        host.string
+    } else {
+        // CFAttributedString and NSAttributedString are toll-free bridged.
+        msg![env; attr_string string]
+    }
 }
 
 fn attributed_string_attrs(env: &mut Environment, attr_string: CFAttributedStringRef) -> id {
-    env.objc
-        .borrow::<CTAttributedStringHostObject>(attr_string)
-        .attrs
+    if let Some(host) = env.objc.get_host_object(attr_string)
+        .and_then(|h| h.as_any().downcast_ref::<CTAttributedStringHostObject>())
+    {
+        host.attrs
+    } else {
+        let length: NSUInteger = msg![env; attr_string length];
+        if length == 0 { return nil; }
+        let range: MutPtr<NSRange> = MutPtr::null();
+        msg![env; attr_string attributesAtIndex:0u32 effectiveRange:range]
+    }
 }
 
 fn string_and_font_from_attr_string(
@@ -317,6 +347,10 @@ fn string_and_font_from_attr_string(
         if maybe_font != nil {
             if is_uifont(env, maybe_font) {
                 maybe_font
+            } else if let Some(host) = env.objc.get_host_object(maybe_font)
+                .and_then(|h| h.as_any().downcast_ref::<CTFontHostObject>())
+            {
+                host.font
             } else {
                 msg_class![env; UIFont systemFontOfSize:12.0]
             }
@@ -364,6 +398,22 @@ fn CTFontCreateWithFontDescriptor(
     _matrix: ConstVoidPtr,
 ) -> CTFontRef {
     let font = font_from_descriptor(env, descriptor, size);
+    retain(env, font);
+    alloc_font(env, font)
+}
+
+/// Named Core Text fonts use the same font fallback as UIFont.
+fn CTFontCreateWithName(
+    env: &mut Environment,
+    name: id,
+    size: CGFloat,
+    _matrix: ConstVoidPtr,
+) -> CTFontRef {
+    let size = if size == 0.0 { 12.0 } else { size };
+    let font: id = msg_class![env; UIFont fontWithName:name size:size];
+    let font = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:size]
+    } else { font };
     retain(env, font);
     alloc_font(env, font)
 }
@@ -441,22 +491,18 @@ fn CFAttributedStringCreateCopy(
     if string.is_null() {
         return nil;
     }
-    let host = env
-        .objc
-        .borrow::<CTAttributedStringHostObject>(string)
-        .clone();
-    retain(env, host.string);
-    retain(env, host.attrs);
-    alloc_attr_string(env, host.string, host.attrs)
+    let text = attributed_string_text(env, string);
+    let attrs = attributed_string_attrs(env, string);
+    retain(env, text);
+    retain(env, attrs);
+    alloc_attr_string(env, text, attrs)
 }
 
 fn CFAttributedStringGetString(env: &mut Environment, attr_string: CFAttributedStringRef) -> id {
     if attr_string.is_null() {
         return nil;
     }
-    env.objc
-        .borrow::<CTAttributedStringHostObject>(attr_string)
-        .string
+    attributed_string_text(env, attr_string)
 }
 
 fn CTTypesetterCreateWithAttributedString(
@@ -515,7 +561,7 @@ fn CTLineGetTypographicBounds(
     ascent: MutPtr<CGFloat>,
     descent: MutPtr<CGFloat>,
     leading: MutPtr<CGFloat>,
-) -> CGFloat {
+) -> f64 {
     if line.is_null() {
         return 0.0;
     }
@@ -537,7 +583,7 @@ fn CTLineGetTypographicBounds(
     if !leading.is_null() {
         env.mem.write(leading, leading_val);
     }
-    width
+    f64::from(width)
 }
 
 fn CTLineGetImageBounds(env: &mut Environment, line: CTLineRef, _context: id) -> CGRect {
@@ -1064,6 +1110,7 @@ fn CTParagraphStyleGetValueForSpecifier(
 }
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(CTFontCreateWithName(_, _, _)),
     export_c_func!(CTFontCreateWithGraphicsFont(_, _, _, _)),
     export_c_func!(CTFontCreateWithFontDescriptor(_, _, _)),
     export_c_func!(CTFontDescriptorCreateWithAttributes(_)),
