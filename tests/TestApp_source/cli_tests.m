@@ -252,6 +252,41 @@ int test_object_setIvar_roundTripsGuestIvar(void) {
   return result;
 }
 
+int test_NSSet_copyPreservesTouchOwnership(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSObject *touch = [[NSObject alloc] init];
+  NSMutableSet *began = [NSMutableSet setWithObject:touch];
+  NSMutableSet *active = [[NSMutableSet alloc] init];
+
+  // Cocos removes swallowed touches from a mutable copy before EAGLView
+  // records the original began set. The release must still intersect it.
+  NSMutableSet *unclaimed = [began mutableCopy];
+  [unclaimed removeObject:touch];
+  [active unionSet:began];
+  NSMutableSet *ended = [[NSSet setWithObject:touch] mutableCopy];
+  [ended intersectSet:active];
+  int result = ([unclaimed count] == 0 && [began containsObject:touch] &&
+                [ended containsObject:touch]) ? 0 : -1;
+
+  NSAutoreleasePool *inner = [[NSAutoreleasePool alloc] init];
+  NSSet *snapshot = [began copy];
+  NSMutableSet *editable = [snapshot mutableCopy];
+  [inner drain]; // Both copy variants must return owned objects.
+  [began removeObject:touch];
+  [editable removeObject:touch];
+  if (![snapshot containsObject:touch] || [editable count] != 0)
+    result = -2;
+
+  [editable release];
+  [snapshot release];
+  [ended release];
+  [unclaimed release];
+  [active release];
+  [touch release];
+  [pool drain];
+  return result;
+}
+
 int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
   NSString *identifier = @"org.touchhle.TestResources";
   NSAutoreleasePool *innerPool = [[NSAutoreleasePool alloc] init];
@@ -6511,6 +6546,7 @@ struct {
     FUNC_DEF(test_UIWebView_delegateCanCancelProgrammaticLoad),
     FUNC_DEF(test_object_setIvar_roundTripsGuestIvar),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
+    FUNC_DEF(test_NSSet_copyPreservesTouchOwnership),
 };
 // clang-format on
 
