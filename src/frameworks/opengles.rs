@@ -26,6 +26,9 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
 
 #[derive(Default)]
 pub struct State {
+    /// Internal-context texture and reusable pixels for full-frame readback.
+    fullscreen_readback_texture: u32,
+    fullscreen_readback_pixels: Vec<u8>,
     /// Current EAGLContext for each thread
     current_ctxs: std::collections::HashMap<crate::ThreadId, Option<crate::objc::id>>,
     /// `glGetString()` results cache, keyed by `(is_es2, name)` so that an

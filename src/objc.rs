@@ -25,7 +25,6 @@ use crate::dyld::{
 use crate::fastmap::{FxHashMap, FxHashSet};
 use crate::MutexId;
 
-mod btc_sports;
 mod classes;
 mod messages;
 mod methods;

@@ -350,4 +350,5 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 
 # Break the Cookie: Sports (Kobold2D config.lua uses CCDirector rotation).
 # Its Info.plist advertises portrait too, despite landscape-only gameplay.
-hu.BV.BTC-Olympic: --landscape-left
+# Read back the portrait drawable and apply device rotation once.
+hu.BV.BTC-Olympic: --landscape-left --present-mode=readback

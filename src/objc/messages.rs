@@ -380,10 +380,6 @@ fn objc_msgSend_inner(
         return;
     }
 
-    if super2.is_none() {
-        super::btc_sports::before_on_enter(env, receiver, orig_class, selector);
-    }
-
     // ULTRAHLE_MINIONJUMP_TAP_BRIDGE_BEGIN
     // Minion Jump / SheepEscape: map Cocos2D GrowButton/GrowStarButton objects
     // to their real target+selector callbacks. This is app-gated so Potato and
