@@ -882,24 +882,59 @@ pub fn decode_current_data(env: &mut Environment, unarchiver: id, is_mutable: bo
 
 fn keys_for_key(env: &mut Environment, unarchiver: id, key: &str) -> Vec<Uid> {
     let host_obj = borrow_host_obj(env, unarchiver);
-    let Some(objects) = host_obj.plist.get("$objects").and_then(|v| v.as_array()) else {
-        return Vec::new();
+    collection_keys(&host_obj.plist, host_obj.current_key, key)
+}
+
+fn collection_keys(plist: &Dictionary, current_key: Option<Uid>, key: &str) -> Vec<Uid> {
+    // Collections may be encoded directly into $top (e.g. an NSSet
+    // containing the root object), without a surrounding UID dictionary.
+    let dict = if let Some(current_key) = current_key {
+        plist.get("$objects")
+            .and_then(Value::as_array)
+            .and_then(|objects| objects.get(current_key.get() as usize))
+            .and_then(Value::as_dictionary)
+    } else {
+        plist.get("$top").and_then(Value::as_dictionary)
     };
-    let Some(current_key) = host_obj.current_key else {
-        return Vec::new();
-    };
-    let idx = current_key.get() as usize;
-    if idx >= objects.len() {
-        return Vec::new();
-    }
-    let item = &objects[idx];
-    let Some(dict) = item.as_dictionary() else {
-        return Vec::new();
-    };
+    let Some(dict) = dict else { return Vec::new(); };
     let Some(arr) = dict.get(key).and_then(|v| v.as_array()) else {
         return Vec::new();
     };
     arr.iter()
         .filter_map(|value| value.as_uid().copied())
         .collect()
+}
+
+#[cfg(test)]
+mod collection_tests {
+    use super::*;
+
+    fn scope(key: &str, indices: &[u64]) -> Value {
+        let mut dict = Dictionary::new();
+        dict.insert(key.into(), Value::Array(indices.iter()
+            .map(|&i| Value::Uid(Uid::new(i))).collect()));
+        Value::Dictionary(dict)
+    }
+
+    #[test]
+    fn decodes_collection_members_directly_in_top() {
+        let mut plist = Dictionary::new();
+        plist.insert("$top".into(), scope("NS.objects", &[1, 2]));
+        assert_eq!(collection_keys(&plist, None, "NS.objects"),
+            vec![Uid::new(1), Uid::new(2)]);
+        assert!(collection_keys(&plist, None, "NS.keys").is_empty());
+    }
+
+    #[test]
+    fn nested_collection_uses_its_own_scope() {
+        let mut plist = Dictionary::new();
+        plist.insert("$top".into(), scope("NS.objects", &[1]));
+        plist.insert("$objects".into(), Value::Array(vec![
+            Value::String("$null".into()), scope("NS.objects", &[2, 3]),
+        ]));
+        assert_eq!(collection_keys(&plist, Some(Uid::new(1)), "NS.objects"),
+            vec![Uid::new(2), Uid::new(3)]);
+        // An invalid nested UID must not silently decode the root instead.
+        assert!(collection_keys(&plist, Some(Uid::new(99)), "NS.objects").is_empty());
+    }
 }
