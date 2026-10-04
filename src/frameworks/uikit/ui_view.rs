@@ -359,14 +359,11 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 + (Class)layerClass {
-    // Game engines that ship their own GL view classes (Gameloft's EAGLView,
-    // Cocos2d's CCEAGLView, etc.) override +layerClass to return CAEAGLLayer.
-    // Mirror that here so their backing layer is a real CAEAGLLayer: the EAGL
-    // fast-path presentation and find_fullscreen_eagl_layer() both depend on
-    // the layer being an EAGL layer, otherwise frames go through the RAM
-    // readback slow path (or never reach the screen at all - see the
-    // Asphalt 8 black-screen report).
-    env.objc.get_known_class("CAEAGLLayer", &mut env.mem)
+    // UIView uses an ordinary backing layer. GL view subclasses supply their
+    // own +layerClass override. Making every UIView a CAEAGLLayer causes an
+    // empty overlay to be selected as the fullscreen GL surface, discarding
+    // the actual game's frames (for example PvZ Great Wall's GameView).
+    env.objc.get_known_class("CALayer", &mut env.mem)
 }
 
 // MARK: - Class-level animation block API
