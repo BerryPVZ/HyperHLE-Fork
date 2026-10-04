@@ -47,6 +47,7 @@ public class MainActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        PreviousExitReport.collect(this);
         // Acquire the multicast lock here (not just declare it): Android
         // Wi-Fi drivers drop multicast unless the app holds it, which broke
         // Bonjour/NSNetService LAN discovery (GameKit, Gameloft games).
