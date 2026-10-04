@@ -13,7 +13,7 @@ use crate::abi::{CallFromHost, DotDotDot, GuestFunction};
 use crate::environment::Environment;
 use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, Ptr};
 use crate::objc::{
-    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject,
+    autorelease, id, msg, msg_class, nil, objc_classes, release, retain, Class, ClassExports, HostObject,
     NSZonePtr, SEL,
 };
 
@@ -71,7 +71,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)setWithSet:(id)object {
     // assert!(object != nil);
     let new: id = msg![env; this alloc];
-    let new: id = msg![env; new initWithObject:object];
+    let new: id = msg![env; new initWithSet:object];
     autorelease(env, new)
 }
 
@@ -106,6 +106,31 @@ pub const CLASSES: ClassExports = objc_classes! {
     let new: id = msg_class![env; _touchHLE_NSSet alloc];
     let new: id = msg![env; new initWithObjects:objects count:count];
     autorelease(env, new)
+}
+
+// Both concrete set classes share the keyed archive's NS.objects array.
+- (id)initWithCoder:(id)coder {
+    let class: Class = msg![env; coder class];
+    let keyed: Class = msg_class![env; NSKeyedUnarchiver class];
+    let nib: Class = msg_class![env; _touchHLE_NIBArchiveDecoder class];
+    let objects = if env.objc.class_is_subclass_of(class, keyed) {
+        super::ns_keyed_unarchiver::decode_current_array(env, coder)
+    } else if env.objc.class_is_subclass_of(class, nib) {
+        super::_nib_archive_decoder::decode_current_array(env, coder)
+    } else {
+        let key = super::ns_string::get_static_str(env, "NS.objects");
+        let array: id = msg![env; coder decodeObjectForKey:key];
+        return msg![env; this initWithArray:array];
+    };
+    let mut dict = DictionaryHostObject::default();
+    let null: id = msg_class![env; NSNull null];
+    for object in objects {
+        dict.insert(env, object, null, false);
+        release(env, object); // decode_current_array retained each member.
+    }
+    let mut old = std::mem::replace(&mut env.objc.borrow_mut::<SetHostObject>(this).dict, dict);
+    old.release(env);
+    this
 }
 
 // NSCopying implementation
@@ -187,6 +212,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
     true
+}
+
+- (id)setByAddingObject:(id)object {
+    let mut dict = set_from_set(env, this, false);
+    let null: id = msg_class![env; NSNull null];
+    dict.insert(env, object, null, false);
+    let new: id = msg_class![env; NSSet alloc];
+    env.objc.borrow_mut::<SetHostObject>(new).dict = dict;
+    autorelease(env, new)
 }
 
 // Apple: "Returns a new set containing the objects of the receiving set and
@@ -788,9 +822,12 @@ fn set_union(env: &mut Environment, set: id, other: id) -> DictionaryHostObject 
         return dict;
     }
     let null: id = msg_class![env; NSNull null];
-    let count: NSUInteger = msg![env; other count];
-    for i in 0..count {
-        let object: id = msg![env; other objectAtIndex:i];
+    let enumerator: id = msg![env; other objectEnumerator];
+    loop {
+        let object: id = msg![env; enumerator nextObject];
+        if object == nil {
+            break;
+        }
         dict.insert(env, object, null, /* copy_key: */ false);
     }
     dict

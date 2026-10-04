@@ -20,7 +20,6 @@ use crate::objc::{
 use crate::Environment;
 use plist::Value;
 use std::io::Cursor;
-use std::ops::Add;
 use std::time::SystemTime;
 
 pub type NSPropertyListMutabilityOptions = NSUInteger;
@@ -45,11 +44,22 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)dataFromPropertyList:(id)plist
                     format:(NSPropertyListFormat)_format
-                errorDescription:(MutPtr<id>)_error_string { // NSString **
+                errorDescription:(MutPtr<id>)error_string { // NSString **
     // assert_eq!(format, NSPropertyListBinaryFormat_v1_0); // TODO
     // assert!(error_string.is_null()); // TODO
 
-    let value = serialize_plist(env, plist);
+    let value = match serialize_plist(env, plist) {
+        Ok(value) => value,
+        Err(reason) => {
+            log!("Cannot serialize property list: {}", reason);
+            if !error_string.is_null() {
+                let error = ns_string::from_rust_string(env, reason.to_owned());
+                let error = autorelease(env, error);
+                env.mem.write(error_string, error);
+            }
+            return nil;
+        }
+    };
     log_dbg!("dataFromPropertyList value {:?}", value);
     let mut buf = Vec::new();
     value.to_writer_binary(&mut buf).unwrap();
@@ -383,7 +393,7 @@ fn deserialize_plist(
     }
 }
 
-fn serialize_plist(env: &mut Environment, plist: id) -> Value {
+fn serialize_plist(env: &mut Environment, plist: id) -> Result<Value, &'static str> {
     let class: Class = msg![env; plist class];
 
     let dict_class = env.objc.get_known_class("NSDictionary", &mut env.mem);
@@ -393,14 +403,14 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
     let data_class = env.objc.get_known_class("NSData", &mut env.mem);
     let date_class = env.objc.get_known_class("NSDate", &mut env.mem);
 
-    if env.objc.class_is_subclass_of(class, dict_class) {
+    Ok(if env.objc.class_is_subclass_of(class, dict_class) {
         if !env.objc.get_class_name(class).starts_with("_touchHLE_NS") {
             log!(
                 "Warning: serialize_plist: dictionary subclass {} is not our \
                  internal implementation; serializing as empty dict.",
                 env.objc.get_class_name(class)
             );
-            return Value::Dictionary(plist::dictionary::Dictionary::new());
+            return Ok(Value::Dictionary(plist::dictionary::Dictionary::new()));
         }
 
         let mut dict = plist::dictionary::Dictionary::new();
@@ -431,7 +441,7 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
             }
 
             let key_string = ns_string::to_rust_string(env, key);
-            let val_plist = serialize_plist(env, val);
+            let val_plist = serialize_plist(env, val)?;
             dict.insert(String::from(key_string), val_plist);
         }
         Value::Dictionary(dict)
@@ -442,17 +452,17 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
                  implementation; serializing as empty array.",
                 env.objc.get_class_name(class)
             );
-            return Value::Array(Vec::new());
+            return Ok(Value::Array(Vec::new()));
         }
 
         let arr_host_obj: ArrayHostObject = std::mem::take(env.objc.borrow_mut(plist));
-        let arr: Vec<Value> = arr_host_obj
+        let arr: Result<Vec<Value>, _> = arr_host_obj
             .array
             .iter()
             .map(|&value| serialize_plist(env, value))
             .collect();
         *env.objc.borrow_mut(plist) = arr_host_obj;
-        Value::Array(arr)
+        Value::Array(arr?)
     } else if env.objc.class_is_subclass_of(class, str_class) {
         if !env.objc.get_class_name(class).starts_with("_touchHLE_NS") {
             log!(
@@ -460,7 +470,7 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
                  implementation; serializing as empty string.",
                 env.objc.get_class_name(class)
             );
-            return Value::String(String::new());
+            return Ok(Value::String(String::new()));
         }
 
         let s = ns_string::to_rust_string(env, plist);
@@ -485,9 +495,8 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
         Value::Data(buffer_slice.to_vec())
     } else if env.objc.class_is_subclass_of(class, date_class) {
         let date = env.objc.borrow::<NSDateHostObject>(plist);
-        let time = apple_epoch().add(
-            crate::frameworks::foundation::ns_time_interval_to_duration_or_zero(date.time_interval),
-        );
+        let time = plist_date_time(date.time_interval)
+            .ok_or("NSDate is outside the representable property-list date range")?;
         Value::Date(time.into())
     } else {
         warn_unsupported_serialize_class_once(env.objc.get_class_name(class));
@@ -498,7 +507,7 @@ fn serialize_plist(env: &mut Environment, plist: id) -> Value {
         // -[<plist> description] returns —
         let description = msg![env; plist description];
         Value::String(ns_string::to_rust_string(env, description).to_string())
-    }
+    })
 }
 
 fn warn_unsupported_serialize_class_once(class_name: &str) {
@@ -539,6 +548,50 @@ pub(crate) fn cf_property_list_create_from_xml_data(
         Err(err) => {
             log_dbg!("CFPropertyListCreateFromXMLData: parse failed: {}", err);
             nil
+        }
+    }
+}
+
+
+/// Preserve signed dates and reject values outside the calendar range before
+/// SystemTime or plist's calendar conversion can overflow.
+fn plist_date_time(interval: f64) -> Option<SystemTime> {
+    // Calendar years 0001 through 9999, relative to 2001-01-01.
+    if !(-63_113_904_000.0..252_423_993_600.0).contains(&interval) {
+        return None;
+    }
+    let duration = std::time::Duration::try_from_secs_f64(interval.abs()).ok()?;
+    if interval < 0.0 {
+        apple_epoch().checked_sub(duration)
+    } else {
+        apple_epoch().checked_add(duration)
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    use super::*;
+    #[test]
+    fn signed_dates_round_trip_through_binary_plists() {
+        for seconds in [-978_307_201.5, -1.25, 0.0, 1.25, 63_113_904_000.0] {
+            let value = Value::Date(plist_date_time(seconds).unwrap().into());
+            let mut bytes = Vec::new();
+            value.to_writer_binary(&mut bytes).unwrap();
+            assert_eq!(Value::from_reader(Cursor::new(bytes)).unwrap(), value);
+        }
+    }
+    #[test]
+    fn invalid_dates_do_not_overflow() {
+        for seconds in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            1e18,
+            252_423_993_600.0,
+        ] {
+            assert!(plist_date_time(seconds).is_none());
         }
     }
 }

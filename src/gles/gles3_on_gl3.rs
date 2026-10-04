@@ -280,6 +280,9 @@ fn is_es1_only_hint_target(target: GLenum) -> bool {
 
 #[allow(clippy::missing_safety_doc)]
 impl GLES for GLES3OnGL3<'_> {
+    fn has_separate_framebuffer_bindings(&self) -> bool {
+        true
+    }
     fn is_es2(&self) -> bool {
         // ES 3.0 supersedes ES 2.0 and shares its shader-based dispatch.
         // `is_es2` gates the existing shader-aware code paths in

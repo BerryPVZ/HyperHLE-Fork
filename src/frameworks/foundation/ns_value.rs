@@ -225,6 +225,13 @@ fn decode_struct_value(
             encoding: enc.to_owned(),
             bytes,
         })
+    } else if matches!(enc.as_bytes().first(), Some(b'{' | b'(' | b'[')) {
+        let (_, size, _) = super::parse_objc_type(env, type_ptr.cast());
+        let bytes = env.mem.get_bytes_fallible(value, size)?.to_vec();
+        Some(NSValueHostObject::RawStruct {
+            encoding: enc.to_owned(),
+            bytes,
+        })
     } else {
         None
     }

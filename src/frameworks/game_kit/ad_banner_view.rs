@@ -10,7 +10,10 @@
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::frameworks::core_graphics::{CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
-use crate::objc::{id, msg, nil, objc_classes, release, retain, ClassExports, NSZonePtr};
+use crate::objc::{
+    id, impl_HostObject_with_superclass, msg, msg_super, nil, objc_classes, release, retain,
+    ClassExports, NSZonePtr,
+};
 
 // `ADBannerContentSizeIdentifier*` CFString constants. iAd-using apps export
 // these in `__nl_symbol_ptr` even when they never actually display a banner;
@@ -53,6 +56,7 @@ type ADBannerContentSizeIdentifier = id; // NSString*
 
 #[derive(Default)]
 struct ADBannerViewHostObject {
+    superclass: crate::frameworks::uikit::ui_view::UIViewHostObject,
     delegate: id,
     ad_type: ADAdType,
     banner_loaded: bool,
@@ -60,7 +64,7 @@ struct ADBannerViewHostObject {
     required_content_size_identifiers: id,
     current_content_size_identifier: id,
 }
-impl crate::objc::HostObject for ADBannerViewHostObject {}
+impl_HostObject_with_superclass!(ADBannerViewHostObject);
 
 #[derive(Default)]
 struct ADInterstitialAdHostObject {
@@ -81,6 +85,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 + (id)allocWithZone:(NSZonePtr)_zone {
     let host_object = Box::new(ADBannerViewHostObject {
+        superclass: Default::default(),
         delegate: nil,
         ad_type: ADAdTypeBanner,
         banner_loaded: false,
@@ -92,21 +97,21 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)init {
-    // Immediately tell the delegate no ad is available.
-    this
+    msg_super![env; this init]
 }
 
 - (id)initWithAdType:(ADAdType)ad_type {
+    let this: id = msg![env; this init];
     env.objc.borrow_mut::<ADBannerViewHostObject>(this).ad_type = ad_type;
     this
 }
 
-- (id)initWithFrame:(CGRect)_frame {
-    this
+- (id)initWithFrame:(CGRect)frame {
+    msg_super![env; this initWithFrame:frame]
 }
 
-- (id)initWithCoder:(id)_coder {
-    this
+- (id)initWithCoder:(id)coder {
+    msg_super![env; this initWithCoder:coder]
 }
 
 - (())dealloc {
@@ -120,7 +125,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     release(env, current);
     // delegate is weak — no release
     let _ = delegate;
-    env.objc.dealloc_object(this, &mut env.mem)
+    msg_super![env; this dealloc]
 }
 
 // MARK: - Delegate
