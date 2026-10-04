@@ -352,3 +352,6 @@ com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
 # Its Info.plist advertises portrait too, despite landscape-only gameplay.
 # Read back the portrait drawable and apply device rotation once.
 hu.BV.BTC-Olympic: --landscape-left --present-mode=readback
+
+# Break the Cookie Free uses the same CCDirector drawable and startup checks.
+hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback

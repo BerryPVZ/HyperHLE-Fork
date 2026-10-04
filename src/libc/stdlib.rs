@@ -1375,9 +1375,14 @@ fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
     };
     // BTC's GameManager init inspects the in-memory encryption command.
     // A decrypted dump clears cryptid, unlike the running device image.
-    // Restore that metadata for this app only, after the loader has accepted
+    // Restore that metadata for these apps only, after the loader has accepted
     // the decrypted executable. No code or on-disk game data is changed.
-    if index == 0 && env.bundle.bundle_identifier() == "hu.BV.BTC-Olympic" {
+    if index == 0
+        && matches!(
+            env.bundle.bundle_identifier(),
+            "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+        )
+    {
         let header = ConstPtr::<u32>::from_bits(base);
         let ncmds = env.mem.read(header + 4);
         let sizeofcmds: u32 = env.mem.read(header + 5);

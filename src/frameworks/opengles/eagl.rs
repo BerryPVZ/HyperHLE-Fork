@@ -1270,8 +1270,10 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
-    let full_frame =
-        env.bundle.bundle_identifier() == "hu.BV.BTC-Olympic" && !env.options.force_composition;
+    let full_frame = matches!(
+        env.bundle.bundle_identifier(),
+        "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+    ) && !env.options.force_composition;
     let pixels_vec = if full_frame {
         std::mem::take(&mut env.framework_state.opengles.fullscreen_readback_pixels)
     } else {
@@ -1324,7 +1326,7 @@ unsafe fn present_full_frame_readback(
     gles.ActiveTexture(gles11::TEXTURE0);
     gles.ClientActiveTexture(gles11::TEXTURE0);
     if texture == 0 {
-        log!("BTC Sports: presenting full {}x{} framebuffer with one device rotation in the internal GL context.", width, height);
+        log!("Break the Cookie: presenting full {}x{} framebuffer with one device rotation in the internal GL context.", width, height);
         gles.GenTextures(1, &mut texture);
     }
     gles.BindTexture(gles11::TEXTURE_2D, texture);
