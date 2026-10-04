@@ -552,6 +552,7 @@ fn fchmod(_env: &mut Environment, _fd: i32, _mode: u32) -> i32 {
 // touchHLE knows how to implement directly. The full list is enormous; we
 // only enumerate the ones we resolve here.
 const SYS_FORK: i32 = 2;
+const SYS_PTRACE: i32 = 26;
 const SYS_STAT: i32 = 188;
 const SYS_THREAD_SELFID: i32 = 372;
 const SYS_GETPID: i32 = 20;
@@ -582,6 +583,14 @@ fn syscall(env: &mut Environment, number: i32, args: DotDotDot) -> i32 {
     log_dbg!("syscall({}) called", number);
     match number {
         SYS_FORK => self::fork(env),
+        SYS_PTRACE => {
+            let mut args = args.start();
+            let request: i32 = args.next(env);
+            let pid: pid_t = args.next(env);
+            let address: MutPtr<u8> = args.next(env);
+            let data: i32 = args.next(env);
+            crate::libc::sys::ptrace::ptrace(env, request, pid, address, data)
+        }
         SYS_STAT => {
             let mut args = args.start();
             let path: ConstPtr<u8> = args.next(env);

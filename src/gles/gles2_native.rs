@@ -1448,6 +1448,12 @@ impl GLES for GLES2Native<'_> {
     unsafe fn GetUniformLocation(&mut self, program: GLuint, name: *const GLchar) -> GLint {
         gles2::GetUniformLocation(program, name)
     }
+    unsafe fn GetUniformiv(&mut self, program: GLuint, location: GLint, params: *mut GLint) {
+        gles2::GetUniformiv(program, location, params)
+    }
+    unsafe fn GetUniformfv(&mut self, program: GLuint, location: GLint, params: *mut GLfloat) {
+        gles2::GetUniformfv(program, location, params)
+    }
     #[allow(clippy::too_many_arguments)]
     unsafe fn GetActiveAttrib(
         &mut self,

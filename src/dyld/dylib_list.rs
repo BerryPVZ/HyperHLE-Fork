@@ -267,6 +267,7 @@ pub const DYLIB_LIST: &[&super::HostDylib] = &[
     &frameworks::gl_kit::DYLIB,
     &frameworks::image_io::DYLIB,
     &frameworks::photos::DYLIB,
+    &frameworks::replay_kit::DYLIB,
     &frameworks::quick_look::DYLIB,
     &frameworks::watch_connectivity::DYLIB,
     &frameworks::xsapitcui::DYLIB,
@@ -365,5 +366,44 @@ mod tests {
                 panic!("Found duplicate constant export {constant_name}");
             }
         }
+    }
+
+    #[test]
+    fn despicable_me_compatibility_exports_are_registered() {
+        let has_maximum_photo_size = DYLIB_LIST
+            .iter()
+            .flat_map(|dylib| dylib.constant_exports)
+            .copied()
+            .flatten()
+            .any(|(name, _)| *name == "_PHImageManagerMaximumSize");
+        let has_protected_open = DYLIB_LIST
+            .iter()
+            .flat_map(|dylib| dylib.function_exports)
+            .copied()
+            .flatten()
+            .any(|(name, _)| *name == "_open_dprotected_np");
+        let has_screen_recorder = DYLIB_LIST
+            .iter()
+            .flat_map(|dylib| dylib.class_exports)
+            .copied()
+            .flatten()
+            .any(|(name, template)| {
+                *name == "RPScreenRecorder"
+                    && template
+                        .class_methods
+                        .iter()
+                        .any(|(selector, _)| *selector == "sharedRecorder")
+                    && template
+                        .instance_methods
+                        .iter()
+                        .any(|(selector, _)| *selector == "isAvailable")
+            });
+
+        assert!(
+            has_maximum_photo_size,
+            "Photos maximum-size constant is missing"
+        );
+        assert!(has_protected_open, "open_dprotected_np is missing");
+        assert!(has_screen_recorder, "ReplayKit screen recorder is missing");
     }
 }
