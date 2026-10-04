@@ -347,3 +347,11 @@ com.disney.SwampyGame: --device-family=iphone-3gs
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and
 # force the compatibility texture filter on strict mobile GLES drivers.
 com.lego.ninjago.thefinalbattle: --landscape-left --fix-texture-min-filter
+
+# Break the Cookie: Sports (Kobold2D config.lua uses CCDirector rotation).
+# Its Info.plist advertises portrait too, despite landscape-only gameplay.
+# Read back the portrait drawable and apply device rotation once.
+hu.BV.BTC-Olympic: --landscape-left --present-mode=readback
+
+# Break the Cookie Free uses the same CCDirector drawable and startup checks.
+hu.BV.BreakTheCookieFree: --landscape-left --present-mode=readback

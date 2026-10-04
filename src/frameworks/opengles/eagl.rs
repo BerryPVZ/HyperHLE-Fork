@@ -1270,7 +1270,15 @@ fn dump_readback_ppm(pixels: &[u8], width: u32, height: u32) {
 unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLuint, drawable: id) {
     // PERF: recycle the layer's previous pixel buffer instead of allocating
     // (and page-faulting in) a fresh multi-megabyte Vec every frame.
-    let pixels_vec = get_pixels_vec_for_presenting(env, drawable);
+    let full_frame = matches!(
+        env.bundle.bundle_identifier(),
+        "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+    ) && !env.options.force_composition;
+    let pixels_vec = if full_frame {
+        std::mem::take(&mut env.framework_state.opengles.fullscreen_readback_pixels)
+    } else {
+        get_pixels_vec_for_presenting(env, drawable)
+    };
     let read_result = {
         let maybe_gles = super::sync_context(
             &mut env.framework_state.opengles,
@@ -1288,11 +1296,92 @@ unsafe fn present_renderbuffer_readback(env: &mut Environment, renderbuffer: GLu
         return;
     };
     dump_readback_ppm(&pixels, width, height);
+    if full_frame {
+        present_full_frame_readback(env, &pixels, width, height);
+        env.framework_state.opengles.fullscreen_readback_pixels = pixels;
+        return;
+    }
     present_pixels(env, drawable, pixels, width, height);
     let force_composition = env.options.force_composition;
     env.options.force_composition = true;
     crate::frameworks::core_animation::recomposite_if_necessary(env, true);
     env.options.force_composition = force_composition;
+}
+
+/// Present raw framebuffer pixels in the separate internal context. Unlike
+/// layer composition this applies exactly one display rotation, without
+/// UIKit frame clipping, and never changes the guest's sprite GL state.
+unsafe fn present_full_frame_readback(
+    env: &mut Environment,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) {
+    let window = env.window.as_mut().unwrap();
+    let viewport = window.viewport();
+    let rotation = window.rotation_matrix();
+    let cursor = window.virtual_cursor_visible_at();
+    let mut texture = env.framework_state.opengles.fullscreen_readback_texture;
+    let mut gles = window.make_internal_gl_ctx_current();
+    gles.ActiveTexture(gles11::TEXTURE0);
+    gles.ClientActiveTexture(gles11::TEXTURE0);
+    if texture == 0 {
+        log!("Break the Cookie: presenting full {}x{} framebuffer with one device rotation in the internal GL context.", width, height);
+        gles.GenTextures(1, &mut texture);
+    }
+    gles.BindTexture(gles11::TEXTURE_2D, texture);
+    for (pname, param) in [
+        (gles11::TEXTURE_MIN_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_MAG_FILTER, gles11::LINEAR),
+        (gles11::TEXTURE_WRAP_S, gles11::CLAMP_TO_EDGE),
+        (gles11::TEXTURE_WRAP_T, gles11::CLAMP_TO_EDGE),
+    ] {
+        gles.TexParameteri(gles11::TEXTURE_2D, pname, param as GLint);
+    }
+    gles.PixelStorei(gles11::UNPACK_ALIGNMENT, 1);
+    gles.TexImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        gles11::RGBA as GLint,
+        width as GLsizei,
+        height as GLsizei,
+        0,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixels.as_ptr().cast(),
+    );
+    gles.BindFramebufferOES(gles11::FRAMEBUFFER_OES, 0);
+    for cap in [
+        gles11::BLEND,
+        gles11::DEPTH_TEST,
+        gles11::STENCIL_TEST,
+        gles11::SCISSOR_TEST,
+        gles11::CULL_FACE,
+        gles11::LIGHTING,
+        gles11::FOG,
+        gles11::ALPHA_TEST,
+    ] {
+        gles.Disable(cap);
+    }
+    gles.DisableClientState(gles11::COLOR_ARRAY);
+    gles.DisableClientState(gles11::NORMAL_ARRAY);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+    gles.BindBuffer(gles11::ELEMENT_ARRAY_BUFFER, 0);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.TexEnvi(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        gles11::REPLACE as GLint,
+    );
+    for mode in [gles11::PROJECTION, gles11::MODELVIEW, gles11::TEXTURE] {
+        gles.MatrixMode(mode);
+        gles.LoadIdentity();
+    }
+    present_frame(gles.as_mut(), viewport, rotation, cursor);
+    drop(gles);
+    window.swap_window();
+    env.framework_state.opengles.fullscreen_readback_texture = texture;
 }
 
 /// Implement framerate limiting.
@@ -1563,6 +1652,18 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     prepare_readback_buffer(&mut pixel_buffer, size);
     let old_pack_alignment = get_int(gles, gles11::PACK_ALIGNMENT);
     gles.PixelStorei(gles11::PACK_ALIGNMENT, 1);
+    // A prior guest command can leave GL_INVALID_ENUM pending. It does not
+    // mean ReadPixels failed: establish an error boundary for this operation.
+    for _ in 0..16 {
+        let pending_error = gles.GetError();
+        if pending_error == gles11::NO_ERROR {
+            break;
+        }
+        log_dbg!(
+            "EAGL readback: clearing earlier GL error {:#x}",
+            pending_error
+        );
+    }
     let before = Instant::now();
     gles.ReadPixels(
         0,
@@ -1579,8 +1680,8 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
         height,
         Instant::now().saturating_duration_since(before)
     );
-    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
     let read_error = gles.GetError();
+    gles.PixelStorei(gles11::PACK_ALIGNMENT, old_pack_alignment);
 
     if !use_bound_framebuffer {
         gles.DeleteFramebuffersOES(1, &src_framebuffer);
@@ -1592,7 +1693,10 @@ unsafe fn read_renderbuffer(gles: &mut dyn GLES, renderbuffer: GLuint, mut pixel
     }
 
     if read_error != gles11::NO_ERROR {
-        log!("EAGL readback failed with GL error {:#x}; skipping frame", read_error);
+        log!(
+            "EAGL readback failed with GL error {:#x}; skipping frame",
+            read_error
+        );
         None
     } else {
         Some((pixel_buffer, width_u32, height_u32))
@@ -3773,6 +3877,22 @@ mod framebuffer_readback_tests {
                 (draw, 9, 8, 8)
             );
         }
+    }
+    #[test]
+    fn stale_guest_error_does_not_discard_valid_readback() {
+        let mut gl = Framebuffers {
+            draw: 7,
+            read: 7,
+            renderbuffer: 8,
+            pack: 4,
+            separate: false,
+            incomplete: false,
+            error: gles11::INVALID_ENUM,
+        };
+        let (pixels, width, height) =
+            unsafe { read_renderbuffer(&mut gl, 42, Vec::new()) }.unwrap();
+        assert_eq!((pixels, width, height), (vec![0x5a; 8], 2, 1));
+        assert_eq!((gl.draw, gl.read, gl.pack), (7, 7, 4));
     }
     #[test]
     fn incomplete_fallback_restores_both_bindings() {

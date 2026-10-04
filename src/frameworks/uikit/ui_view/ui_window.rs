@@ -421,7 +421,17 @@ pub const CLASSES: ClassExports = objc_classes! {
     //        are really equivalent and should all trigger autorotation.
     // `env.window` is `None` in headless mode; skip autorotation instead of
     // unwrapping (which would panic the host).
-    let rotation = env.window.as_ref().map(|window| window.current_rotation());
+    // BTC Sports and Free use Kobold2D's Autorotation.CCDirector, which rotates
+    // inside a portrait EAGL framebuffer. Rotating/resizing the UIKit root
+    // as well changes its drawable to landscape and clips the guest scene.
+    let rotation = if matches!(
+        env.bundle.bundle_identifier(),
+        "hu.BV.BTC-Olympic" | "hu.BV.BreakTheCookieFree"
+    ) {
+        None
+    } else {
+        env.window.as_ref().map(|window| window.current_rotation())
+    };
     if let Some(orientation) = rotation.and_then(|rotation| match rotation {
         crate::window::DeviceOrientation::LandscapeLeft => Some(UIDeviceOrientationLandscapeLeft),
         crate::window::DeviceOrientation::LandscapeRight => Some(UIDeviceOrientationLandscapeRight),
