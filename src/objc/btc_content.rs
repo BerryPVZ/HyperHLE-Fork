@@ -52,6 +52,7 @@ pub(super) fn intercept(env: &mut Environment, class: Class, sel: SEL) -> bool {
     }
     let value = match sel.as_str(&env.mem) {
         "isGummyBearAllowed" | "isLaboratoryAllowed" => 1,
+        "isMaterialAllowed:" if env.cpu.regs()[2] == 6 => 1,
         "appEdition" if env.objc.btc_classic_menu_depth > 0 => 0,
         _ => return false,
     };

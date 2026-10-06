@@ -82,6 +82,7 @@ pub struct State {
 }
 
 pub(crate) struct UIViewHostObject {
+    needs_layout: bool,
     pub(crate) layer: id,
     pub(crate) subviews: Vec<id>,
     pub(crate) superview: id,
@@ -139,6 +140,7 @@ impl HostObject for UIViewHostObject {}
 impl Default for UIViewHostObject {
     fn default() -> UIViewHostObject {
         UIViewHostObject {
+            needs_layout: true,
             layer: nil,
             subviews: Vec::new(),
             superview: nil,
@@ -210,9 +212,26 @@ fn init_common(env: &mut Environment, this: id) -> id {
 
     // A view's backing layer is not retained by the view.
     env.objc.borrow_mut::<UIViewHostObject>(this).layer = layer;
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
     env.framework_state.uikit.ui_view.views.push(this);
 
     this
+}
+
+/// Deliver deferred layout for views added or invalidated after app launch.
+pub fn layout_pending_views(env: &mut Environment) {
+    let views = env.framework_state.uikit.ui_view.views.clone();
+    for &view in &views { retain(env, view); }
+    for view in views {
+        if env.objc.borrow::<UIViewHostObject>(view).needs_layout {
+            let window: id = msg![env; view window];
+            if window != nil {
+                env.objc.borrow_mut::<UIViewHostObject>(view).needs_layout = false;
+                () = msg![env; view layoutSubviews];
+            }
+        }
+        release(env, view);
+    }
 }
 
 fn touchhle_cocos_view_class_name(env: &mut Environment, view: id) -> String {
@@ -1023,7 +1042,9 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setTranslatesAutoresizingMaskIntoConstraints:(bool)_translates { }
 - (bool)translatesAutoresizingMaskIntoConstraints { true }
-- (())setNeedsLayout { }
+- (())setNeedsLayout {
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
+}
 - (())addConstraint:(id)_constraint { }
 - (())addConstraints:(id)_constraints { }
 - (())removeConstraint:(id)_constraint { }
@@ -1277,6 +1298,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())addSubview:(id)view {
     if view == nil { return; }
+    env.objc.borrow_mut::<UIViewHostObject>(view).needs_layout = true;
+    env.objc.borrow_mut::<UIViewHostObject>(this).needs_layout = true;
     if env.objc.borrow::<UIViewHostObject>(view).superview == this {
         () = msg![env; this bringSubviewToFront:view];
     } else {
