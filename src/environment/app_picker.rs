@@ -364,7 +364,7 @@ const CLASSES: ClassExports = objc_classes! {
 };
 
 fn show_app_picker_gui(
-    options: Options,
+    mut options: Options,
     apps: Result<Vec<AppInfo>, String>,
 ) -> Result<(PathBuf, Vec<String>), String> {
     let icon = {
@@ -390,6 +390,15 @@ fn show_app_picker_gui(
         );
         image
     };
+    // Choose the picker's orientation before SDL creates its window and
+    // applies the Android orientation hint. Game launch options are separate.
+    if options.initial_orientation == DeviceOrientation::Portrait {
+        if let Some((width, height)) = crate::window::host_screen_size() {
+            if width > height {
+                options.initial_orientation = DeviceOrientation::LandscapeLeft;
+            }
+        }
+    }
     let environment = Environment::new_without_app(options, icon)?;
     Ok(environment.run_app_picker(|env| app_picker_inner(env, apps)))
 }
@@ -415,14 +424,50 @@ fn app_picker_inner(
     () = msg![env; ui_application setDelegate:delegate];
 
     let screen: id = msg_class![env; UIScreen mainScreen];
-    let bounds: CGRect = msg![env; screen bounds];
+    // Composition uses portrait coordinates; rotate the picker content within
+    // that canvas so its labels and touch targets stay upright in landscape.
+    let (width, height) = env.window().device_family().portrait_size();
+    let bounds = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { width: width as CGFloat, height: height as CGFloat },
+    };
 
     let window: id = msg_class![env; UIWindow alloc];
     let window: id = msg![env; window initWithFrame:bounds];
 
-    let app_frame: CGRect = msg![env; screen applicationFrame];
+    let mut app_frame: CGRect = msg![env; screen applicationFrame];
+    app_frame.size = CGSize {
+        width: bounds.size.width,
+        height: bounds.size.height - app_frame.origin.y,
+    };
+    let content_center = CGPoint {
+        x: app_frame.size.width / 2.0,
+        y: app_frame.origin.y + app_frame.size.height / 2.0,
+    };
+    let orientation = env.window().current_rotation();
+    let landscape = matches!(orientation,
+        DeviceOrientation::LandscapeLeft | DeviceOrientation::LandscapeRight);
+    if landscape {
+        app_frame = CGRect {
+            origin: CGPoint { x: 0.0, y: 0.0 },
+            size: CGSize { width: app_frame.size.height, height: app_frame.size.width },
+        };
+    }
     let main_view: id = msg_class![env; UIView alloc];
     let main_view: id = msg![env; main_view initWithFrame:app_frame];
+    if landscape {
+        use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
+        let direction: CGFloat = if orientation == DeviceOrientation::LandscapeLeft {
+            -1.0
+        } else {
+            1.0
+        };
+        let transform = CGAffineTransform {
+            a: 0.0, b: direction, c: -direction, d: 0.0, tx: 0.0, ty: 0.0,
+        };
+        () = msg![env; main_view setTransform:transform];
+        () = msg![env; main_view setCenter:content_center];
+    }
     () = msg![env; window addSubview:main_view];
 
     // Wallpaper
@@ -1377,7 +1422,11 @@ fn make_icon_grid(
     total_app_count: usize,
     have_wallpaper: bool,
 ) -> IconGridStuff {
-    let num_cols = if app_frame.size.width >= 380.0 {
+    let num_cols = if app_frame.size.width > app_frame.size.height {
+        // Use the wider display without shrinking icons or their touch areas.
+        ((app_frame.size.width - 24.0 + 19.0) / (ICON_SIZE.width + 19.0))
+            .floor().max(2.0) as usize
+    } else if app_frame.size.width >= 380.0 {
         4
     } else if app_frame.size.width >= 270.0 {
         3
