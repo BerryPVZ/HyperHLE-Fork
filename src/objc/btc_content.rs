@@ -21,7 +21,7 @@ fn node(env: &Environment, object: id, name: &str) -> id {
 }
 
 pub(super) fn intercept(env: &mut Environment, class: Class, sel: SEL) -> bool {
-    if env.bundle.bundle_identifier() == "hu.BV.BreakTheCookieFree"
+    if matches!(env.bundle.bundle_identifier(), "hu.BV.BreakTheCookieFree" | "hu.BV.BTC-Olympic")
         && env.objc.get_class_name(class) == "KKInputTouch"
         && sel.as_str(&env.mem) == "anyTouchBeganThisFrame"
     {

@@ -1211,6 +1211,12 @@ fn path_for_resource_helper(
     // the guest then floods the log with "Could not find full path of
     // file …" errors and plays no sound. Reached only when every
     // stricter lookup has failed.
+    // Explicit directories must not resolve to a same-named resource elsewhere.
+    let explicit_directory = directory != nil
+        && !ns_string::to_rust_string(env, directory).is_empty();
+    if explicit_directory || name_str.contains('/') || lproj != nil {
+        return nil;
+    }
     if let Some(file_name) = rust_path.file_name() {
         let wanted = file_name.to_str().unwrap_or("").to_lowercase();
         if !wanted.is_empty() {
@@ -1221,9 +1227,10 @@ fn path_for_resource_helper(
                 stack.push(root_str.into_owned());
             }
             let mut visited_dirs = 0usize;
+            let mut matching_path = None;
             while let Some(dir) = stack.pop() {
                 if visited_dirs >= 1000 {
-                    break;
+                    return nil;
                 }
                 visited_dirs += 1;
                 let Ok(entries) =
@@ -1246,9 +1253,15 @@ fn path_for_resource_helper(
                     if is_dir {
                         stack.push(full);
                     } else if entry.to_lowercase() == wanted {
-                        return ns_string::from_rust_string(env, full);
+                        // A bare name is ambiguous across resource packs. Let
+                        // the caller retry with its explicit search directory.
+                        if matching_path.is_some() { return nil; }
+                        matching_path = Some(full);
                     }
                 }
+            }
+            if let Some(full) = matching_path {
+                return ns_string::from_rust_string(env, full);
             }
         }
     }
