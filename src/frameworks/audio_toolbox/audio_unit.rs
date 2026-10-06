@@ -648,6 +648,14 @@ fn AudioUnitSetProperty(
         }
     }
 
+    // Games attach effects while their mixer graph is already running.
+    if in_id == kAudioUnitProperty_SetRenderCallback
+        && audio_components::State::get(&mut env.framework_state)
+            .audio_component_instances.get(&in_unit).is_some_and(|obj| obj.started)
+    {
+        setup_audio_unit_for_render(env, in_unit);
+    }
+
     // Audio Unit Services notifies property listeners synchronously after a
     // successful property write. The listener snapshot is taken by the
     // helper, so callbacks may safely re-enter Audio Unit Services.
@@ -1493,8 +1501,7 @@ fn alloc_render_timestamp(env: &mut Environment, sample_time: f64) -> MutVoidPtr
 /// OpenAL Soft сам микширует все источники вместе.
 fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
     use crate::frameworks::core_audio_types::{
-        kAudioFormatFlagIsNonInterleaved, kAudioFormatFlagIsPacked,
-        kAudioFormatFlagIsSignedInteger, kAudioFormatLinearPCM,
+        kAudioFormatFlagIsNonInterleaved, kAudioFormatLinearPCM,
     };
 
     // Готовим план: список
@@ -1508,7 +1515,6 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         f64,
     )> = {
         let at = &mut env.framework_state.audio_toolbox;
-        let hardware_sr = at.audio_session.current_hardware_sample_rate;
         let Some(obj) = at
             .audio_components
             .audio_component_instances
@@ -1519,23 +1525,6 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
         if !obj.started || obj.mixer_buses.is_empty() {
             return;
         }
-        // Дефолтный формат шины 3D Mixer, если игра его явно не задавала:
-        // 16-bit signed integer LE PCM, моно, текущая частота железа.
-        let default_format = AudioStreamBasicDescription {
-            sample_rate: if hardware_sr > 0.0 {
-                hardware_sr
-            } else {
-                22050.0
-            },
-            format_id: kAudioFormatLinearPCM,
-            format_flags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
-            bytes_per_packet: 2,
-            frames_per_packet: 1,
-            bytes_per_frame: 2,
-            channels_per_frame: 1,
-            bits_per_channel: 16,
-            _reserved: 0,
-        };
         let mut v = Vec::new();
         for (bus_id, bus) in obj.mixer_buses.iter() {
             let (Some(cb), Some(src), Some(last)) =
@@ -1543,7 +1532,8 @@ fn render_audio_unit_buses(env: &mut Environment, audio_unit: AudioUnit) {
             else {
                 continue;
             };
-            let fmt = bus.stream_format.unwrap_or(default_format);
+            let fmt = bus.stream_format.or(obj.input_stream_format)
+                .unwrap_or(obj.global_stream_format);
             v.push((*bus_id, cb, src, last, fmt, bus.sample_time));
         }
         v
