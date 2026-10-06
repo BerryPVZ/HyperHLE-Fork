@@ -34,7 +34,7 @@
 //!   `CTStringAttributes.h` (Apple SDK).
 
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant, HostDylib};
-use crate::font::{Font, TextAlignment, WrapMode};
+use crate::font::{Font, WrapMode};
 use rusttype::GlyphId;
 use crate::frameworks::core_foundation::{CFRange, cf_array::CFArrayRef, cf_type::CFTypeRef};
 use crate::frameworks::core_graphics::cg_bitmap_context::CGBitmapContextDrawer;
@@ -618,16 +618,13 @@ fn CTLineDraw(env: &mut Environment, line: CTLineRef, context: id) {
     let size: CGFloat = msg![env; font pointSize];
     let text_str = to_rust_string(env, text).into_owned();
     let font_obj = font_from_uifont(env, font).unwrap_or_else(Font::sans_regular);
+    // Core Text uses Quartz baseline coordinates, unlike UIKit's top-left text.
+    let (matrix, position) =
+        crate::frameworks::core_graphics::cg_context::text_matrix_and_position(env, context);
     let mut drawer = CGBitmapContextDrawer::new(&env.objc, &mut env.mem, context);
     let fill_color = drawer.rgb_fill_color();
-    font_obj.draw(
-        size,
-        &text_str,
-        (0.0, 0.0),
-        None,
-        TextAlignment::Left,
-        |glyph| draw_font_glyph(&mut drawer, glyph, fill_color, None, None),
-    );
+    font_obj.draw_text_baseline(size, &text_str, (position.x, position.y), matrix,
+        |glyph| draw_font_glyph(&mut drawer, glyph, fill_color, None, None));
 }
 
 /// `CFIndex CTLineGetGlyphCount(CTLineRef line)`

@@ -573,6 +573,15 @@ impl Font {
         }
     }
 
+    /// Draw a single line using Quartz baseline coordinates (positive Y up).
+    pub fn draw_text_baseline<F: FnMut(RasterGlyph)>(
+        &self, font_size: f32, text: &str, origin: (f32, f32),
+        text_transform: CGAffineTransform, draw_glyph: F,
+    ) {
+        self.draw_glyphs(font_size, text.chars().map(|c| self.rt().glyph(c).id()),
+            origin, text_transform, draw_glyph);
+    }
+
     /// Draw glyphs. Similar to [Self::draw], but uses raw glyph ids instead of
     /// text and doesn't account for line breaks or text alignment (those
     /// should be handled by the caller). Used by CoreGraphics for font

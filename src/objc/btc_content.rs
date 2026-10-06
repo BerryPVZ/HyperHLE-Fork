@@ -59,7 +59,9 @@ pub(super) fn intercept(env: &mut Environment, class: Class, sel: SEL) -> bool {
     true
 }
 
-pub(super) fn before(env: &mut Environment, object: id, class: Class, sel: SEL) -> Option<(id, u32)> {
+pub(super) enum MenuHook { Background(id, u32), Beaters(id) }
+
+pub(super) fn before(env: &mut Environment, object: id, class: Class, sel: SEL) -> Option<MenuHook> {
     if env.bundle.bundle_identifier() != "hu.BV.BTC-Olympic" {
         return None;
     }
@@ -87,6 +89,9 @@ pub(super) fn before(env: &mut Environment, object: id, class: Class, sel: SEL) 
         }
         env.cpu.regs_mut().copy_from_slice(&saved);
     }
+    if class_name == "BeatersMaterialsSubMenu" && selector == "loadMenu" {
+        return Some(MenuHook::Beaters(object));
+    }
     if class_name == "BackgroundSubMenu" && matches!(selector.as_str(), "loadMenu" | "loadBackground") {
         let page_slot = slot(env, object, "pageNumber")?;
         let page: u32 = env.mem.read(page_slot);
@@ -96,14 +101,21 @@ pub(super) fn before(env: &mut Environment, object: id, class: Class, sel: SEL) 
             env.mem.write(page_slot, (page - 1).min(2));
             env.objc.btc_classic_menu_depth += 1;
         }
-        return Some((object, page));
+        return Some(MenuHook::Background(object, page));
     }
     None
 }
 
-pub(super) fn after(env: &mut Environment, token: Option<(id, u32)>) {
-    let Some((object, page)) = token else {
-        return;
+pub(super) fn after(env: &mut Environment, token: Option<MenuHook>) {
+    let (object, page) = match token {
+        Some(MenuHook::Background(object, page)) => (object, page),
+        Some(MenuHook::Beaters(object)) => {
+            let saved = *env.cpu.regs();
+            add_bush_weapon(env, object);
+            env.cpu.regs_mut().copy_from_slice(&saved);
+            return;
+        }
+        None => return,
     };
     if page >= 2 {
         env.objc.btc_classic_menu_depth -= 1;
@@ -117,6 +129,38 @@ pub(super) fn after(env: &mut Environment, token: Option<(id, u32)>) {
         () = msg![env; next setVisible:(page < 3)];
     }
     env.cpu.regs_mut().copy_from_slice(&saved);
+}
+
+// Sports retains Bush's sprites and handler but leaves the last menu slot empty.
+fn add_bush_weapon(env: &mut Environment, object: id) {
+    let Some(page) = slot(env, object, "pageNumber") else { return };
+    if env.mem.read(page) != 3 { return; }
+    let menu = node(env, object, "menu");
+    let torch = node(env, object, "torchButton");
+    let boxbag = node(env, object, "boxbagButton");
+    if menu.is_null() || torch.is_null() || boxbag.is_null() { return; }
+    const BUSH_TAG: i32 = 0x42555348;
+    let existing: id = msg![env; menu getChildByTag:BUSH_TAG];
+    if !existing.is_null() { return; }
+    let frame = crate::frameworks::foundation::ns_string::get_static_str(env, "bush_head.png");
+    let normal: id = msg_class![env; CCSprite spriteWithSpriteFrameName:frame];
+    let selected: id = msg_class![env; CCSprite spriteWithSpriteFrameName:frame];
+    if normal.is_null() || selected.is_null() { return; }
+    let selector = env.objc.register_host_selector("bushButtonTapped:".to_owned(), &mut env.mem);
+    let button: id = msg_class![env; CCMenuItemSprite
+        itemFromNormalSprite:normal selectedSprite:selected target:object selector:selector];
+    let column: CGPoint = msg![env; boxbag position];
+    let row: CGPoint = msg![env; torch position];
+    let position = CGPoint { x: column.x, y: row.y };
+    () = msg![env; button setPosition:position];
+    () = msg![env; menu addChild:button z:0i32 tag:BUSH_TAG];
+    let title = crate::frameworks::foundation::ns_string::get_static_str(env, "Bush");
+    let font = crate::frameworks::foundation::ns_string::get_static_str(env, "Arial");
+    let label: id = msg_class![env; CCLabelTTF labelWithString:title fontName:font fontSize:14.0f32];
+    let size: CGSize = msg![env; button contentSize];
+    let position = CGPoint { x: size.width / 2.0, y: -10.0 };
+    () = msg![env; label setPosition:position];
+    () = msg![env; button addChild:label];
 }
 
 // UIKit delivers the event after the previous draw. Free polls on the next
