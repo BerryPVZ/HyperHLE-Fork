@@ -7,8 +7,8 @@
 //!
 //! Chrome (and many other apps) use attributed strings for styled text.
 //! We store the plain text plus an ordered attribute dictionary per range.
-//! Styles are not rendered (our text stack draws plain text), but the
-//! object model is complete: ranges, attributes, mutable editing.
+//! UIKit label drawing supports the first run's font, color and paragraph
+//! layout. Mixed-style rendering and advanced typography remain unsupported.
 
 use crate::abi::GuestArg;
 use crate::dyld::{export_c_func, FunctionExports};
@@ -18,6 +18,27 @@ use crate::mem::{ConstPtr, MutPtr, SafeRead};
 use crate::frameworks::foundation::ns_string::NSUTF8StringEncoding;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, NSZonePtr};
 use crate::Environment;
+use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::cg_context::{CGContextSaveGState, CGContextRestoreGState};
+use crate::frameworks::uikit::{ui_font, ui_graphics::UIGraphicsGetCurrentContext};
+
+/// UIKit's uniform-style text path (used by Cocos2d to rasterize labels).
+/// Mixed-style runs currently use the first run's style for the whole label.
+fn label_style(env: &mut Environment, this: id) -> (id, id, id) {
+    let range: MutPtr<NSRange> = MutPtr::null();
+    let attrs: id = msg![env; this attributesAtIndex:0u32 effectiveRange:range];
+    let key = ns_string::get_static_str(env, "NSFont");
+    let font: id = msg![env; attrs objectForKey:key];
+    let font: id = if font == nil {
+        msg_class![env; UIFont systemFontOfSize:12.0f32]
+    } else { font };
+    let key = ns_string::get_static_str(env, "NSColor");
+    let color: id = msg![env; attrs objectForKey:key];
+    let color: id = if color == nil { msg_class![env; UIColor blackColor] } else { color };
+    let key = ns_string::get_static_str(env, "NSParagraphStyle");
+    let paragraph: id = msg![env; attrs objectForKey:key];
+    (font, color, paragraph)
+}
 
 /// Host object: text plus `(range, attrs)` pairs, non-overlapping, sorted.
 #[derive(Default)]
@@ -156,6 +177,48 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (id)string {
     env.objc.borrow::<NSAttributedStringHostObject>(this).text
+}
+
+- (CGSize)size {
+    let (font, _, _) = label_style(env, this);
+    let text: id = msg![env; this string];
+    msg![env; text sizeWithFont:font]
+}
+
+- (CGRect)boundingRectWithSize:(CGSize)size options:(NSUInteger)options context:(id)_context {
+    let (font, _, paragraph) = label_style(env, this);
+    let text: id = msg![env; this string];
+    let text = ns_string::to_rust_string(env, text);
+    let mode: NSInteger = msg![env; paragraph lineBreakMode];
+    // NSStringDrawingUsesLineFragmentOrigin enables multiline layout.
+    let constraint = if options & 1 != 0 && size.width > 0.0 {
+        Some((size, mode))
+    } else { None };
+    CGRect { origin: CGPoint { x: 0.0, y: 0.0 },
+        size: ui_font::size_with_font(env, font, &text, constraint) }
+}
+
+- (())drawInRect:(CGRect)rect {
+    let (font, color, paragraph) = label_style(env, this);
+    let text: id = msg![env; this string];
+    let mode: NSInteger = msg![env; paragraph lineBreakMode];
+    let alignment: NSInteger = msg![env; paragraph alignment];
+    let context = UIGraphicsGetCurrentContext(env);
+    if context.is_null() { return; }
+    CGContextSaveGState(env, context);
+    let _: () = msg![env; color setFill];
+    let _: CGSize = msg![env; text drawInRect:rect withFont:font lineBreakMode:mode alignment:alignment];
+    CGContextRestoreGState(env, context);
+}
+
+- (())drawAtPoint:(CGPoint)point {
+    let size: CGSize = msg![env; this size];
+    let rect = CGRect { origin: point, size };
+    let _: () = msg![env; this drawInRect:rect];
+}
+
+- (())drawWithRect:(CGRect)rect options:(NSUInteger)_options context:(id)_context {
+    let _: () = msg![env; this drawInRect:rect];
 }
 
 // ---- attribute access ----

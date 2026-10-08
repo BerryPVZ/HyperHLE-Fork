@@ -1630,6 +1630,28 @@ pub const CLASSES: ClassExports = objc_classes! {
     ui_font::size_with_font(env, font, &text, None)
 }
 
+- (CGRect)boundingRectWithSize:(CGSize)size options:(NSUInteger)options attributes:(id)attributes context:(id)context {
+    let string: id = msg_class![env; NSAttributedString alloc];
+    let string: id = msg![env; string initWithString:this attributes:attributes];
+    let rect: CGRect = msg![env; string boundingRectWithSize:size options:options context:context];
+    release(env, string);
+    rect
+}
+
+- (())drawInRect:(CGRect)rect withAttributes:(id)attributes {
+    let string: id = msg_class![env; NSAttributedString alloc];
+    let string: id = msg![env; string initWithString:this attributes:attributes];
+    let _: () = msg![env; string drawInRect:rect];
+    release(env, string);
+}
+
+- (())drawAtPoint:(CGPoint)point withAttributes:(id)attributes {
+    let string: id = msg_class![env; NSAttributedString alloc];
+    let string: id = msg![env; string initWithString:this attributes:attributes];
+    let _: () = msg![env; string drawAtPoint:point];
+    release(env, string);
+}
+
 - (CGSize)sizeWithFont:(id)font forWidth:(CGFloat)width lineBreakMode:(UILineBreakMode)line_break_mode {
     let text = to_rust_string(env, this);
     let size = CGSize { width, height: 99999.0 };

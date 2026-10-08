@@ -27,6 +27,7 @@ pub mod asidentifier_manager;
 pub mod chipmunk_space;
 pub mod ns_array;
 pub mod ns_attributed_string;
+pub mod ns_paragraph_style;
 pub mod ns_assertion_handler;
 pub mod ns_autorelease_pool;
 pub mod ns_bundle;
@@ -1506,6 +1507,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
         chipmunk_space::CLASSES,
         ns_array::CLASSES,
         ns_attributed_string::CLASSES,
+        ns_paragraph_style::CLASSES,
         ns_assertion_handler::CLASSES,
         ns_autorelease_pool::CLASSES,
         ns_bundle::CLASSES,
