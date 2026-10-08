@@ -376,6 +376,39 @@ fn objc_msgSend_inner(
         }
     }
 
+    // PetsWar 1.0 uses an MPEG-4 Part 2 CG.mp4 intro, which our H.264
+    // movie decoder cannot display. Continue through its existing deferred
+    // gameStart: path, waiting for asynchronous image preloading if needed.
+    if super2.is_none()
+        && env.bundle.bundle_identifier() == "com.iphogame.petswar"
+        && env.objc.get_class_name(orig_class) == "MTLoadingLayer"
+        && selector.as_str(&env.mem) == "playMovieAtURL:"
+    {
+        let start = env.objc.lookup_selector("gameStart:");
+        let loaded = env.objc.object_lookup_ivar(&env.mem, receiver, &"index".to_owned());
+        let total = env.objc.object_lookup_ivar(&env.mem, receiver, &"count".to_owned());
+        let new_game = env.objc.object_lookup_ivar(&env.mem, receiver, &"gameNew_".to_owned());
+        if let (Some(start), Some(loaded), Some(total), Some(new_game)) =
+            (start, loaded, total, new_game)
+        {
+            if env.objc.object_has_method(&env.mem, receiver, start) {
+                let loaded: u32 = env.mem.read(loaded.cast());
+                let total: u32 = env.mem.read(total.cast());
+                if loaded >= total {
+                    let saved = *env.cpu.regs();
+                    () = super::msg![env; receiver schedule:start];
+                    env.cpu.regs_mut().copy_from_slice(&saved);
+                } else {
+                    // imageLoaded: schedules gameStart: when index == count,
+                    // provided this intro-only flag is clear.
+                    env.mem.write(new_game.cast::<u8>(), 0);
+                }
+                log!("PetsWar: skipped unsupported intro; continuing after image preload");
+                return;
+            }
+        }
+    }
+
     if super2.is_none() && super::runtime_hooks::intercept(env, orig_class, selector) {
         return;
     }

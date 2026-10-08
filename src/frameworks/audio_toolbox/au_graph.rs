@@ -591,6 +591,12 @@ fn AUGraphSetNodeInputCallback(
         }
     }
 
+    if audio_components::State::get(&mut env.framework_state)
+        .audio_component_instances.get(&dest_unit).is_some_and(|obj| obj.started)
+    {
+        setup_audio_unit_for_render(env, dest_unit);
+    }
+
     log_dbg!(
         "AUGraphSetNodeInputCallback({:?}, dest_node={}, bus={}, proc={:?}, ref_con={:?}) -> unit={:?}",
         graph, dest_node, dest_input_number, proc_copy, ref_con_copy, dest_unit

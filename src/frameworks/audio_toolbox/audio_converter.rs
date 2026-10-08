@@ -12,10 +12,10 @@
 //! <-> floating point, in both little- and big-endian layouts.
 //!
 //! `AudioConverterFillComplexBuffer` uses a staging buffer in guest memory
-//! when the source and destination formats differ (the game's input
+//! for LPCM input (the game's input
 //! callback fills source-format data, which is then converted into the
-//! caller's output buffer). When the formats match, it stays a zero-copy
-//! passthrough like before.
+//! caller's output buffer). Input callbacks may replace mData with a pointer
+//! to their own samples; that memory is borrowed, never freed by the converter.
 
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::FunctionExports;
@@ -23,9 +23,9 @@ use crate::export_c_func;
 use crate::frameworks::carbon_core::OSStatus;
 use crate::frameworks::core_audio_types::{
     debug_fourcc, fourcc, kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat,
-    kAudioFormatLinearPCM, AudioStreamBasicDescription,
+    kAudioFormatFlagIsNonInterleaved, kAudioFormatLinearPCM, AudioStreamBasicDescription,
 };
-use crate::mem::{guest_size_of, ConstPtr, MutPtr, MutVoidPtr, SafeRead};
+use crate::mem::{ConstPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::Environment;
 
 const kAudioConverterErr_InvalidInputSize: OSStatus = -50;
@@ -70,6 +70,33 @@ unsafe impl SafeRead for OpaqueAudioConverter {}
 
 type AudioConverterRef = MutPtr<OpaqueAudioConverter>;
 
+fn pcm_plane(interleaved: &[u8], sample_bytes: usize, channels: usize, channel: usize) -> Vec<u8> {
+    interleaved
+        .chunks_exact(sample_bytes * channels)
+        .flat_map(|frame| {
+            frame[channel * sample_bytes..(channel + 1) * sample_bytes]
+                .iter()
+                .copied()
+        })
+        .collect()
+}
+
+/// Copy only complete frames actually supplied by the input callback.
+fn returned_pcm(
+    mem: &crate::mem::Mem,
+    abl: &AudioBufferList,
+    packets: u32,
+    bytes_per_frame: u32,
+) -> Vec<u8> {
+    let buffer = abl.mBuffers[0];
+    if abl.mNumberBuffers == 0 || buffer.mData.is_null() || bytes_per_frame == 0 {
+        return Vec::new();
+    }
+    let frames = packets.min(buffer.mDataByteSize / bytes_per_frame);
+    mem.bytes_at(buffer.mData.cast(), frames * bytes_per_frame)
+        .to_vec()
+}
+
 /// `kAudioConverterSampleRateConverterQuality` ('srcq') and the quality
 /// constants from Apple's `AudioConverter.h`.
 const kAudioConverterSampleRateConverterQuality: u32 = fourcc(b"srcq");
@@ -110,7 +137,9 @@ pub fn pcm_shape_from_asbd(asbd: &AudioStreamBasicDescription) -> Option<PcmShap
         return None;
     }
     let bytes_per_channel = (bits / 8) as u32;
-    let bytes_per_frame = if asbd.bytes_per_frame > 0 {
+    let bytes_per_frame = if asbd.format_flags & kAudioFormatFlagIsNonInterleaved != 0 {
+        channels * bytes_per_channel
+    } else if asbd.bytes_per_frame > 0 {
         asbd.bytes_per_frame
     } else {
         channels * bytes_per_channel
@@ -147,9 +176,7 @@ fn read_f32_sample(data: &[u8], shape: &PcmShape, frame: usize, channel: usize) 
             8 => ((bytes[0] as i32) - 128) as f64 / 128.0,
             16 => i16::from_be_bytes(bytes.try_into().unwrap()) as f64 / 32768.0,
             24 => {
-                let v = ((bytes[0] as i32) << 16)
-                    | ((bytes[1] as i32) << 8)
-                    | (bytes[2] as i32);
+                let v = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
                 let v = (v << 8) >> 8; // sign-extend 24 -> 32
                 v as f64 / 8388608.0
             }
@@ -167,9 +194,7 @@ fn read_f32_sample(data: &[u8], shape: &PcmShape, frame: usize, channel: usize) 
             8 => ((bytes[0] as i32) - 128) as f64 / 128.0,
             16 => i16::from_le_bytes(bytes.try_into().unwrap()) as f64 / 32768.0,
             24 => {
-                let v = ((bytes[0] as i32) << 16)
-                    | ((bytes[1] as i32) << 8)
-                    | (bytes[2] as i32);
+                let v = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
                 let v = (v << 8) >> 8; // sign-extend 24 -> 32
                 v as f64 / 8388608.0
             }
@@ -389,7 +414,8 @@ fn AudioConverterGetProperty(
                 return kAudioConverterErr_InvalidInputSize;
             }
             env.mem.write(io_data_size, 4u32);
-            env.mem.write(out_property_data.cast(), converter.src_quality);
+            env.mem
+                .write(out_property_data.cast(), converter.src_quality);
             0
         }
         kAudioConverterSampleRateConverterComplexity => {
@@ -398,7 +424,8 @@ fn AudioConverterGetProperty(
                 return kAudioConverterErr_InvalidInputSize;
             }
             env.mem.write(io_data_size, 4u32);
-            env.mem.write(out_property_data.cast(), converter.src_complexity);
+            env.mem
+                .write(out_property_data.cast(), converter.src_complexity);
             0
         }
         _ => {
@@ -470,6 +497,13 @@ fn AudioConverterConvertBuffer(
         return kAudioConverterErr_InvalidInputSize;
     }
     let converter: OpaqueAudioConverter = env.mem.read(in_audio_converter);
+    // These flat-buffer APIs do not carry separate PCM planes.
+    if (converter.source_format.format_flags | converter.dest_format.format_flags)
+        & kAudioFormatFlagIsNonInterleaved
+        != 0
+    {
+        return kAudioConverterErr_FormatNotSupported;
+    }
     let Some(src_shape) = pcm_shape_from_asbd(&converter.source_format) else {
         log!(
             "AudioConverterConvertBuffer: unsupported source format {:#?}",
@@ -521,6 +555,13 @@ fn AudioConverterConvertComplexBuffer(
         return kAudioConverterErr_InvalidInputSize;
     }
     let converter: OpaqueAudioConverter = env.mem.read(in_audio_converter);
+    // These flat-buffer APIs do not carry separate PCM planes.
+    if (converter.source_format.format_flags | converter.dest_format.format_flags)
+        & kAudioFormatFlagIsNonInterleaved
+        != 0
+    {
+        return kAudioConverterErr_FormatNotSupported;
+    }
     let Some(src_shape) = pcm_shape_from_asbd(&converter.source_format) else {
         log!(
             "AudioConverterConvertComplexBuffer: unsupported source format {:#?}",
@@ -540,7 +581,10 @@ fn AudioConverterConvertComplexBuffer(
     let in_buf = in_abl.mBuffers[0];
     let src_bytes = (in_number_frames as usize) * src_shape.bytes_per_frame as usize;
     let src_bytes = src_bytes.min(in_buf.mDataByteSize as usize);
-    let src = env.mem.bytes_at(in_buf.mData.cast(), src_bytes as u32).to_vec();
+    let src = env
+        .mem
+        .bytes_at(in_buf.mData.cast(), src_bytes as u32)
+        .to_vec();
 
     let converted = convert_pcm(&src, &src_shape, &dst_shape);
 
@@ -579,25 +623,6 @@ fn AudioConverterFillComplexBuffer(
     let src_shape = pcm_shape_from_asbd(&converter.source_format);
     let dst_shape = pcm_shape_from_asbd(&converter.dest_format);
 
-    // Fast path: identical shapes -> the game can write straight into the
-    // output buffer (previous passthrough behaviour).
-    let passthrough = match (&src_shape, &dst_shape) {
-        (Some(s), Some(d)) => pcm_shapes_equal(s, d),
-        _ => true,
-    };
-    if passthrough {
-        return in_input_data_proc.call_from_host(
-            env,
-            (
-                in_audio_converter,
-                io_output_data_packet_size,
-                out_output_data,
-                out_packet_description,
-                in_input_data_proc_user_data,
-            ),
-        );
-    }
-
     let (Some(src_shape), Some(dst_shape)) = (src_shape, dst_shape) else {
         // Non-LPCM formats can't be converted here; let the callback fill
         // the output buffer directly as before and hope for the best.
@@ -618,14 +643,51 @@ fn AudioConverterFillComplexBuffer(
         );
     };
 
+    let dst_planar_buffers =
+        converter.dest_format.format_flags & kAudioFormatFlagIsNonInterleaved != 0;
+    let buffer_count = env.mem.read(out_output_data).mNumberBuffers;
+    if buffer_count
+        < if dst_planar_buffers {
+            dst_shape.channels
+        } else {
+            1
+        }
+    {
+        return kAudioConverterErr_InvalidInputSize;
+    }
+
     // Determine how many source frames we can ask for, based on the output
     // buffer capacity in destination frames.
     let out_abl: AudioBufferList = env.mem.read(out_output_data);
-    let out_capacity = out_abl.mBuffers[0].mDataByteSize as usize;
-    let dst_frames_capacity = out_capacity / dst_shape.bytes_per_frame as usize;
+    let mut out_capacity = out_abl.mBuffers[0].mDataByteSize as usize;
+    if dst_planar_buffers {
+        for channel in 0..dst_shape.channels {
+            let buffer: AudioBuffer = env.mem.read(ConstPtr::from_bits(
+                out_output_data.to_bits() + 4 + channel * 12,
+            ));
+            if buffer.mData.is_null() {
+                return kAudioConverterErr_InvalidInputSize;
+            }
+            out_capacity = out_capacity.min(buffer.mDataByteSize as usize);
+        }
+    } else if out_abl.mBuffers[0].mData.is_null() {
+        return kAudioConverterErr_InvalidInputSize;
+    }
+    let dst_planar = converter.dest_format.format_flags & kAudioFormatFlagIsNonInterleaved != 0;
+    let dst_buffer_frame_size = if dst_planar {
+        dst_shape.bits / 8
+    } else {
+        dst_shape.bytes_per_frame
+    };
+    let dst_frames_capacity = (out_capacity / dst_buffer_frame_size as usize)
+        .min(env.mem.read(io_output_data_packet_size) as usize);
     let src_frames_max = ((dst_frames_capacity as f64) * src_shape.sample_rate
         / dst_shape.sample_rate)
         .ceil() as usize;
+    if dst_frames_capacity == 0 {
+        env.mem.write(io_output_data_packet_size, 0);
+        return 0;
+    }
     let src_frames_max = src_frames_max.max(1);
     let staging_size = (src_frames_max * src_shape.bytes_per_frame as usize) as u32;
 
@@ -634,21 +696,22 @@ fn AudioConverterFillComplexBuffer(
     if staging_data.is_null() {
         return kAudioConverterErr_InvalidInputSize;
     }
-    let staging_abl_ptr: MutPtr<AudioBufferList> =
-        env.mem.alloc(guest_size_of::<AudioBufferList>()).cast();
-    if staging_abl_ptr.is_null() {
-        env.mem.free(staging_data);
-        return kAudioConverterErr_InvalidInputSize;
+    let src_planar = converter.source_format.format_flags & kAudioFormatFlagIsNonInterleaved != 0;
+    let src_buffers = if src_planar { src_shape.channels } else { 1 };
+    let staging_abl_ptr: MutPtr<AudioBufferList> = env.mem.alloc(4 + src_buffers * 12).cast();
+    env.mem.write(staging_abl_ptr.cast::<u32>(), src_buffers);
+    let plane_size = staging_size / src_buffers;
+    for channel in 0..src_buffers {
+        let buffer = AudioBuffer {
+            mNumberChannels: if src_planar { 1 } else { src_shape.channels },
+            mDataByteSize: plane_size,
+            mData: MutVoidPtr::from_bits(staging_data.to_bits() + channel * plane_size),
+        };
+        env.mem.write(
+            MutPtr::<AudioBuffer>::from_bits(staging_abl_ptr.to_bits() + 4 + channel * 12),
+            buffer,
+        );
     }
-    let staging_abl = AudioBufferList {
-        mNumberBuffers: 1,
-        mBuffers: [AudioBuffer {
-            mNumberChannels: src_shape.channels,
-            mDataByteSize: staging_size,
-            mData: staging_data,
-        }],
-    };
-    env.mem.write(staging_abl_ptr, staging_abl);
 
     let mut packets = src_frames_max as u32;
     let packets_ptr: MutPtr<u32> = env.mem.alloc_and_write(packets);
@@ -665,23 +728,83 @@ fn AudioConverterFillComplexBuffer(
 
     if callback_status == 0 {
         packets = env.mem.read(packets_ptr);
-        let src_frames = (packets as usize).min(src_frames_max);
-        let src_bytes = src_frames * src_shape.bytes_per_frame as usize;
-        let src = env
-            .mem
-            .bytes_at(staging_data.cast(), src_bytes as u32)
-            .to_vec();
+        // The callback owns its returned mData. PopCap returns pointers into
+        // decoded sound buffers rather than writing into our staging storage.
+        let returned: AudioBufferList = env.mem.read(staging_abl_ptr);
+        let requested = packets.min(src_frames_max as u32);
+        let src = if src_planar && returned.mNumberBuffers >= src_shape.channels {
+            let mut planes = Vec::new();
+            for channel in 0..src_shape.channels {
+                let buffer: AudioBuffer = env.mem.read(ConstPtr::from_bits(
+                    staging_abl_ptr.to_bits() + 4 + channel * 12,
+                ));
+                let plane = AudioBufferList {
+                    mNumberBuffers: 1,
+                    mBuffers: [buffer],
+                };
+                planes.push(returned_pcm(
+                    &env.mem,
+                    &plane,
+                    requested,
+                    src_shape.bits / 8,
+                ));
+            }
+            let frames = planes
+                .iter()
+                .map(|plane| plane.len() / (src_shape.bits / 8) as usize)
+                .min()
+                .unwrap_or(0);
+            let mut interleaved = Vec::new();
+            for frame in 0..frames {
+                let offset = frame * (src_shape.bits / 8) as usize;
+                for plane in &planes {
+                    interleaved
+                        .extend_from_slice(&plane[offset..offset + (src_shape.bits / 8) as usize]);
+                }
+            }
+            interleaved
+        } else if !src_planar {
+            returned_pcm(&env.mem, &returned, requested, src_shape.bytes_per_frame)
+        } else {
+            Vec::new()
+        };
         let converted = convert_pcm(&src, &src_shape, &dst_shape);
-        let out_bytes = converted.len().min(out_capacity);
-        let out_slice = env
-            .mem
-            .bytes_at_mut(out_abl.mBuffers[0].mData.cast(), out_bytes as u32);
-        out_slice.copy_from_slice(&converted[..out_bytes]);
+        let out_bytes = converted
+            .len()
+            .min(dst_frames_capacity * dst_shape.bytes_per_frame as usize);
         let produced_frames = out_bytes / dst_shape.bytes_per_frame as usize;
-        env.mem.write(io_output_data_packet_size, produced_frames as u32);
-        let mut updated = out_abl;
-        updated.mBuffers[0].mDataByteSize = out_bytes as u32;
-        env.mem.write(out_output_data, updated);
+        if dst_planar {
+            let sample_bytes = (dst_shape.bits / 8) as usize;
+            for channel in 0..dst_shape.channels as usize {
+                let ptr = MutPtr::<AudioBuffer>::from_bits(
+                    out_output_data.to_bits() + 4 + channel as u32 * 12,
+                );
+                let mut buffer = env.mem.read(ptr);
+                let plane = pcm_plane(
+                    &converted[..out_bytes],
+                    sample_bytes,
+                    dst_shape.channels as usize,
+                    channel,
+                );
+                if !buffer.mData.is_null() {
+                    let size = plane.len().min(buffer.mDataByteSize as usize);
+                    env.mem
+                        .bytes_at_mut(buffer.mData.cast(), size as u32)
+                        .copy_from_slice(&plane[..size]);
+                    buffer.mDataByteSize = size as u32;
+                    env.mem.write(ptr, buffer);
+                }
+            }
+        } else {
+            env.mem
+                .bytes_at_mut(out_abl.mBuffers[0].mData.cast(), out_bytes as u32)
+                .copy_from_slice(&converted[..out_bytes]);
+            let mut updated = out_abl;
+            updated.mBuffers[0].mDataByteSize = out_bytes as u32;
+            env.mem.write(out_output_data, updated);
+        }
+        env.mem
+            .write(io_output_data_packet_size, produced_frames as u32);
     }
 
     env.mem.free(packets_ptr.cast());
@@ -701,3 +824,60 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(AudioConverterConvertComplexBuffer(_, _, _, _)),
     export_c_func!(AudioConverterFillComplexBuffer(_, _, _, _, _, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_pcm_reaches_canonical_stereo_float_planes() {
+        let dst = crate::frameworks::audio_toolbox::audio_components::AudioComponentInstanceHostObject::default()
+            .global_stream_format;
+        let dst_shape = pcm_shape_from_asbd(&dst).unwrap();
+        let src_shape = PcmShape {
+            sample_rate: 44100.0,
+            channels: 1,
+            bits: 16,
+            is_float: false,
+            is_big_endian: false,
+            bytes_per_frame: 2,
+        };
+        let samples: Vec<u8> = [16384i16, -8192]
+            .into_iter()
+            .flat_map(i16::to_le_bytes)
+            .collect();
+        let converted = convert_pcm(&samples, &src_shape, &dst_shape);
+        for channel in 0..2 {
+            let plane = pcm_plane(&converted, 4, 2, channel);
+            let floats: Vec<f32> = plane
+                .chunks_exact(4)
+                .map(|sample| f32::from_le_bytes(sample.try_into().unwrap()))
+                .collect();
+            assert_eq!(floats, vec![0.5, -0.25]);
+        }
+        assert!(convert_pcm(&[], &src_shape, &dst_shape).is_empty());
+    }
+
+    #[test]
+    fn input_callback_can_return_borrowed_samples_and_short_read() {
+        let mut mem = crate::mem::Mem::new();
+        mem.set_null_segment_size(4096);
+        let samples = mem.alloc(8);
+        mem.bytes_at_mut(samples.cast(), 8)
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let abl = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: 6,
+                mData: samples,
+            }],
+        };
+        assert_eq!(returned_pcm(&mem, &abl, 4, 2), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(returned_pcm(&mem, &abl, 1, 2), vec![1, 2]);
+        assert!(returned_pcm(&mem, &abl, 0, 2).is_empty());
+        // The converter must leave borrowed input memory intact.
+        assert_eq!(mem.bytes_at(samples.cast(), 8), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        mem.free(samples);
+    }
+}
