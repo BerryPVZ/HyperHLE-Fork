@@ -96,6 +96,7 @@ pub fn CGBitmapContextCreate(
         }),
         transform: CGAffineTransformIdentity,
         text_transform: None,
+        text_position: CGPoint::default(),
         rgb_fill_color: (0.0, 0.0, 0.0, 1.0),
         fill_color_space_model: match color_space_name {
             kCGColorSpaceGenericGray => kCGColorSpaceModelMonochrome,

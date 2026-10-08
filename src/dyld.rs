@@ -530,6 +530,8 @@ impl Dyld {
         self.thread_exit_routine = Some(write_return_to_host_routine(mem, Self::SVC_THREAD_EXIT));
         // Currently assuming only the app binary contains Objective-C things.
 
+        // Route modern libpng's windowBits=0 through the old-zlib adapter.
+        self.create_proc_address_no_inval(mem, "_inflateInit2_").unwrap();
         objc.register_bin_selectors(&bins[0], mem);
         objc.register_host_selectors(mem);
         for bin in bins {

@@ -2497,6 +2497,27 @@ pub fn objc_getClassList(
     i32::try_from(total).unwrap_or(i32::MAX)
 }
 
+/// Return a caller-owned, NULL-terminated list of loaded Objective-C images.
+/// The strings themselves have process lifetime, as with dyld's image names.
+pub fn objc_copyImageNames(
+    env: &mut crate::Environment,
+    out_count: crate::mem::MutPtr<u32>,
+) -> crate::mem::MutPtr<ConstPtr<u8>> {
+    let images: Vec<u32> = env.bins.iter().enumerate()
+        .filter(|(_, bin)| bin.sections.iter().any(|s| s.name.starts_with("__objc_")))
+        .map(|(index, _)| index as u32).collect();
+    let count = images.len() as u32;
+    if !out_count.is_null() { env.mem.write(out_count, count); }
+    if count == 0 { return crate::mem::Ptr::null(); }
+    let result = env.mem.alloc((count + 1) * 4).cast();
+    for (index, image) in images.into_iter().enumerate() {
+        let name = crate::libc::mach_o::_dyld_get_image_name(env, image);
+        env.mem.write(result + index as u32, name);
+    }
+    env.mem.write(result + count, ConstPtr::<u8>::null());
+    result
+}
+
 /// `const char **objc_copyClassNamesForImage(const char *image,
 /// unsigned int *outCount)` — enumerate class names defined by a
 /// loaded image. We don't track image membership, so write 0 to

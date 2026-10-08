@@ -73,6 +73,7 @@ pub(super) struct CGContextHostObject {
     pub(super) transform: CGAffineTransform,
     /// Text transform for glyph drawing (see `CGContextSetTextMatrix`).
     pub(super) text_transform: Option<CGAffineTransform>,
+    pub(super) text_position: CGPoint,
     /// (fill, stroke, alpha, line_width, line_cap, line_join, miter_limit,
     ///  flatness, blend_mode, transform)
     pub(super) state_stack: Vec<CGContextState>,
@@ -1145,16 +1146,17 @@ fn CGContextSetInterpolationQuality(
         .interpolation_quality = quality;
 }
 
-fn CGContextGetTextPosition(_env: &mut Environment, _context: CGContextRef) -> CGPoint {
-    CGPoint { x: 0.0, y: 0.0 }
+pub fn text_matrix_and_position(env: &Environment, context: CGContextRef) -> (CGAffineTransform, CGPoint) {
+    let host = env.objc.borrow::<CGContextHostObject>(context);
+    (host.text_transform.unwrap_or(CGAffineTransformIdentity), host.text_position)
 }
 
-fn CGContextSetTextPosition(
-    _env: &mut Environment,
-    _context: CGContextRef,
-    _x: CGFloat,
-    _y: CGFloat,
-) {
+fn CGContextGetTextPosition(env: &mut Environment, context: CGContextRef) -> CGPoint {
+    env.objc.borrow::<CGContextHostObject>(context).text_position
+}
+
+fn CGContextSetTextPosition(env: &mut Environment, context: CGContextRef, x: CGFloat, y: CGFloat) {
+    env.objc.borrow_mut::<CGContextHostObject>(context).text_position = CGPoint { x, y };
 }
 
 fn CGContextSetTextDrawingMode(_env: &mut Environment, _context: CGContextRef, _mode: i32) {}

@@ -133,7 +133,7 @@ fn _dyld_get_image_header(env: &mut Environment, image_index: u32) -> u32 {
 /// `const char* _dyld_get_image_name(uint32_t image_index)`
 /// Returns a C-string pointer with the path of the image at `image_index`.
 /// We allocate the string in guest memory the first time it's requested.
-fn _dyld_get_image_name(env: &mut Environment, image_index: u32) -> ConstPtr<u8> {
+pub(crate) fn _dyld_get_image_name(env: &mut Environment, image_index: u32) -> ConstPtr<u8> {
     let idx = image_index as usize;
     if idx >= env.bins.len() {
         log!(
@@ -142,13 +142,18 @@ fn _dyld_get_image_name(env: &mut Environment, image_index: u32) -> ConstPtr<u8>
         );
         return Ptr::null();
     }
+    if let Some(&ptr) = env.libc_state.mach_o.image_names.get(&image_index) {
+        return ptr;
+    }
     let name = env.bins[idx].name.clone();
     let len = name.len() as u32 + 1;
     let ptr: MutPtr<u8> = env.mem.alloc(len).cast();
     let dst = env.mem.bytes_at_mut(ptr, len);
     dst[..name.len()].copy_from_slice(name.as_bytes());
     dst[name.len()] = 0;
-    ptr.cast_const()
+    let ptr = ptr.cast_const();
+    env.libc_state.mach_o.image_names.insert(image_index, ptr);
+    ptr
 }
 
 /// `intptr_t _dyld_get_image_vmaddr_slide(uint32_t image_index)`
@@ -672,6 +677,7 @@ const NX_ARCH_INFOS: &[NXArchInfoEntry] = &[
 
 #[derive(Default)]
 pub struct State {
+    image_names: HashMap<u32, ConstPtr<u8>>,
     /// Cache of `(cputype, cpusubtype)` → guest pointer to an `NXArchInfoGuest`.
     ///
     /// Each entry is allocated lazily and lives for the duration of the

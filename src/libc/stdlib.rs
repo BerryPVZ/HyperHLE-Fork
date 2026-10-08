@@ -1907,34 +1907,28 @@ fn flistxattr(
 // MARK: - zlib supplemental
 // ===========================================================================
 
-/// `int inflateReset2(z_streamp strm, int windowBits)`
-///
-/// Per the [zlib manual](https://www.zlib.net/manual.html): "This function is
-/// equivalent to inflateEnd followed by inflateInit2, but does not free and
-/// reallocate the internal decompression state. The stream will keep attributes
-/// that may have been set by inflateInit2." It was added in zlib 1.2.3.4.
-///
-/// The bundled libz.1.2.3.dylib does not export this symbol, so apps that link
-/// against a newer SDK (e.g. Flappy Bird built for iOS 7) fail at lazy-bind
-/// time. We provide a minimal host implementation that calls through to the
-/// guest's `inflateReset` (same as calling inflateReset on the stream — window
-/// bits are stored in the stream structure anyway from the initial inflateInit2
-/// call).
-///
-/// Return value: Z_OK (0) on success.
-fn inflateReset2(_env: &mut Environment, _strm: MutVoidPtr, _window_bits: i32) -> i32 {
-    // Z_OK = 0. We cannot easily call back into the guest's inflateReset
-    // from host code without the full z_stream layout. However, the most
-    // common pattern is that inflateReset2 is called right after inflateInit2
-    // (which already set window bits) or before any actual inflate call.
-    // Returning Z_OK lets the app proceed — the stream state was already
-    // initialized by the guest's inflateInit2 which IS in the old libz.
-    log_dbg!(
-        "inflateReset2(strm={:?}, windowBits={}) -> Z_OK (stubbed)",
-        _strm,
-        _window_bits
-    );
-    0 // Z_OK
+/// Compatibility with modern libpng's windowBits=0 (read window from header).
+/// The bundled zlib 1.2.3 predates that convention; a 32 KiB window can decode
+/// all valid zlib streams. Other window modes pass through unchanged.
+fn inflateInit2_(env: &mut Environment, stream: MutVoidPtr, bits: i32,
+                 version: ConstPtr<u8>, size: i32) -> i32 {
+    let Some(addr) = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateInit2_")).copied() else {
+        return -2;
+    };
+    let bits = if bits == 0 { 15 } else { bits };
+    GuestFunction::from_addr_with_thumb_bit(addr).call_from_host(env, (stream, bits, version, size))
+}
+
+/// Reinitialize the old guest decompressor rather than reporting a fake reset.
+fn inflateReset2(env: &mut Environment, stream: MutVoidPtr, bits: i32) -> i32 {
+    if stream.is_null() { return -2; }
+    let end = env.bins.iter().find_map(|b| b.external_symbols.get("_inflateEnd")).copied();
+    let version = env.bins.iter().find_map(|b| b.external_symbols.get("_zlibVersion")).copied();
+    let (Some(end), Some(version)) = (end, version) else { return -2; };
+    let result: i32 = GuestFunction::from_addr_with_thumb_bit(end).call_from_host(env, (stream,));
+    if result != 0 { return result; }
+    let version: ConstPtr<u8> = GuestFunction::from_addr_with_thumb_bit(version).call_from_host(env, ());
+    inflateInit2_(env, stream, bits, version, 56)
 }
 
 /// `int getloadavg(double loadavg[], int nelem)`
@@ -2052,6 +2046,7 @@ pub const FUNCTIONS: FunctionExports = &[
     // bundled libz.1.2.3.dylib doesn't have it. Some apps (Flappy Bird)
     // import it.
     export_c_func!(inflateReset2(_, _)),
+    export_c_func!(inflateInit2_(_, _, _, _)),
 ];
 
 pub fn atof_inner(

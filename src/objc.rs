@@ -45,7 +45,7 @@ pub use classes::{
     method_getImplementation, method_getName, method_getTypeEncoding, method_setImplementation,
     objc_alloc, objc_allocWithZone, objc_allocateClassPair, objc_autorelease,
     objc_autoreleasePoolPop, objc_autoreleasePoolPush, objc_autoreleaseReturnValue,
-    objc_begin_catch, objc_classes, objc_copyClassNamesForImage, objc_disposeClassPair,
+    objc_begin_catch, objc_classes, objc_copyImageNames, objc_copyClassNamesForImage, objc_disposeClassPair,
     objc_end_catch, objc_exception_throw, objc_getClass, objc_getClassList, objc_getMetaClass,
     objc_getProtocol, objc_getRequiredClass, objc_lookUpClass, objc_readClassPair,
     objc_registerClassPair, objc_release, objc_retain, objc_retainAutorelease,
@@ -465,6 +465,7 @@ const FUNCTIONS: FunctionExports = &[
     export_c_func!(objc_getClassList(_, _)),
     export_c_func!(protocol_conformsToProtocol(_, _)),
     export_c_func!(objc_copyClassNamesForImage(_, _)),
+    export_c_func!(objc_copyImageNames(_)),
     export_c_func!(object_getIndexedIvars(_)),
     // `_objc_deallocOnMainThreadHelper` (one leading underscore in the C
     // name) is exported by libobjc as the Mach-O symbol
