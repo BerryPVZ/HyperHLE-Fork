@@ -240,7 +240,7 @@ struct ArchivedFileMetadata {
 type DecompressedFile = Rc<[u8]>;
 
 /// Represents a file inside an IPA bundle that can be opened.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct IpaFileRef {
     archive: Rc<RefCell<ZipArchive<std::fs::File>>>,
     archive_files_cache: Rc<RefCell<HashMap<usize, DecompressedFile>>>,

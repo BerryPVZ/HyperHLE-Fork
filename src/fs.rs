@@ -26,6 +26,7 @@
 //! See also [crate::paths], which has paths for host files used by touchHLE.
 
 mod bundle;
+mod bear_kick;
 
 pub use bundle::BundleData;
 
@@ -994,7 +995,11 @@ impl Fs {
             );
 
         let mut app_dir_children = HashMap::new();
-        app_dir_children.insert(bundle_dir_name, app_bundle.into_fs_node());
+        let mut bundle_node = app_bundle.into_fs_node();
+        if bundle_id == "com.single.thebearkick" && !read_only_mode {
+            bear_kick::expose_packaged_resources(&mut bundle_node);
+        }
+        app_dir_children.insert(bundle_dir_name, bundle_node);
         for (dir, host_path) in directories.iter().zip(host_path_directories.iter()) {
             if let Some(host_path) = host_path {
                 app_dir_children.insert(
