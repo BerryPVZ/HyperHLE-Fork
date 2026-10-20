@@ -222,6 +222,37 @@ pub const CLASSES: ClassExports = objc_classes! {
     }
 }
 
+// Returns YES only if *every* requested type is present. touchHLE's
+// pasteboard has a single item, so "the first item" is the whole pasteboard.
+- (bool)containsPasteboardTypes:(id)pasteboard_types { // NSArray<NSString*>*
+    if pasteboard_types == nil {
+        return false;
+    }
+
+    let count: NSUInteger = msg![env; pasteboard_types count];
+    if count == 0 {
+        return false;
+    }
+
+    for i in 0..count {
+        let type_obj: id = msg![env; pasteboard_types objectAtIndex:i];
+        if type_obj == nil {
+            return false;
+        }
+        let type_str = ns_string::to_rust_string(env, type_obj);
+        let key: &str = type_str.as_ref();
+
+        let host = env.objc.borrow::<UIPasteboardHostObject>(this);
+        let present = host.data_by_type.contains_key(key)
+            || (host.string != nil && STRING_PASTEBOARD_TYPES.contains(&key));
+        if !present {
+            return false;
+        }
+    }
+
+    true
+}
+
 @end
 
 };
