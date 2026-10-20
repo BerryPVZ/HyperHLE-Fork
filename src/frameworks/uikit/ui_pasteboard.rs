@@ -13,6 +13,10 @@ use std::collections::HashMap;
 
 // MARK: - UIPasteboard host object
 
+/// Pasteboard types that `-string` / `-setString:` implicitly provide.
+/// (This is the content of `UIPasteboardTypeListString`.)
+const STRING_PASTEBOARD_TYPES: [&str; 2] = ["public.utf8-plain-text", "public.plain-text"];
+
 #[derive(Default)]
 struct UIPasteboardHostObject {
     /// Имя буфера обмена (NSString*)
