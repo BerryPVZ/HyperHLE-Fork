@@ -5,7 +5,7 @@
  */
 //! `UIPasteboard` and `UILocalNotification`.
 
-use crate::frameworks::foundation::{ns_string, NSUInteger}
+use crate::frameworks::foundation::{ns_string, NSUInteger};
 use crate::objc::{
     id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
