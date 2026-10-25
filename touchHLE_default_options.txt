@@ -384,3 +384,9 @@ com.ea.simsmedieval.bv: --ios-es2-direct-present
 # Retina screen. On the 320x480 iPhone 3GS every label and icon is twice too
 # big for its row, so the title and text overflow. Emulate a Retina iPhone.
 com.anarchyent.mcwikipaid: --device-family=iphone-4
+
+# Noblemen: 1896: indexes a per-program array of GL_ACTIVE_ATTRIBUTES entries
+# by attribute location, and its deferred light pass sends a texture-coordinate
+# array to location 0 for a program without one. With `position` at 0 the 3D
+# scene stays black. Use locations 0 to N-1 with `position` last.
+com.foursakenmedia.civilwar: --reverse-attrib-locations

@@ -4257,7 +4257,82 @@ fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
         record_shader_detach(program, shader);
     });
 }
+/// New locations for [crate::options::Options::reverse_attrib_locations].
+/// `attribs` holds each active attribute's location as the driver chose it
+/// and the number of locations it takes. The result gives the attributes the
+/// locations 0 to N-1 in the reverse order, in the same order as `attribs`.
+fn reversed_attrib_locations(attribs: &[(GLint, GLint)]) -> Vec<GLint> {
+    let mut order: Vec<usize> = (0..attribs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(attribs[i].0));
+    let mut locations = vec![0; attribs.len()];
+    let mut next = 0;
+    for i in order {
+        locations[i] = next;
+        next += attribs[i].1;
+    }
+    locations
+}
+
+/// Relink `program` with [reversed_attrib_locations]. Only called when the
+/// app bound no attribute locations itself.
+unsafe fn relink_with_reversed_attrib_locations(gles: &mut dyn GLES, program: GLuint) {
+    let mut ok: GLint = 0;
+    gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+    if ok == 0 {
+        return;
+    }
+    let mut count: GLint = 0;
+    gles.GetProgramiv(program, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &mut count);
+    let mut names = Vec::new();
+    let mut attribs = Vec::new();
+    for i in 0..count {
+        let mut name = [0u8; 256];
+        let mut len: GLsizei = 0;
+        let mut size: GLint = 0;
+        let mut type_: GLenum = 0;
+        gles.GetActiveAttrib(
+            program,
+            i as GLuint,
+            name.len() as GLsizei,
+            &mut len,
+            &mut size,
+            &mut type_,
+            name.as_mut_ptr().cast(),
+        );
+        let name = &name[..len.clamp(0, name.len() as GLsizei - 1) as usize];
+        if name.is_empty() || name.starts_with(b"gl_") {
+            continue;
+        }
+        let name = std::ffi::CString::new(name).unwrap();
+        let location = gles.GetAttribLocation(program, name.as_ptr());
+        if location < 0 {
+            continue;
+        }
+        // Matrix attributes take one location per column.
+        let slots = match type_ {
+            0x8B5A /* GL_FLOAT_MAT2 */ => 2,
+            0x8B5B /* GL_FLOAT_MAT3 */ => 3,
+            0x8B5C /* GL_FLOAT_MAT4 */ => 4,
+            _ => 1,
+        } * size.max(1);
+        names.push(name);
+        attribs.push((location, slots));
+    }
+    let locations = reversed_attrib_locations(&attribs);
+    if locations
+        .iter()
+        .zip(&attribs)
+        .all(|(new, (old, _))| new == old)
+    {
+        return;
+    }
+    for (name, &location) in names.iter().zip(&locations) {
+        gles.BindAttribLocation(program, location as GLuint, name.as_ptr());
+    }
+    gles.LinkProgram(program);
+}
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
+    let reverse_locations = env.options.reverse_attrib_locations;
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         // If the app explicitly bound attribute locations for this program,
         // respect them: forcing canonical bindings here would override the
@@ -4267,7 +4342,9 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             .guest_bound_attribs
             .get(&program)
             .map_or(false, |names| !names.is_empty());
-        if gles.is_es2() && !app_bound {
+        // The option needs the driver's own locations, see
+        // `Options::reverse_attrib_locations`.
+        if gles.is_es2() && !app_bound && !reverse_locations {
             for (index, names) in [
                 (
                     0,
@@ -4357,6 +4434,9 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             fix_fragment_only_varyings(gles, program);
         }
         gles.LinkProgram(program);
+        if gles.is_es2() && !app_bound && reverse_locations {
+            relink_with_reversed_attrib_locations(gles, program);
+        }
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
         if ok == 0 {
@@ -8974,5 +9054,24 @@ mod uniform_array_reconciliation_tests {
         let fixes = vec![("light".to_string(), 4u32)];
         let patched = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
         assert!(patched.contains("light[4]"), "{patched}");
+    }
+}
+
+#[cfg(test)]
+mod reversed_attrib_location_tests {
+    use super::reversed_attrib_locations;
+
+    #[test]
+    fn reverses_driver_order_into_locations_below_the_count() {
+        // Noblemen: 1896's deferred light program: `position` and
+        // `positionWorld`.
+        assert_eq!(reversed_attrib_locations(&[(0, 1), (1, 1)]), [1, 0]);
+        // Gaps in the driver's locations are closed up.
+        assert_eq!(
+            reversed_attrib_locations(&[(0, 1), (6, 1), (2, 1)]),
+            [2, 0, 1]
+        );
+        // A mat4 takes four locations.
+        assert_eq!(reversed_attrib_locations(&[(0, 4), (4, 1)]), [1, 0]);
     }
 }

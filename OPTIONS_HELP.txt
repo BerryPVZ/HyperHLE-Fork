@@ -513,6 +513,18 @@ Other options:
         Use the legacy MPMoviePlayerController behavior, even if the fix was
         enabled by an app-specific options file.
 
+    --reverse-attrib-locations
+        When an OpenGL ES 2.0 app binds no attribute locations itself, give
+        the active attributes of a linked program the locations 0 to N-1, in
+        the reverse of the order the host driver chose. This is for games
+        that need locations below the attribute count and that send arrays to
+        location 0 for attributes a program does not have. Disabled globally;
+        the bundled default-options file enables it for Noblemen: 1896.
+
+    --no-reverse-attrib-locations
+        Use the usual attribute locations, even if --reverse-attrib-locations
+        was enabled by an app-specific options file.
+
     --rotation-fix
         Use UIKit's actual autorotation state to decide whether EAGL needs an
         extra 180-degree presentation compensation. This fixes iPad games that

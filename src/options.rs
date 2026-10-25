@@ -274,6 +274,18 @@ pub struct Options {
     /// enable it for GTA III. Off globally because some other games rely on
     /// the legacy eager-load and automatic fullscreen presentation behaviour.
     pub fix_movie_player: bool,
+    /// When an OpenGL ES 2.0 app binds no attribute locations itself, give a
+    /// linked program's active attributes the locations 0 to N-1 in the
+    /// reverse of the order the host driver chose. Turn it on with
+    /// `--reverse-attrib-locations`. The bundled defaults turn it on for
+    /// Noblemen: 1896. That game sizes a per-program array by
+    /// `GL_ACTIVE_ATTRIBUTES` and indexes it by location, so locations must
+    /// be 0 to N-1. Its deferred light pass also sets a texture-coordinate
+    /// array at location 0 for a program that has no such attribute, which
+    /// only works if `position` is not at location 0. The spec leaves
+    /// unbound locations to the implementation:
+    /// <https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glBindAttribLocation.xml>
+    pub reverse_attrib_locations: bool,
     /// Expose a real guest-memory `xmlNode` struct tree ("DOM mirror") from
     /// libxml2 instead of opaque handles, for games that read node struct
     /// fields directly (`node->name`/`children`/`next`/…). Needed by Where's My
@@ -372,6 +384,7 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(false),
             fix_movie_player: false,
+            reverse_attrib_locations: false,
             xml_dom_mirror: std::env::var_os("TOUCHHLE_XML_MIRROR")
                 .map(|value| value != "0")
                 .unwrap_or(false),
@@ -410,6 +423,10 @@ impl Options {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
             self.fix_movie_player = false;
+        } else if arg == "--reverse-attrib-locations" {
+            self.reverse_attrib_locations = true;
+        } else if arg == "--no-reverse-attrib-locations" {
+            self.reverse_attrib_locations = false;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {
@@ -799,6 +816,22 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-fix-movie-player").unwrap());
         assert!(!options.fix_movie_player);
+    }
+
+    #[test]
+    fn reverse_attrib_locations_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.reverse_attrib_locations);
+
+        assert!(options
+            .parse_argument("--reverse-attrib-locations")
+            .unwrap());
+        assert!(options.reverse_attrib_locations);
+
+        assert!(options
+            .parse_argument("--no-reverse-attrib-locations")
+            .unwrap());
+        assert!(!options.reverse_attrib_locations);
     }
 
     #[test]
