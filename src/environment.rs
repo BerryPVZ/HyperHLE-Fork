@@ -1159,9 +1159,8 @@ impl Environment {
         let launch_image = None;
 
         assert!(!options.headless);
-        // On macOS, leave NSApp's icon alone so Launch Services keeps the
-        // bundled HyperHLE.icns icon. SDL_SetWindowIcon would replace the Dock
-        // icon with the app picker's fallback artwork.
+        // On macOS, passing no icon restores the bundle's Dock icon after a
+        // game has replaced it through SDL_SetWindowIcon.
         #[cfg(target_os = "macos")]
         let window_icon = {
             let _ = icon;
