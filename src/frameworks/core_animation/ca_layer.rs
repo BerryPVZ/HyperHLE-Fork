@@ -198,6 +198,62 @@ pub const kCAGravityTopRight: &str = "topRight";
 pub const kCAGravityBottomLeft: &str = "bottomLeft";
 pub const kCAGravityBottomRight: &str = "bottomRight";
 
+/// Where a layer's `contents` of `size` (in points) are drawn within its
+/// `bounds` for a `contentsGravity` value. Unknown values behave like the
+/// default, `kCAGravityResize`.
+///
+/// Apple: "The naming of contents gravity constants is based on the
+/// direction of the vertical axis": with `contentsAreFlipped` NO, `top`
+/// aligns to the maximum-Y edge, which on iOS is the bottom of the screen.
+/// <https://developer.apple.com/documentation/quartzcore/calayer/1410933-contentsgravity>
+pub(crate) fn contents_rect_for_gravity(gravity: &str, bounds: CGRect, size: CGSize) -> CGRect {
+    let (bw, bh) = (bounds.size.width, bounds.size.height);
+    let (w, h) = match gravity {
+        kCAGravityResizeAspect | kCAGravityResizeAspectFill
+            if size.width > 0.0 && size.height > 0.0 =>
+        {
+            let fit_x = bw / size.width;
+            let fit_y = bh / size.height;
+            let scale = if gravity == kCAGravityResizeAspect {
+                fit_x.min(fit_y)
+            } else {
+                fit_x.max(fit_y)
+            };
+            (size.width * scale, size.height * scale)
+        }
+        kCAGravityCenter
+        | kCAGravityTop
+        | kCAGravityBottom
+        | kCAGravityLeft
+        | kCAGravityRight
+        | kCAGravityTopLeft
+        | kCAGravityTopRight
+        | kCAGravityBottomLeft
+        | kCAGravityBottomRight => (size.width, size.height),
+        _ => return bounds,
+    };
+    let x = match gravity {
+        kCAGravityLeft | kCAGravityTopLeft | kCAGravityBottomLeft => 0.0,
+        kCAGravityRight | kCAGravityTopRight | kCAGravityBottomRight => bw - w,
+        _ => (bw - w) / 2.0,
+    };
+    let y = match gravity {
+        kCAGravityBottom | kCAGravityBottomLeft | kCAGravityBottomRight => 0.0,
+        kCAGravityTop | kCAGravityTopLeft | kCAGravityTopRight => bh - h,
+        _ => (bh - h) / 2.0,
+    };
+    CGRect {
+        origin: CGPoint {
+            x: bounds.origin.x + x,
+            y: bounds.origin.y + y,
+        },
+        size: CGSize {
+            width: w,
+            height: h,
+        },
+    }
+}
+
 // CAShapeLayer line cap / line join constants. Apple's QuartzCore
 // headers (`CAShapeLayer.h`) declare these as
 // `CA_EXTERN NSString * const kCALineCap*` / `kCALineJoin*`. The literal
@@ -1381,4 +1437,46 @@ pub fn set_use_implicit_animations(env: &mut Environment, layer: id, enable: boo
     env.objc
         .borrow_mut::<CALayerHostObject>(layer)
         .use_implicit_animations = enable;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> CGRect {
+        CGRect {
+            origin: CGPoint { x, y },
+            size: CGSize {
+                width: w,
+                height: h,
+            },
+        }
+    }
+
+    #[test]
+    fn contents_gravity_positions_contents() {
+        let bounds = rect(0.0, 0.0, 160.0, 60.0);
+        let size = CGSize {
+            width: 63.0,
+            height: 35.0,
+        };
+        let at = |gravity| contents_rect_for_gravity(gravity, bounds, size);
+        assert_eq!(at(kCAGravityResize), bounds);
+        assert_eq!(at("unknown"), bounds);
+        assert_eq!(at(kCAGravityCenter), rect(48.5, 12.5, 63.0, 35.0));
+        assert_eq!(at(kCAGravityLeft), rect(0.0, 12.5, 63.0, 35.0));
+        assert_eq!(at(kCAGravityRight), rect(97.0, 12.5, 63.0, 35.0));
+        // Gravity names follow a Y-up axis: "top" is the maximum-Y edge.
+        assert_eq!(at(kCAGravityTop), rect(48.5, 25.0, 63.0, 35.0));
+        assert_eq!(at(kCAGravityBottomLeft), rect(0.0, 0.0, 63.0, 35.0));
+
+        let square = CGSize {
+            width: 10.0,
+            height: 10.0,
+        };
+        let fit = contents_rect_for_gravity(kCAGravityResizeAspect, bounds, square);
+        assert_eq!(fit, rect(50.0, 0.0, 60.0, 60.0));
+        let fill = contents_rect_for_gravity(kCAGravityResizeAspectFill, bounds, square);
+        assert_eq!(fill, rect(0.0, -50.0, 160.0, 160.0));
+    }
 }

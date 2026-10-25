@@ -6,7 +6,7 @@
 //! `UIImageView`.
 
 use crate::frameworks::core_graphics::cg_image::CGImageRef;
-use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string::get_static_str;
 use crate::frameworks::foundation::{NSInteger, NSTimeInterval, NSUInteger};
 use crate::objc::{
@@ -235,6 +235,12 @@ fn set_layer_contents(env: &mut Environment, this: id, image: id) {
     } else {
         msg![env; image CGImage]
     };
+    // As on iOS, the layer takes the image's scale, so an @2x image's
+    // contents are its point size when positioned by contentsGravity.
+    if image != nil {
+        let scale: CGFloat = msg![env; image scale];
+        () = msg![env; layer setContentsScale:scale];
+    }
     () = msg![env; layer setContents:cg_image];
 }
 

@@ -26,6 +26,7 @@ pub mod ui_web_view;
 pub mod ui_window;
 
 use super::ui_graphics::{UIGraphicsPopContext, UIGraphicsPushContext};
+use crate::frameworks::core_animation::ca_layer;
 use crate::frameworks::core_graphics::cg_affine_transform::CGAffineTransform;
 use crate::frameworks::core_graphics::cg_color::CGColorRef;
 use crate::frameworks::core_graphics::cg_context::{CGContextClearRect, CGContextRef};
@@ -865,6 +866,15 @@ pub const CLASSES: ClassExports = objc_classes! {
     let key_bg = get_static_str(env, "UIBackgroundColor");
     let bg_color: id = if msg![env; coder containsValueForKey:key_bg] { msg![env; coder decodeObjectForKey:key_bg] } else { nil };
 
+    // Interface Builder archives the Alpha and "Clip Subviews" attributes
+    // only when they differ from the defaults (1.0 and NO). A view with
+    // UIAlpha 0 is invisible until the app fades it in.
+    let key_alpha = get_static_str(env, "UIAlpha");
+    let alpha: CGFloat = if msg![env; coder containsValueForKey:key_alpha] { msg![env; coder decodeFloatForKey:key_alpha] } else { 1.0 };
+
+    let key_clips = get_static_str(env, "UIClipsToBounds");
+    let clips_to_bounds: bool = if msg![env; coder containsValueForKey:key_clips] { msg![env; coder decodeBoolForKey:key_clips] } else { false };
+
     let key_tag = get_static_str(env, "UITag");
     let tag: NSInteger = if msg![env; coder containsValueForKey:key_tag] { msg![env; coder decodeIntegerForKey:key_tag] } else { 0 };
 
@@ -913,6 +923,8 @@ pub const CLASSES: ClassExports = objc_classes! {
     () = msg![env; this setHidden:hidden];
     () = msg![env; this setOpaque:opaque];
     if bg_color != nil { () = msg![env; this setBackgroundColor:bg_color]; }
+    () = msg![env; this setAlpha:alpha];
+    () = msg![env; this setClipsToBounds:clips_to_bounds];
 
     () = msg![env; this setTag:tag];
     () = msg![env; this setContentMode:content_mode];
@@ -976,7 +988,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (())setTag:(NSInteger)tag { env.objc.borrow_mut::<UIViewHostObject>(this).tag = tag; }
 
 - (NSInteger)contentMode { env.objc.borrow::<UIViewHostObject>(this).content_mode }
-- (())setContentMode:(NSInteger)content_mode { env.objc.borrow_mut::<UIViewHostObject>(this).content_mode = content_mode; }
+// A view's contentMode positions its layer's contents, the way UIKit sets the
+// layer's contentsGravity. Gravity names follow a Y-up axis, so the top of a
+// view is the layer's kCAGravityBottom edge.
+// https://developer.apple.com/documentation/uikit/uiview/1622619-contentmode
+// https://developer.apple.com/documentation/quartzcore/calayer/1410933-contentsgravity
+- (())setContentMode:(NSInteger)content_mode {
+    env.objc.borrow_mut::<UIViewHostObject>(this).content_mode = content_mode;
+    let gravity = match content_mode {
+        1 => ca_layer::kCAGravityResizeAspect,      // ScaleAspectFit
+        2 => ca_layer::kCAGravityResizeAspectFill,  // ScaleAspectFill
+        4 => ca_layer::kCAGravityCenter,            // Center
+        5 => ca_layer::kCAGravityBottom,            // Top
+        6 => ca_layer::kCAGravityTop,               // Bottom
+        7 => ca_layer::kCAGravityLeft,              // Left
+        8 => ca_layer::kCAGravityRight,             // Right
+        9 => ca_layer::kCAGravityBottomLeft,        // TopLeft
+        10 => ca_layer::kCAGravityBottomRight,      // TopRight
+        11 => ca_layer::kCAGravityTopLeft,          // BottomLeft
+        12 => ca_layer::kCAGravityTopRight,         // BottomRight
+        _ => ca_layer::kCAGravityResize,            // ScaleToFill, Redraw
+    };
+    let gravity = get_static_str(env, gravity);
+    let layer = env.objc.borrow::<UIViewHostObject>(this).layer;
+    () = msg![env; layer setContentsGravity:gravity];
+}
 
 - (NSUInteger)autoresizingMask { env.objc.borrow::<UIViewHostObject>(this).autoresizing_mask }
 - (())setAutoresizingMask:(NSUInteger)mask { env.objc.borrow_mut::<UIViewHostObject>(this).autoresizing_mask = mask; }

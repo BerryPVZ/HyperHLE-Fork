@@ -148,6 +148,63 @@ fn update(env: &mut Environment, this: id) {
     // Without proper side-by-side layout the title would overlap the image.
     let hide_title = image != nil;
     () = msg![env; title_label setHidden:hide_title];
+
+    // The image view's frame depends on the current image's size.
+    () = msg![env; this layoutSubviews];
+}
+
+fn inset_rect(rect: CGRect, insets: UIEdgeInsets) -> CGRect {
+    CGRect {
+        origin: CGPoint {
+            x: rect.origin.x + insets.left,
+            y: rect.origin.y + insets.top,
+        },
+        size: CGSize {
+            width: (rect.size.width - insets.left - insets.right).max(0.0),
+            height: (rect.size.height - insets.top - insets.bottom).max(0.0),
+        },
+    }
+}
+
+/// Place an item of `size` in `area` the way UIButton aligns its content:
+/// centered by default, at an edge for Left/Right/Top/Bottom, and stretched
+/// to the whole area for Fill. An item larger than the area is shrunk to it.
+fn align_in_rect(
+    area: CGRect,
+    size: CGSize,
+    horizontal: UIControlContentHorizontalAlignment,
+    vertical: UIControlContentVerticalAlignment,
+) -> CGRect {
+    let (x, width) = match horizontal {
+        UIControlContentHorizontalAlignmentFill => (area.origin.x, area.size.width),
+        _ => {
+            let width = size.width.min(area.size.width);
+            let x = match horizontal {
+                UIControlContentHorizontalAlignmentLeft => area.origin.x,
+                UIControlContentHorizontalAlignmentRight => area.origin.x + area.size.width - width,
+                _ => area.origin.x + (area.size.width - width) / 2.0,
+            };
+            (x, width)
+        }
+    };
+    let (y, height) = match vertical {
+        UIControlContentVerticalAlignmentFill => (area.origin.y, area.size.height),
+        _ => {
+            let height = size.height.min(area.size.height);
+            let y = match vertical {
+                UIControlContentVerticalAlignmentTop => area.origin.y,
+                UIControlContentVerticalAlignmentBottom => {
+                    area.origin.y + area.size.height - height
+                }
+                _ => area.origin.y + (area.size.height - height) / 2.0,
+            };
+            (y, height)
+        }
+    };
+    CGRect {
+        origin: CGPoint { x, y },
+        size: CGSize { width, height },
+    }
 }
 
 fn init_common(env: &mut Environment, this: id) -> id {
@@ -311,6 +368,34 @@ pub const CLASSES: ClassExports = objc_classes! {
         }
     }
 
+    // Interface Builder's Control > Alignment and Edge settings. The insets
+    // are archived like UIBounds, as top, left, bottom, right.
+    let key = get_static_str(env, "UIContentHorizontalAlignment");
+    if msg![env; coder containsValueForKey:key] {
+        let alignment: NSInteger = msg![env; coder decodeIntegerForKey:key];
+        () = msg![env; this setContentHorizontalAlignment:alignment];
+    }
+    let key = get_static_str(env, "UIContentVerticalAlignment");
+    if msg![env; coder containsValueForKey:key] {
+        let alignment: NSInteger = msg![env; coder decodeIntegerForKey:key];
+        () = msg![env; this setContentVerticalAlignment:alignment];
+    }
+    let key = get_static_str(env, "UIContentEdgeInsets");
+    if msg![env; coder containsValueForKey:key] {
+        let insets: CGRect = msg![env; coder decodeCGRectForKey:key];
+        () = msg![env; this setContentEdgeInsets:insets];
+    }
+    let key = get_static_str(env, "UITitleEdgeInsets");
+    if msg![env; coder containsValueForKey:key] {
+        let insets: CGRect = msg![env; coder decodeCGRectForKey:key];
+        () = msg![env; this setTitleEdgeInsets:insets];
+    }
+    let key = get_static_str(env, "UIImageEdgeInsets");
+    if msg![env; coder containsValueForKey:key] {
+        let insets: CGRect = msg![env; coder decodeCGRectForKey:key];
+        () = msg![env; this setImageEdgeInsets:insets];
+    }
+
     () = msg![env; this layoutSubviews];
     update(env, this);
     this
@@ -331,16 +416,25 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 // MARK: - Layout
 
+// Apple: the image is drawn at its own size within the content rectangle
+// (bounds minus contentEdgeInsets), placed by contentHorizontalAlignment and
+// contentVerticalAlignment; only the background image fills the button.
+// Subclasses can override the ...RectFor... methods, so lay out through them.
+// https://developer.apple.com/documentation/uikit/uibutton/1624026-imagerectforcontentrect
 - (())layoutSubviews {
     let host_object = env.objc.borrow_mut::<UIButtonHostObject>(this);
     let title_label = host_object.title_label;
     let background_image_view = host_object.background_image_view;
     let image_view = host_object.image_view;
     let bounds: CGRect = msg![env; this bounds];
+    let content_rect: CGRect = msg![env; this contentRectForBounds:bounds];
+    let title_rect: CGRect = msg![env; this titleRectForContentRect:content_rect];
+    let image_rect: CGRect = msg![env; this imageRectForContentRect:content_rect];
+    let background_rect: CGRect = msg![env; this backgroundRectForBounds:bounds];
 
-    () = msg![env; title_label setFrame:bounds];
-    () = msg![env; background_image_view setFrame:bounds];
-    () = msg![env; image_view setFrame:bounds];
+    () = msg![env; title_label setFrame:title_rect];
+    () = msg![env; background_image_view setFrame:background_rect];
+    () = msg![env; image_view setFrame:image_rect];
 }
 
 // touchHLE has no deferred layout pass (setNeedsLayout is a no-op), so
@@ -398,14 +492,26 @@ pub const CLASSES: ClassExports = objc_classes! {
     content_rect
 }
 
-- (CGRect)imageRectForContentRect:(CGRect)_content_rect {
-    CGRect {
-        origin: CGPoint { x: 0.0, y: 0.0 },
-        size:   CGSize  { width: 0.0, height: 0.0 },
-    }
+- (CGRect)imageRectForContentRect:(CGRect)content_rect {
+    let image: id = msg![env; this currentImage];
+    let host = env.objc.borrow::<UIButtonHostObject>(this);
+    let (horizontal, vertical, insets) = (
+        host.content_horizontal_alignment,
+        host.content_vertical_alignment,
+        host.image_edge_insets,
+    );
+    let area = inset_rect(content_rect, insets);
+    let size: CGSize = if image != nil {
+        msg![env; image size]
+    } else {
+        CGSize { width: 0.0, height: 0.0 }
+    };
+    align_in_rect(area, size, horizontal, vertical)
 }
 
-- (CGRect)contentRectForBounds:(CGRect)bounds { bounds }
+- (CGRect)contentRectForBounds:(CGRect)bounds {
+    inset_rect(bounds, env.objc.borrow::<UIButtonHostObject>(this).content_edge_insets)
+}
 - (CGRect)backgroundRectForBounds:(CGRect)bounds { bounds }
 
 // MARK: - Type
@@ -458,6 +564,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         _                                        => UITextAlignmentCenter,
     };
     () = msg![env; label setTextAlignment:text_alignment];
+    () = msg![env; this layoutSubviews];
 }
 
 - (UIControlContentVerticalAlignment)contentVerticalAlignment {
@@ -466,6 +573,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setContentVerticalAlignment:(UIControlContentVerticalAlignment)alignment {
     env.objc.borrow_mut::<UIButtonHostObject>(this).content_vertical_alignment = alignment;
+    () = msg![env; this layoutSubviews];
 }
 
 // MARK: - Edge insets (Hacked to use CGRect for GuestArg/GuestRet
@@ -486,6 +594,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         right: rect.size.height,
     };
     env.objc.borrow_mut::<UIButtonHostObject>(this).content_edge_insets = insets;
+    () = msg![env; this layoutSubviews];
 }
 
 - (CGRect)titleEdgeInsets {
@@ -503,6 +612,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         right: rect.size.height,
     };
     env.objc.borrow_mut::<UIButtonHostObject>(this).title_edge_insets = insets;
+    () = msg![env; this layoutSubviews];
 }
 
 - (CGRect)imageEdgeInsets {
@@ -520,6 +630,7 @@ pub const CLASSES: ClassExports = objc_classes! {
         right: rect.size.height,
     };
     env.objc.borrow_mut::<UIButtonHostObject>(this).image_edge_insets = insets;
+    () = msg![env; this layoutSubviews];
 }
 
 // MARK: - Behaviour flags
