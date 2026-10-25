@@ -761,6 +761,41 @@ fn pad_icon_for_dock(image: &Image) -> Image {
     Image::from_pixels(canvas_width, canvas_height, pixels)
 }
 
+/// Undo SDL's application-wide Dock icon override when the picker reopens.
+/// AppKit restores the icon declared by the app bundle when given nil.
+/// See https://developer.apple.com/documentation/appkit/nsapplication/applicationiconimage
+#[cfg(target_os = "macos")]
+fn restore_application_icon() {
+    use std::ffi::{c_char, c_void};
+
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    unsafe {
+        let class = objc_getClass(c"NSApplication".as_ptr());
+        if class.is_null() {
+            return;
+        }
+        let shared: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let app = shared(class, sel_registerName(c"sharedApplication".as_ptr()));
+        if app.is_null() {
+            return;
+        }
+        let set_icon: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        set_icon(
+            app,
+            sel_registerName(c"setApplicationIconImage:".as_ptr()),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
 /// Query the host's primary display size in physical pixels, if possible.
 ///
 /// Used by `--device-family=auto` to pick the closest emulated device before
@@ -1176,6 +1211,9 @@ impl Window {
             #[cfg(not(target_os = "macos"))]
             let icon = icon;
             window.set_icon(surface_from_image(&icon));
+        } else {
+            #[cfg(target_os = "macos")]
+            restore_application_icon();
         }
 
         let event_pump = sdl_ctx
