@@ -82,6 +82,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub use touchHLE_version::*;
 
+pub const DISPLAY_NAME: &str = "HyperHLE-Reborn";
+
 #[cfg(target_os = "ios")]
 static HOST_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "ios")]
@@ -217,10 +219,30 @@ Special options:
 ";
 /// Run a guest session, keeping its termination separate from emulator errors.
 /// `None` denotes a host-only operation or a return without guest termination.
-pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermination>, String> {
+pub fn main<T: Iterator<Item = String>>(args: T) -> Result<Option<GuestTermination>, String> {
     crash_handler::install();
     crash_handler::install_panic_hook();
+    let original_args: Vec<String> = args.collect();
+    let program = original_args.first().cloned().unwrap_or_default();
+    let mut next_args = original_args;
+    let mut returning_to_picker = false;
+    loop {
+        let result = run_session(next_args.into_iter(), returning_to_picker)?;
+        if cfg!(not(any(target_os = "android", target_os = "ios")))
+            && matches!(result, Some(GuestTermination::ReturnToPicker))
+        {
+            next_args = vec![program.clone()];
+            returning_to_picker = true;
+        } else {
+            return Ok(result);
+        }
+    }
+}
 
+fn run_session<T: Iterator<Item = String>>(
+    mut args: T,
+    returning_to_picker: bool,
+) -> Result<Option<GuestTermination>, String> {
     // Headless CI boxes have no sound devices; when asked, point OpenAL
     // Soft's wave writer at a capture file before any OpenAL call happens.
     if std::env::var_os("TOUCHHLE_CAPTURE_AUDIO").is_some()
@@ -338,7 +360,8 @@ pub fn main<T: Iterator<Item = String>>(mut args: T) -> Result<Option<GuestTermi
         echo!(
             "No app specified, opening app picker. Use the --help flag to see command-line usage."
         );
-        let (bundle_path, mut extra_options) = environment::app_picker::app_picker(options)?;
+        let (bundle_path, mut extra_options) =
+            environment::app_picker::app_picker(options, !returning_to_picker)?;
         option_args.append(&mut extra_options);
         bundle_path
     };

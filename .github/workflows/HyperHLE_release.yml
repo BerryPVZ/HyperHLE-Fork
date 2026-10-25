@@ -26,7 +26,17 @@ concurrency:
 
 jobs:
   build-osx:
-    runs-on: macos-latest  
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            artifact: HyperHLE_macOS_x86_64
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            artifact: HyperHLE_macOS_AArch64
+    runs-on: ${{ matrix.runner }}
 
     steps:  
       - name: Checkout touchHLE
@@ -59,34 +69,37 @@ jobs:
         with:
           cmakeVersion: "~3.29.0"
 
-      - name: Install x86_64 toolchain  
-        run: rustup target add x86_64-apple-darwin  
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
 
       # TestApp is built with LLVM 12 against the common-3.0 SDK, as in
       # touchHLE's CI. These steps were removed in 49d9d48e.
       - name: Try to get cached copy of LLVM
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
         id: cache-llvm
         uses: actions/cache@main
         with:
           path: tests/llvm
           key: llvm_12_0_0_macOS_x64
 
-      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+      - if: ${{ matrix.target == 'x86_64-apple-darwin' && steps.cache-llvm.outputs.cache-hit != 'true' }}
         name: Download LLVM
         run: curl -L -O "https://github.com/llvm/llvm-project/releases/download/llvmorg-12.0.0/clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz"
 
-      - if: ${{ steps.cache-llvm.outputs.cache-hit != 'true' }}
+      - if: ${{ matrix.target == 'x86_64-apple-darwin' && steps.cache-llvm.outputs.cache-hit != 'true' }}
         name: Extract LLVM
         run: tar -xf clang+llvm-12.0.0-x86_64-apple-darwin.tar.xz && mkdir tests/llvm && mv clang+llvm-12.0.0-x86_64-apple-darwin/* tests/llvm
 
       - name: Get copy of common-3.0-sdk
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
         run: cd tests && curl -L https://github.com/touchHLE/common-3.0-sdk/releases/latest/download/common-3.0.sdk-macOS-universal.tar.gz | tar xzv
 
       - name: Test
-        run: cargo test --target x86_64-apple-darwin
+        if: ${{ matrix.target == 'x86_64-apple-darwin' }}
+        run: cargo test --target ${{ matrix.target }}
         
       - name: Build  
-        run: cargo build --target x86_64-apple-darwin --release  
+        run: cargo build --target ${{ matrix.target }} --release
 
       - name: Create .app bundle and DMG
         # `hdiutil create` periodically fails on the `macos-15-arm64` GitHub
@@ -102,7 +115,7 @@ jobs:
           set -eu
           cd dev-scripts
           ./make-macos-bundle.sh \
-            ../target/x86_64-apple-darwin/release/touchHLE \
+            ../target/${{ matrix.target }}/release/touchHLE \
             "`cargo run --package touchHLE_version`" \
             "`cargo run --package touchHLE_version -- --branding`"
           mkdir touchHLE-dmg-src
@@ -131,12 +144,12 @@ jobs:
             sleep "$sleep_secs"
             attempt=$((attempt + 1))
           done
-          mv touchHLE.dmg ..
+          mv touchHLE.dmg ../touchHLE_${{ matrix.target }}.dmg
           
       - uses: actions/upload-artifact@main
         with:
-          name: HyperHLE_macOS_x86_64
-          path: touchHLE.dmg
+          name: ${{ matrix.artifact }}
+          path: touchHLE_${{ matrix.target }}.dmg
 
   build-linux:
     runs-on: ubuntu-latest
@@ -578,11 +591,16 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           fetch-tags: true
-      - name: Download macOS artifact
+      - name: Download macOS Intel artifact
         uses: actions/download-artifact@main
         with:
           name: HyperHLE_macOS_x86_64
-          path: artifacts/macos
+          path: artifacts/macos-x86_64
+      - name: Download macOS Apple Silicon artifact
+        uses: actions/download-artifact@main
+        with:
+          name: HyperHLE_macOS_AArch64
+          path: artifacts/macos-aarch64
       - name: Download Android artifact
         uses: actions/download-artifact@main
         with:
