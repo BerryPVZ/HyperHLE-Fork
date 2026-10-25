@@ -624,6 +624,8 @@ pub enum TextInputEvent {
 pub enum Event {
     /// User requested quit.
     Quit,
+    /// User closed the SDL window.
+    CloseWindow,
     /// OS has informed touchHLE it will soon become inactive.
     /// (iOS `applicationWillResignActive:`, Android `onPause()`)
     AppWillResignActive,
@@ -651,6 +653,8 @@ pub enum Event {
     /// Left (-1) or right (+1) arrow key was pressed. Used by the app picker
     /// to switch pages.
     ArrowKey(i8),
+    /// SDL's vertical mouse-wheel delta (including the host's natural-scroll setting).
+    MouseWheel(i32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1135,10 +1139,11 @@ impl Window {
                 .display_bounds(0)
                 .map_err(|err| format!("Could not query the display bounds: {}", err))?
                 .size();
-            let window = video_ctx
-                .window(title, width, height)
-                .fullscreen_desktop()
-                .opengl()
+            let mut window_builder = video_ctx.window(title, width, height);
+            window_builder.fullscreen_desktop().opengl();
+            #[cfg(target_os = "macos")]
+            window_builder.allow_highdpi();
+            let window = window_builder
                 .build()
                 .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
@@ -1148,11 +1153,11 @@ impl Window {
                 device_orientation,
                 scale_hack,
             );
-            let window = video_ctx
-                .window(title, width, height)
-                .position_centered()
-                .resizable()
-                .opengl()
+            let mut window_builder = video_ctx.window(title, width, height);
+            window_builder.position_centered().resizable().opengl();
+            #[cfg(target_os = "macos")]
+            window_builder.allow_highdpi();
+            let window = window_builder
                 .build()
                 .map_err(|err| format!("Could not create the SDL OpenGL window: {}", err))?;
             window
@@ -1660,6 +1665,10 @@ impl Window {
 
             self.event_queue.push_back(match event {
                 E::Quit { .. } => Event::Quit,
+                E::Window {
+                    win_event: sdl2::event::WindowEvent::Close,
+                    ..
+                } => Event::CloseWindow,
                 E::MouseButtonDown {
                     x,
                     y,
@@ -2081,6 +2090,7 @@ impl Window {
                     repeat: false,
                     ..
                 } => Event::ArrowKey(1),
+                E::MouseWheel { y, .. } => Event::MouseWheel(y),
                 E::KeyDown {
                     keycode: Some(sdl2::keyboard::Keycode::Return),
                     ..
@@ -2120,6 +2130,12 @@ impl Window {
 
     /// Pop an event from the queue (in FIFO order, except for high priority
     /// events)
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub fn close_requested(&self) -> bool {
+        matches!(self.high_priority_event.as_ref(), Some(Event::CloseWindow))
+            || self.event_queue.iter().any(|event| matches!(event, Event::CloseWindow))
+    }
+
     pub fn pop_event(&mut self) -> Option<Event> {
         // TEST HOOK: GD autoplay taps for verifying level music headlessly.
         if !self.auto_taps.is_empty() {
@@ -2640,9 +2656,9 @@ impl Window {
                 // Also show FPS in the window title so it's visible when the
                 // app is running fullscreen or without console.
                 let base_title = if crate::branding().is_empty() {
-                    format!("touchHLE {}", crate::VERSION)
+                    format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
                 } else {
-                    format!("touchHLE {} {}", crate::branding(), crate::VERSION)
+                    format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
                 };
                 let title = format!("{} - FPS: {:.1}", base_title, fps);
                 // Ignore any error setting the title.
@@ -2789,14 +2805,11 @@ impl Window {
         // Use the full drawable when the native constraint is active and the
         // current client size still matches it. Programmatic resizes, Snap,
         // maximize and window managers that ignore hints fall back to fitting
-        // the guest image. macOS constrains the outer frame (including the
-        // title bar), so its drawable ratio intentionally uses the full area.
+        // the guest image. Check the drawable on macOS too: its title bar and
+        // backing-pixel rounding can leave the content a pixel off the ratio.
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             let drawable_size = self.window.drawable_size();
-            #[cfg(target_os = "macos")]
-            let native_ratio_matches = true;
-            #[cfg(not(target_os = "macos"))]
             let native_ratio_matches = {
                 let lhs = drawable_size.0 as u64 * app_height as u64;
                 let rhs = drawable_size.1 as u64 * app_width as u64;

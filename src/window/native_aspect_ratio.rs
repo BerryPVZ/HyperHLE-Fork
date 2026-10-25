@@ -10,6 +10,8 @@ mod platform {
     use super::*;
     use std::ffi::{c_char, c_void, CString};
 
+    static ASPECT_STATE_KEY: u8 = 0;
+
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Size {
@@ -17,14 +19,177 @@ mod platform {
         height: f64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Rect {
+        origin: Point,
+        size: Size,
+    }
+
+    struct State {
+        sdl_window: *mut sdl2_sys::SDL_Window,
+        ratio: Size,
+        enabled: bool,
+        resize_axis: Option<ResizeAxis>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ResizeAxis {
+        Width,
+        Height,
+    }
+
     #[link(name = "objc")]
     unsafe extern "C" {
         fn sel_registerName(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
+        #[cfg(target_arch = "x86_64")]
+        fn objc_msgSend_stret();
+        fn object_getClass(object: *mut c_void) -> *mut c_void;
+        fn class_addMethod(
+            class: *mut c_void,
+            selector: *mut c_void,
+            implementation: *const c_void,
+            types: *const c_char,
+        ) -> bool;
+        fn class_getInstanceMethod(class: *mut c_void, selector: *mut c_void) -> *mut c_void;
+        fn method_getImplementation(method: *mut c_void) -> *const c_void;
+        fn objc_getAssociatedObject(object: *mut c_void, key: *const c_void) -> *mut c_void;
+        fn objc_setAssociatedObject(
+            object: *mut c_void,
+            key: *const c_void,
+            value: *mut c_void,
+            policy: usize,
+        );
+    }
+
+    unsafe fn send_object(object: *mut c_void, name: &str) -> *mut c_void {
+        let selector = CString::new(name).unwrap();
+        let send: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { send(object, sel_registerName(selector.as_ptr())) }
+    }
+
+    unsafe fn install_method(
+        class: *mut c_void,
+        name: &std::ffi::CStr,
+        implementation: *const c_void,
+        types: &std::ffi::CStr,
+    ) -> bool {
+        if class.is_null() {
+            return false;
+        }
+        let selector = unsafe { sel_registerName(name.as_ptr()) };
+        if unsafe { class_addMethod(class, selector, implementation, types.as_ptr()) } {
+            true
+        } else {
+            let method = unsafe { class_getInstanceMethod(class, selector) };
+            !method.is_null() && unsafe { method_getImplementation(method) == implementation }
+        }
+    }
+
+    unsafe extern "C" fn live_resize_boundary(
+        _delegate: *mut c_void,
+        _selector: *mut c_void,
+        notification: *mut c_void,
+    ) {
+        let window = unsafe { send_object(notification, "object") };
+        let state = unsafe {
+            objc_getAssociatedObject(window, &ASPECT_STATE_KEY as *const u8 as *const c_void)
+        } as *mut State;
+        if !state.is_null() {
+            unsafe { (*state).resize_axis = None };
+        }
+    }
+
+    unsafe fn content_rect(window: *mut c_void, frame: Rect) -> Rect {
+        let selector = c"contentRectForFrameRect:";
+        let selector = unsafe { sel_registerName(selector.as_ptr()) };
+        #[cfg(target_arch = "aarch64")]
+        {
+            let send: unsafe extern "C" fn(*mut c_void, *mut c_void, Rect) -> Rect =
+                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            unsafe { send(window, selector, frame) }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut result = std::mem::MaybeUninit::<Rect>::uninit();
+            let send: unsafe extern "C" fn(*mut Rect, *mut c_void, *mut c_void, Rect) =
+                unsafe { std::mem::transmute(objc_msgSend_stret as *const ()) };
+            unsafe {
+                send(result.as_mut_ptr(), window, selector, frame);
+                result.assume_init()
+            }
+        }
+    }
+
+    unsafe extern "C" fn window_will_resize(
+        _delegate: *mut c_void,
+        _selector: *mut c_void,
+        window: *mut c_void,
+        proposed: Size,
+    ) -> Size {
+        let state = unsafe {
+            objc_getAssociatedObject(window, &ASPECT_STATE_KEY as *const u8 as *const c_void)
+        } as *const State;
+        if state.is_null() || !unsafe { (*state).enabled } {
+            return proposed;
+        }
+        let ratio = unsafe { (*state).ratio };
+        let frame = Rect {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: proposed,
+        };
+        let content = unsafe { content_rect(window, frame) }.size;
+        if content.width <= 0.0 || content.height <= 0.0 {
+            return proposed;
+        }
+
+        let mut current_width = 0;
+        let mut current_height = 0;
+        unsafe {
+            sdl2_sys::SDL_GetWindowSize(
+                (*state).sdl_window,
+                &mut current_width,
+                &mut current_height,
+            );
+        }
+        let state = unsafe { &mut *state.cast_mut() };
+        if state.resize_axis.is_none()
+            && (content.width - f64::from(current_width)).abs() < 0.5
+            && (content.height - f64::from(current_height)).abs() < 0.5
+        {
+            return proposed;
+        }
+        let axis = *state.resize_axis.get_or_insert_with(|| {
+            let width_changed = (content.width - f64::from(current_width)).abs() / ratio.width;
+            let height_changed = (content.height - f64::from(current_height)).abs() / ratio.height;
+            if width_changed >= height_changed {
+                ResizeAxis::Width
+            } else {
+                ResizeAxis::Height
+            }
+        });
+        let (width, height) = match axis {
+            ResizeAxis::Width => (content.width, content.width * ratio.height / ratio.width),
+            ResizeAxis::Height => (content.height * ratio.width / ratio.height, content.height),
+        };
+        Size {
+            width: width + proposed.width - content.width,
+            height: height + proposed.height - content.height,
+        }
     }
 
     pub struct Constraint {
         window: *mut c_void,
+        state: *mut State,
     }
 
     impl Constraint {
@@ -40,44 +205,92 @@ mod platform {
             } else {
                 std::ptr::null_mut()
             };
-            Self { window: native }
-        }
-
-        pub fn set(&mut self, enabled: bool, ratio: (u32, u32)) {
-            if self.window.is_null() {
-                return;
+            if native.is_null() {
+                return Self {
+                    window: native,
+                    state: std::ptr::null_mut(),
+                };
             }
-            let (selector, value) = if enabled && ratio.0 > 0 && ratio.1 > 0 {
-                (
-                    "setAspectRatio:",
-                    Size {
-                        width: ratio.0 as f64,
-                        height: ratio.1 as f64,
-                    },
+            let delegate = unsafe { send_object(native, "delegate") };
+            let class = unsafe { object_getClass(delegate) };
+            let installed = unsafe {
+                install_method(
+                    class,
+                    c"windowWillResize:toSize:",
+                    window_will_resize as *const c_void,
+                    c"{CGSize=dd}@:@{CGSize=dd}",
+                ) && install_method(
+                    class,
+                    c"windowWillStartLiveResize:",
+                    live_resize_boundary as *const c_void,
+                    c"v@:@",
+                ) && install_method(
+                    class,
+                    c"windowDidEndLiveResize:",
+                    live_resize_boundary as *const c_void,
+                    c"v@:@",
                 )
-            } else {
-                // AppKit 26 can crash during a later live resize after
-                // setContentAspectRatio: is called, including when clearing
-                // it with (0, 0). Resetting resize increments is the
-                // documented way to cancel an NSWindow aspect constraint.
-                (
-                    "setResizeIncrements:",
-                    Size {
+            };
+            let state = if installed {
+                let state = Box::into_raw(Box::new(State {
+                    sdl_window: window.raw(),
+                    ratio: Size {
                         width: 1.0,
                         height: 1.0,
                     },
-                )
+                    enabled: false,
+                    resize_axis: None,
+                }));
+                unsafe {
+                    objc_setAssociatedObject(
+                        native,
+                        &ASPECT_STATE_KEY as *const u8 as *const c_void,
+                        state.cast(),
+                        0, // OBJC_ASSOCIATION_ASSIGN
+                    );
+                }
+                state
+            } else {
+                std::ptr::null_mut()
             };
-            let selector = CString::new(selector).unwrap();
-            let send: unsafe extern "C" fn(*mut c_void, *mut c_void, Size) =
-                unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+            Self {
+                window: native,
+                state,
+            }
+        }
+
+        pub fn set(&mut self, enabled: bool, ratio: (u32, u32)) {
+            if self.state.is_null() {
+                return;
+            }
             unsafe {
-                send(self.window, sel_registerName(selector.as_ptr()), value);
+                (*self.state).enabled = enabled && ratio.0 > 0 && ratio.1 > 0;
+                (*self.state).resize_axis = None;
+                (*self.state).ratio = Size {
+                    width: ratio.0 as f64,
+                    height: ratio.1 as f64,
+                };
             }
         }
 
         pub fn is_native(&self) -> bool {
-            !self.window.is_null()
+            !self.state.is_null()
+        }
+    }
+
+    impl Drop for Constraint {
+        fn drop(&mut self) {
+            if !self.state.is_null() {
+                unsafe {
+                    objc_setAssociatedObject(
+                        self.window,
+                        &ASPECT_STATE_KEY as *const u8 as *const c_void,
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    drop(Box::from_raw(self.state));
+                }
+            }
         }
     }
 }

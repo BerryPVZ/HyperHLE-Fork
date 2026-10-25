@@ -481,11 +481,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)sendAction:(SEL)action
                 to:(id)target
               from:(id)sender
-          forEvent:(id)_event { // UIEvent*
+          forEvent:(id)event { // UIEvent*
+    let has_event_argument = action.as_str(&env.mem).bytes().filter(|&c| c == b':').count() == 2;
     if target != nil {
         let responds: bool = msg![env; target respondsToSelector:action];
         if responds {
-            () = msg![env; target performSelector:action withObject:sender];
+            if has_event_argument {
+                () = msg![env; target performSelector:action withObject:sender withObject:event];
+            } else {
+                () = msg![env; target performSelector:action withObject:sender];
+            }
             return true;
         }
         return false;
@@ -495,7 +500,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     while responder != nil {
         let responds: bool = msg![env; responder respondsToSelector:action];
         if responds {
-            () = msg![env; responder performSelector:action withObject:sender];
+            if has_event_argument {
+                () = msg![env; responder performSelector:action withObject:sender withObject:event];
+            } else {
+                () = msg![env; responder performSelector:action withObject:sender];
+            }
             return true;
         }
         responder = msg![env; responder nextResponder];

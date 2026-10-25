@@ -30,8 +30,8 @@ use crate::frameworks::uikit::ui_graphics::{UIGraphicsPopContext, UIGraphicsPush
 use crate::frameworks::uikit::ui_view::ui_control::ui_button::UIButtonTypeCustom;
 use crate::frameworks::uikit::ui_view::ui_control::{
     UIControlEventTouchCancel, UIControlEventTouchDown, UIControlEventTouchDragExit,
-    UIControlEventTouchUpInside, UIControlEventTouchUpOutside, UIControlEventValueChanged,
-    UIControlStateNormal,
+    UIControlEventTouchDragInside, UIControlEventTouchDragOutside, UIControlEventTouchUpInside,
+    UIControlEventTouchUpOutside, UIControlEventValueChanged, UIControlStateNormal,
 };
 use crate::fs::BundleData;
 use crate::image::Image;
@@ -41,20 +41,27 @@ use crate::options::Options;
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI8, Ordering};
 use std::time::{Duration, Instant};
 
 /// Pending left (-1) or right (+1) arrow key press, 0 if none. Written by the
 /// window event handler and consumed by the picker loop.
 static PENDING_ARROW_KEY: AtomicI8 = AtomicI8::new(0);
+static PENDING_MOUSE_WHEEL: AtomicI32 = AtomicI32::new(0);
 
 /// Records an arrow key press for the app picker to act on.
 pub fn post_arrow_key(dir: i8) {
     PENDING_ARROW_KEY.store(dir, Ordering::Relaxed);
+}
+
+pub fn post_mouse_wheel(delta: i32) {
+    PENDING_MOUSE_WHEEL.fetch_add(delta, Ordering::Relaxed);
 }
 
 struct AppInfo {
@@ -86,7 +93,7 @@ fn remember_last_app_path(path: &Path) {
     }
 }
 
-pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
+pub fn app_picker(options: Options, show_lock_screen: bool) -> Result<(PathBuf, Vec<String>), String> {
     let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
 
     let apps: Result<Vec<AppInfo>, String> = if !apps_dir.is_dir() {
@@ -101,7 +108,7 @@ pub fn app_picker(options: Options) -> Result<(PathBuf, Vec<String>), String> {
         })
     };
 
-    show_app_picker_gui(options, apps)
+    show_app_picker_gui(options, apps, show_lock_screen)
 }
 
 fn enumerate_apps(apps_dir: &Path) -> Result<Vec<AppInfo>, std::io::Error> {
@@ -386,12 +393,10 @@ struct AppPickerDelegateHostObject {
     fullscreen: Option<bool>,
     device_model_tag: Option<i32>,
     device_model_toggle: bool,
-    device_model_scroll_up: bool,
-    device_model_scroll_down: bool,
+    device_model_scroll_to: Option<CGFloat>,
     language_tag: Option<i32>,
     language_toggle: bool,
-    language_scroll_up: bool,
-    language_scroll_down: bool,
+    language_scroll_to: Option<CGFloat>,
     /// Set when a finger goes down on an app icon (`UIControlEventTouchDown`).
     icon_touch_down: id,
     /// Set when a touch that started on an icon stops being a tap.
@@ -736,11 +741,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())deviceModelToggle {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_toggle = true;
 }
-- (())deviceModelScrollUp {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_up = true;
-}
-- (())deviceModelScrollDown {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_down = true;
+- (())deviceModelScroll:(id)sender forEvent:(id)event {
+    if let Some(position) = dropdown_scroll_position(env, sender, event) {
+        env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).device_model_scroll_to = Some(position);
+    }
 }
 - (())language:(id)sender { // UIButton*
     let tag: NSInteger = msg![env; sender tag];
@@ -749,11 +753,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())languageToggle {
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).language_toggle = true;
 }
-- (())languageScrollUp {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).language_scroll_up = true;
-}
-- (())languageScrollDown {
-    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).language_scroll_down = true;
+- (())languageScroll:(id)sender forEvent:(id)event {
+    if let Some(position) = dropdown_scroll_position(env, sender, event) {
+        env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).language_scroll_to = Some(position);
+    }
 }
 - (())iconTouchDown:(id)sender { // UIButton*
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).icon_touch_down = sender;
@@ -792,6 +795,7 @@ const CLASSES: ClassExports = objc_classes! {
 fn show_app_picker_gui(
     mut options: Options,
     apps: Result<Vec<AppInfo>, String>,
+    show_lock_screen: bool,
 ) -> Result<(PathBuf, Vec<String>), String> {
     if std::env::consts::OS == "ios" && options.scale_hack.get() == 1 {
         options.scale_hack = NonZeroU32::new(3).unwrap();
@@ -812,12 +816,13 @@ fn show_app_picker_gui(
         image
     };
     let environment = Environment::new_without_app(options, icon)?;
-    Ok(environment.run_app_picker(|env| app_picker_inner(env, apps)))
+    Ok(environment.run_app_picker(move |env| app_picker_inner(env, apps, show_lock_screen)))
 }
 
 fn app_picker_inner(
     env: &mut Environment,
     mut apps: Result<Vec<AppInfo>, String>,
+    show_lock_screen: bool,
 ) -> (PathBuf, Vec<String>) {
     let mut option_args = Vec::new();
     // Note that objects are generally not released in this code, because they
@@ -1019,7 +1024,7 @@ fn app_picker_inner(
         let label: id = msg![env; label initWithFrame:label_frame];
         let text = ns_string::from_rust_string(
             env,
-            format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
+            format!("{} ({})", crate::DISPLAY_NAME, crate::COMMIT_HASH),
         );
         () = msg![env; label setText:text];
         () = msg![env; label setTextAlignment:UITextAlignmentRight];
@@ -1101,6 +1106,7 @@ fn app_picker_inner(
     let mut current_page: usize = 0;
     // Discard arrow presses made before the picker was shown.
     PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+    PENDING_MOUSE_WHEEL.store(0, Ordering::Relaxed);
     // If the user taps the dock's "Add .ipa" shortcut, this records the .ipa
     // files that existed at that moment; once a new one shows up, the app list
     // is re-enumerated.
@@ -1127,30 +1133,32 @@ fn app_picker_inner(
     chrome_views.extend(page_dots.iter().copied());
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    run_lock_screen(
-        env,
-        main_run_loop,
-        delegate,
-        main_view,
-        app_frame.size,
-        icon_grid_stuff.as_ref(),
-        status_bar,
-        status_time_label,
-        dock,
-        version_label,
-        &page_dots,
-    );
-    if let Some(ref grid) = icon_grid_stuff {
-        play_home_screen_unlock_animation(
+    if show_lock_screen {
+        run_lock_screen(
             env,
             main_run_loop,
             delegate,
-            grid,
+            main_view,
             app_frame.size,
-            wallpaper_view,
-            &chrome_views,
+            icon_grid_stuff.as_ref(),
+            status_bar,
+            status_time_label,
+            dock,
+            version_label,
+            &page_dots,
         );
-        PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+        if let Some(ref grid) = icon_grid_stuff {
+            play_home_screen_unlock_animation(
+                env,
+                main_run_loop,
+                delegate,
+                grid,
+                app_frame.size,
+                wallpaper_view,
+                &chrome_views,
+            );
+            PENDING_ARROW_KEY.store(0, Ordering::Relaxed);
+        }
     }
     // If an app is picked, this loop returns. If the user quits touchHLE, the
     // process exits.
@@ -1502,17 +1510,8 @@ fn app_picker_inner(
                 &device_model_label_for_tag(device_state.selected),
                 &device_state,
             );
-        } else if std::mem::take(&mut host_obj.device_model_scroll_up) {
-            device_state.scroll = (device_state.scroll - 1).max(0);
-            refresh_dropdown(
-                env,
-                &settings.device_dropdown,
-                &device_model_label_for_tag(device_state.selected),
-                &device_state,
-            );
-        } else if std::mem::take(&mut host_obj.device_model_scroll_down) {
-            device_state.scroll = (device_state.scroll + 1)
-                .min(dropdown_max_scroll(settings.device_dropdown.items.len()));
+        } else if let Some(position) = std::mem::take(&mut host_obj.device_model_scroll_to) {
+            device_state.scroll = dropdown_scroll_at(position, settings.device_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.device_dropdown,
@@ -1536,17 +1535,8 @@ fn app_picker_inner(
                 &language_label_for_tag(language_state.selected),
                 &language_state,
             );
-        } else if std::mem::take(&mut host_obj.language_scroll_up) {
-            language_state.scroll = (language_state.scroll - 1).max(0);
-            refresh_dropdown(
-                env,
-                &settings.language_dropdown,
-                &language_label_for_tag(language_state.selected),
-                &language_state,
-            );
-        } else if std::mem::take(&mut host_obj.language_scroll_down) {
-            language_state.scroll = (language_state.scroll + 1)
-                .min(dropdown_max_scroll(settings.language_dropdown.items.len()));
+        } else if let Some(position) = std::mem::take(&mut host_obj.language_scroll_to) {
+            language_state.scroll = dropdown_scroll_at(position, settings.language_dropdown.items.len());
             refresh_dropdown(
                 env,
                 &settings.language_dropdown,
@@ -1606,6 +1596,38 @@ fn app_picker_inner(
             quick_options_gles_native = gles_native || !crate::window::angle_backend_available();
         } else if let Some(fullscreen) = std::mem::take(&mut host_obj.fullscreen) {
             quick_options_fullscreen = fullscreen;
+        }
+
+        let wheel = PENDING_MOUSE_WHEEL.swap(0, Ordering::Relaxed);
+        if wheel != 0 {
+            let language_open = language_state.open;
+            let dropdown = if language_open {
+                Some((&mut language_state, &settings.language_dropdown))
+            } else if device_state.open {
+                Some((&mut device_state, &settings.device_dropdown))
+            } else {
+                None
+            };
+            if let Some((state, dropdown)) = dropdown {
+                state.scroll = (state.scroll - wheel as isize)
+                    .clamp(0, dropdown_max_scroll(dropdown.items.len()));
+                let label = if language_open {
+                    language_label_for_tag(state.selected)
+                } else {
+                    device_model_label_for_tag(state.selected)
+                };
+                refresh_dropdown(env, dropdown, &label, state);
+            } else if !msg![env; (settings.main_view) isHidden] {
+                let scroll = settings.scroll_view;
+                let offset: CGPoint = msg![env; scroll contentOffset];
+                let bounds: CGRect = msg![env; scroll bounds];
+                let content_size: CGSize = msg![env; scroll contentSize];
+                let max_y = (content_size.height - bounds.size.height).max(0.0);
+                let new_y = (offset.y - wheel as CGFloat * 40.0).clamp(0.0, max_y);
+                if new_y != offset.y {
+                    () = msg![env; scroll setContentOffset:(CGPoint { x: offset.x, y: new_y })];
+                }
+            }
         }
 
         picker_settings.scale_hack = quick_options_scale_hack;
@@ -1744,8 +1766,6 @@ fn app_picker_inner(
     // Return the environment so some parts of it can be salvaged.
     (app_path, option_args)
 }
-
-const HYPERHLE_REBORN_NAME: &str = "HyperHLE-Reborn";
 
 /// Old-iOS home screen layout: a fixed 4×4 icon grid above a row of page dots,
 /// and a translucent dock along the bottom edge.
@@ -2172,6 +2192,46 @@ fn update_icon_grid(
 }
 
 
+/// Play a short, original two-part chime when the lock screen is dismissed.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn play_unlock_sound() -> Result<AudioQueue<i16>, String> {
+    let sdl = sdl2::init()?;
+    let audio = sdl.audio()?;
+    let desired = AudioSpecDesired {
+        freq: Some(44_100),
+        channels: Some(1),
+        samples: None,
+    };
+    let queue = audio.open_queue::<i16, _>(None, &desired)?;
+    let rate = queue.spec().freq as f32;
+    let sample_count = (rate * 0.36) as usize;
+    let mut samples = Vec::with_capacity(sample_count);
+    let tau = std::f32::consts::TAU;
+    for index in 0..sample_count {
+        let t = index as f32 / rate;
+        let click = if t < 0.012 {
+            (1.0 - t / 0.012) * (tau * 2400.0 * t).sin()
+        } else {
+            0.0
+        };
+        let tone = |start: f32, frequency: f32| {
+            let elapsed = (t - start).max(0.0);
+            if t < start {
+                0.0
+            } else {
+                (-elapsed * 16.0).exp()
+                    * ((tau * frequency * elapsed).sin()
+                        + 0.28 * (tau * frequency * 2.01 * elapsed).sin())
+            }
+        };
+        let value = 0.11 * click + 0.17 * tone(0.015, 1050.0) + 0.15 * tone(0.105, 790.0);
+        samples.push((value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+    }
+    queue.queue_audio(&samples)?;
+    queue.resume();
+    Ok(queue)
+}
+
 /// Construct and display the iPhone OS 4 lock screen over the picker wallpaper.
 /// A rightward swipe dismisses the lock screen; a pulsing label recreates the
 /// animated “slide to unlock” treatment.
@@ -2413,6 +2473,14 @@ fn run_lock_screen(
         host.swipe_right = false;
         host.swipe_left = false;
     }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let _unlock_sound = match env.on_parent_stack_in_coroutine(|_, _| play_unlock_sound()) {
+        Ok(queue) => Some(queue),
+        Err(error) => {
+            log!("Warning: could not play unlock sound: {error}");
+            None
+        }
+    };
     animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
         let p = ease_in_out_cubic(t) as CGFloat;
         let mut frame: CGRect = msg![env; lock frame];
@@ -3544,8 +3612,7 @@ struct DropdownSpec {
     entries: Vec<(String, NSInteger)>,
     toggle_selector: &'static str,
     item_selector: &'static str,
-    scroll_up_selector: &'static str,
-    scroll_down_selector: &'static str,
+    scroll_selector: &'static str,
 }
 
 /// The state that the picker keeps for one settings dropdown.
@@ -3588,7 +3655,23 @@ fn refresh_dropdown(
 
 /// The largest scroll offset for a list of `item_count` entries.
 fn dropdown_max_scroll(item_count: usize) -> isize {
-    (item_count as isize).saturating_sub(DEVICE_MENU_VISIBLE_ITEMS as isize)
+    (item_count as isize - DEVICE_MENU_VISIBLE_ITEMS as isize).max(0)
+}
+
+fn dropdown_scroll_position(env: &mut Environment, sender: id, event: id) -> Option<CGFloat> {
+    let touches: id = msg![env; event touchesForView:sender];
+    let touch: id = msg![env; touches anyObject];
+    (touch != nil).then(|| {
+        let point: CGPoint = msg![env; touch locationInView:sender];
+        point.y
+    })
+}
+
+fn dropdown_scroll_at(position: CGFloat, item_count: usize) -> isize {
+    let travel = (DEVICE_MENU_VISIBLE_ITEMS as CGFloat) * DEVICE_MENU_ITEM_HEIGHT - 54.0;
+    (((position - 27.0) / travel) * dropdown_max_scroll(item_count) as CGFloat)
+        .round()
+        .clamp(0.0, dropdown_max_scroll(item_count) as CGFloat) as isize
 }
 
 /// Builds the Settings screen: a navigation bar with a "Done" button, and a
@@ -3959,7 +4042,7 @@ fn setup_settings(
     let footer = new_label(
         env,
         rect(0.0, y, width, 18.0),
-        &format!("{HYPERHLE_REBORN_NAME} ({})", crate::COMMIT_HASH),
+        &format!("{} ({})", crate::DISPLAY_NAME, crate::COMMIT_HASH),
         12.0,
         false,
         gray_text,
@@ -4024,8 +4107,7 @@ fn device_model_dropdown_spec() -> DropdownSpec {
         entries: device_model_entries(),
         toggle_selector: "deviceModelToggle",
         item_selector: "deviceModel:",
-        scroll_up_selector: "deviceModelScrollUp",
-        scroll_down_selector: "deviceModelScrollDown",
+        scroll_selector: "deviceModelScroll:forEvent:",
     }
 }
 
@@ -4063,8 +4145,7 @@ fn language_dropdown_spec() -> DropdownSpec {
             .collect(),
         toggle_selector: "languageToggle",
         item_selector: "language:",
-        scroll_up_selector: "languageScrollUp",
-        scroll_down_selector: "languageScrollDown",
+        scroll_selector: "languageScroll:forEvent:",
     }
 }
 
@@ -4159,8 +4240,8 @@ fn update_dropdown_menu(
 /// Builds a settings dropdown: a button in a settings row, whose title shows
 /// the selection, plus a list that is shown as an overlay on the whole Settings
 /// screen, with a dimmer behind it. The list holds one button per entry of
-/// `spec`, a scrollbar track and thumb, and transparent up/down halves that
-/// scroll it. The list starts out hidden, and its titles are set by
+/// `spec`, a scrollbar track and thumb, and a draggable control over them.
+/// The list starts out hidden, and its titles are set by
 /// [refresh_dropdown].
 fn make_settings_dropdown(
     env: &mut Environment,
@@ -4175,8 +4256,7 @@ fn make_settings_dropdown(
         entries,
         toggle_selector,
         item_selector,
-        scroll_up_selector,
-        scroll_down_selector,
+        scroll_selector,
     } = spec;
     let list_width: CGFloat = 256.0;
     let scrollbar_width: CGFloat = 24.0;
@@ -4275,8 +4355,8 @@ fn make_settings_dropdown(
         },
     };
     let track_view: id = msg![env; track_view initWithFrame:track_frame];
-    let black: id = msg_class![env; UIColor blackColor];
-    () = msg![env; track_view setBackgroundColor:black];
+    let track_color = ui_color(env, 0.87, 0.87, 0.89, 1.0);
+    () = msg![env; track_view setBackgroundColor:track_color];
     () = msg![env; menu_view addSubview:track_view];
 
     let thumb_view: id = msg_class![env; UIView alloc];
@@ -4291,47 +4371,19 @@ fn make_settings_dropdown(
         },
     };
     let thumb_view: id = msg![env; thumb_view initWithFrame:thumb_frame];
-    let light_gray: id = msg_class![env; UIColor lightGrayColor];
-    () = msg![env; thumb_view setBackgroundColor:light_gray];
+    let thumb_color = ui_color(env, 0.55, 0.55, 0.58, 1.0);
+    () = msg![env; thumb_view setBackgroundColor:thumb_color];
     () = msg![env; menu_view addSubview:thumb_view];
 
-    // Transparent up/down halves over the scrollbar that scroll the list.
+    // A single control supports clicking the track and dragging the thumb.
     let clear: id = msg_class![env; UIColor clearColor];
-    let up_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    let up_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: 0.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: visible_menu_height / 2.0,
-        },
-    };
-    () = msg![env; up_btn setFrame:up_frame];
-    () = msg![env; up_btn setBackgroundColor:clear];
-    () = msg![env; up_btn addTarget:delegate
-                             action:(env.objc.lookup_selector(scroll_up_selector).unwrap())
-                   forControlEvents:UIControlEventTouchUpInside];
-    () = msg![env; menu_view addSubview:up_btn];
-
-    let down_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
-    let down_frame = CGRect {
-        origin: CGPoint {
-            x: list_width,
-            y: visible_menu_height / 2.0,
-        },
-        size: CGSize {
-            width: scrollbar_width,
-            height: visible_menu_height / 2.0,
-        },
-    };
-    () = msg![env; down_btn setFrame:down_frame];
-    () = msg![env; down_btn setBackgroundColor:clear];
-    () = msg![env; down_btn addTarget:delegate
-                               action:(env.objc.lookup_selector(scroll_down_selector).unwrap())
-                     forControlEvents:UIControlEventTouchUpInside];
-    () = msg![env; menu_view addSubview:down_btn];
+    let scroll_btn: id = msg_class![env; UIButton buttonWithType:UIButtonTypeCustom];
+    () = msg![env; scroll_btn setFrame:track_frame];
+    () = msg![env; scroll_btn setBackgroundColor:clear];
+    () = msg![env; scroll_btn addTarget:delegate
+                               action:(env.objc.lookup_selector(scroll_selector).unwrap())
+                     forControlEvents:(UIControlEventTouchDown | UIControlEventTouchDragInside | UIControlEventTouchDragExit | UIControlEventTouchDragOutside)];
+    () = msg![env; menu_view addSubview:scroll_btn];
 
     SettingsDropdown {
         button,

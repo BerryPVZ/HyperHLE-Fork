@@ -1066,6 +1066,16 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
                 echo!("User requested quit, exiting.");
                 ui_application::exit(env);
             }
+            Event::CloseWindow => {
+                if !env.is_app_picker && cfg!(not(any(target_os = "android", target_os = "ios"))) {
+                    echo!("Game window closed; returning to the app picker.");
+                    env.request_guest_termination(crate::environment::GuestTermination::ReturnToPicker);
+                    break;
+                } else {
+                    echo!("User closed the app picker window, exiting.");
+                    ui_application::exit(env);
+                }
+            }
             Event::TouchesDown(..) | Event::TouchesMove(..) | Event::TouchesUp(..) => {
                 ui_touch::handle_event(env, event)
             }
@@ -1105,6 +1115,9 @@ pub(crate) fn handle_events_with_result(env: &mut Environment) -> (Option<Instan
             }
             Event::ArrowKey(dir) => {
                 crate::environment::app_picker::post_arrow_key(dir);
+            }
+            Event::MouseWheel(delta) => {
+                crate::environment::app_picker::post_mouse_wheel(delta);
             }
             Event::EnterDebugger => {
                 if env.is_debugging_enabled() {
