@@ -390,3 +390,6 @@ com.anarchyent.mcwikipaid: --device-family=iphone-4
 # array to location 0 for a program without one. With `position` at 0 the 3D
 # scene stays black. Use locations 0 to N-1 with `position` last.
 com.foursakenmedia.civilwar: --reverse-attrib-locations
+
+# Illusia: draws in landscape but never declares or requests an orientation.
+com.gamevil.illusia: --landscape-left

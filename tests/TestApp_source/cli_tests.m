@@ -14,6 +14,7 @@
 #include <CoreFoundation/CFRunLoop.h>
 #include <CoreFoundation/CFString.h>
 #include <CoreFoundation/CFURL.h>
+#include <CoreFoundation/CFURLAccess.h>
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -36,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
@@ -768,6 +770,177 @@ int test_runloop_nil_date_polls(void) {
   CFRelease(source);
   [probe release];
   [pool drain];
+  return result;
+}
+
+// CFRunLoopTimerCreate returns a timer that calls its callout with the
+// context's info, first at fireDate, then every interval (never if 0).
+// https://developer.apple.com/documentation/corefoundation/1542501-cfrunlooptimercreate
+// Heavy Gunner and Illusia drive their game loops with such timers.
+static int cf_timer_calls;
+static CFRunLoopTimerRef cf_timer_last_timer;
+static void cf_timer_callout(CFRunLoopTimerRef timer, void *info) {
+  cf_timer_calls += (int)(intptr_t)info;
+  cf_timer_last_timer = timer;
+}
+
+int test_CFRunLoopTimerCreate_callout(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  CFStringRef mode = CFSTR("TestAppCFTimerMode");
+  CFRunLoopTimerContext context = {0};
+  context.info = (void *)(intptr_t)1;
+  CFRunLoopTimerRef timer =
+      CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0, 0, 0,
+                           cf_timer_callout, &context);
+  int result = 0;
+  if (timer == NULL || CFRunLoopTimerDoesRepeat(timer) ||
+      !CFRunLoopTimerIsValid(timer))
+    result = -1;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
+  cf_timer_calls = 0;
+  cf_timer_last_timer = NULL;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && (cf_timer_calls != 1 || cf_timer_last_timer != timer))
+    result = -2;
+  // A one-shot timer is invalidated after it fires.
+  if (result == 0 && CFRunLoopTimerIsValid(timer))
+    result = -3;
+  CFRelease(timer);
+
+  // A repeating timer keeps firing until it is invalidated.
+  context.info = (void *)(intptr_t)10;
+  timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0.02, 0,
+                               0, cf_timer_callout, &context);
+  if (result == 0 && (!CFRunLoopTimerDoesRepeat(timer) ||
+                      fabs(CFRunLoopTimerGetInterval(timer) - 0.02) > 0.001))
+    result = -4;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
+  cf_timer_calls = 0;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && cf_timer_calls < 20)
+    result = -5;
+  CFRunLoopTimerInvalidate(timer);
+  if (result == 0 && CFRunLoopTimerIsValid(timer))
+    result = -6;
+  CFRelease(timer);
+  [pool drain];
+  return result;
+}
+
+// CFRunLoopTimer is toll-free bridged to NSTimer, and
+// CFRunLoopTimerSetNextFireDate reschedules it like -[NSTimer setFireDate:].
+// https://developer.apple.com/documentation/corefoundation/1543570-cfrunlooptimersetnextfiredate
+// PAC-MAN Remix schedules each frame this way on a timer whose interval is
+// effectively infinite.
+int test_CFRunLoopTimerSetNextFireDate_NSTimer(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  CFStringRef mode = CFSTR("TestAppNextFireDateMode");
+  NSTimer *timer = [NSTimer timerWithTimeInterval:1e9
+                                           target:probe
+                                         selector:@selector(signal:)
+                                         userInfo:nil
+                                          repeats:YES];
+  CFRunLoopTimerRef cfTimer = (CFRunLoopTimerRef)timer;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), cfTimer, mode);
+  CFAbsoluteTime fireDate = CFAbsoluteTimeGetCurrent() + 0.01;
+  CFRunLoopTimerSetNextFireDate(cfTimer, fireDate);
+  int result = 0;
+  if (fabs(CFRunLoopTimerGetNextFireDate(cfTimer) - fireDate) > 0.001)
+    result = -1;
+  perform_selector_on_main_thread_calls = 0;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && perform_selector_on_main_thread_calls != 1)
+    result = -2;
+  [timer invalidate];
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+// CFURLCreatePropertyFromResource returns one property of a resource, or
+// NULL with a CFURLError. See CFURLAccess.h and
+// https://developer.apple.com/documentation/corefoundation/1543376-cfurlcreatepropertyfromresource
+// Illusia sizes every resource it loads with kCFURLFileLength.
+int test_CFURLCreatePropertyFromResource(void) {
+  CFBundleRef mainBundle = CFBundleGetMainBundle();
+  CFURLRef url = CFBundleCopyResourceURL(
+      mainBundle, CFSTR("test_1x1_black_pixel"), CFSTR("jpg"), NULL);
+  if (url == NULL)
+    return -1;
+  int result = 0;
+  SInt32 error = 1;
+  CFNumberRef length =
+      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
+  SInt32 size = 0;
+  if (length == NULL || error != 0 ||
+      !CFNumberGetValue(length, kCFNumberSInt32Type, &size) || size != 720)
+    result = -2;
+  if (length != NULL)
+    CFRelease(length);
+  CFBooleanRef exists =
+      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
+  if (result == 0 && (exists == NULL || !CFBooleanGetValue(exists)))
+    result = -3;
+  if (exists != NULL)
+    CFRelease(exists);
+  CFDictionaryRef properties = NULL;
+  if (result == 0 &&
+      (!CFURLCreateDataAndPropertiesFromResource(NULL, url, NULL, &properties,
+                                                 NULL, &error) ||
+       properties == NULL ||
+       !CFNumberGetValue(CFDictionaryGetValue(properties, kCFURLFileLength),
+                         kCFNumberSInt32Type, &size) ||
+       size != 720))
+    result = -4;
+  if (properties != NULL)
+    CFRelease(properties);
+  CFRelease(url);
+
+  url = CFURLCreateWithFileSystemPath(NULL, CFSTR("/no/such/file"),
+                                      kCFURLPOSIXPathStyle, false);
+  error = 0;
+  length = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
+  if (result == 0 && (length != NULL || error != kCFURLResourceNotFoundError))
+    result = -5;
+  exists = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
+  if (result == 0 && (exists == NULL || CFBooleanGetValue(exists)))
+    result = -6;
+  if (exists != NULL)
+    CFRelease(exists);
+  CFRelease(url);
+  return result;
+}
+
+// Every file has its own serial number, and (st_dev, st_ino) identifies it:
+// stat() and fstat() of the same file agree, and different files differ.
+// IL2CPP's FileStream enforces FileShare by that pair, so if every file
+// reported the same inode, Sponge on the Run's log file open failed with a
+// "Sharing violation".
+// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_stat.h.html
+int test_stat_inode_identifies_file(void) {
+  struct stat jpg_stat, jpg_fstat, ttf_fstat;
+  if (stat("test_1x1_black_pixel.jpg", &jpg_stat) != 0)
+    return -1;
+  int jpg = open("test_1x1_black_pixel.jpg", O_RDONLY);
+  int ttf = open("LiberationMono-Regular.ttf", O_RDONLY);
+  if (jpg < 0 || ttf < 0)
+    return -2;
+  int result = 0;
+  if (fstat(jpg, &jpg_fstat) != 0 || fstat(ttf, &ttf_fstat) != 0)
+    result = -3;
+  else if (jpg_stat.st_ino == 0 || jpg_stat.st_ino != jpg_fstat.st_ino ||
+           jpg_stat.st_dev != jpg_fstat.st_dev)
+    result = -4;
+  else if (jpg_fstat.st_dev == ttf_fstat.st_dev &&
+           jpg_fstat.st_ino == ttf_fstat.st_ino)
+    result = -5;
+  close(jpg);
+  close(ttf);
   return result;
 }
 
@@ -7649,6 +7822,10 @@ struct {
     FUNC_DEF(test_runloop_timer_waits_until_deadline),
     FUNC_DEF(test_runloop_nil_date_polls),
     FUNC_DEF(test_runloop_common_is_not_a_run_mode),
+    FUNC_DEF(test_CFRunLoopTimerCreate_callout),
+    FUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
+    FUNC_DEF(test_CFURLCreatePropertyFromResource),
+    FUNC_DEF(test_stat_inode_identifies_file),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_UIApplication_tracking_is_common_mode),
     FUNC_DEF(test_NSHashTable_copy_is_independent),

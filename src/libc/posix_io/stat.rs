@@ -7,7 +7,7 @@
 
 use super::{off_t, FileDescriptor, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::fs::{FsError, GuestFile, GuestPath};
+use crate::fs::{resolve_path, FsError, GuestFile, GuestPath};
 use crate::libc::errno::{set_errno, EACCES, EBADF, EEXIST, ENOENT};
 use crate::libc::time::timespec;
 use crate::mem::{ConstPtr, MutPtr, SafeRead};
@@ -155,6 +155,29 @@ fn mkdir(env: &mut Environment, path: ConstPtr<u8>, mode: mode_t) -> i32 {
     }
 }
 
+/// `st_dev` reported for every guest file: they all live on one file system.
+const GUEST_DEVICE: dev_t = 1;
+
+/// File serial number (`st_ino`) for a guest path, relative to the current
+/// directory. On iOS every file has its own stable inode, and `(st_dev,
+/// st_ino)` identifies a file. IL2CPP's FileStream keeps its open files keyed
+/// on that pair to enforce FileShare, so reporting 0 for every file turned the
+/// second concurrent open of any file into a "Sharing violation" IOException
+/// (The SpongeBob Movie Game: Sponge on the Run, opening its log file).
+/// touchHLE has no real inodes, so derive one from the absolute path.
+fn inode_for_path(env: &Environment, path: &str) -> ino_t {
+    let components = resolve_path(GuestPath::new(path), Some(env.fs.working_directory()));
+    // 64-bit FNV-1a
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for component in components {
+        for &byte in b"/".iter().chain(component.as_bytes()) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    hash.max(1)
+}
+
 /// Helper for [stat()] and [fstat()] that fills the data in the stat struct
 fn fstat_inner(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> i32 {
     // Apple `man 2 fstat`: the standard streams (stdin/stdout/stderr) are
@@ -184,6 +207,14 @@ fn fstat_inner(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> 
     // struct with many kinds of data in it. This code is assuming the caller
     // only wants a small part of it.
     let mut stat = stat::default();
+
+    let inode_path = match file.file {
+        GuestFile::File(_)
+        | GuestFile::IpaBundleFile(_)
+        | GuestFile::ResourceFile(_)
+        | GuestFile::Directory => file.path.clone(),
+        _ => None,
+    };
 
     match file.file {
         GuestFile::File(_) | GuestFile::IpaBundleFile(_) | GuestFile::ResourceFile(_) => {
@@ -221,6 +252,11 @@ fn fstat_inner(env: &mut Environment, fd: FileDescriptor, buf: MutPtr<stat>) -> 
                 fd
             );
         }
+    }
+
+    if let Some(path) = inode_path {
+        stat.st_dev = GUEST_DEVICE;
+        stat.st_ino = inode_for_path(env, &path);
     }
 
     env.mem.write(buf, stat);
@@ -263,6 +299,8 @@ pub(crate) fn stat(env: &mut Environment, path: ConstPtr<u8>, buf: MutPtr<stat>)
     let guest_path = GuestPath::new(&resolved_path);
 
     let mut st = stat::default();
+    st.st_dev = GUEST_DEVICE;
+    st.st_ino = inode_for_path(env, &resolved_path);
 
     if env.fs.is_dir(guest_path) {
         st.st_mode = S_IFDIR | 0o755;

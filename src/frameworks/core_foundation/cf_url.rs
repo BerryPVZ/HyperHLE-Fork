@@ -19,8 +19,9 @@ use crate::frameworks::core_foundation::cf_string::{
 use crate::frameworks::foundation::ns_string::{
     from_rust_string, get_static_str, to_rust_string, NSUTF8StringEncoding,
 };
-use crate::frameworks::foundation::ns_property_list_serialization;
 use crate::frameworks::foundation::NSUInteger;
+use crate::frameworks::foundation::{ns_array, ns_property_list_serialization, ns_url};
+use crate::fs::{GuestPath, GuestPathBuf};
 use crate::mem::{ConstPtr, GuestUSize, MutPtr};
 use crate::objc::{id, msg, msg_class, nil, release, retain};
 use crate::Environment;
@@ -1148,9 +1149,157 @@ fn CFURLGetTypeID(_env: &mut Environment) -> u32 {
 
 // MARK: - Resource access (CFURLAccess.h)
 
+// CFURLError values from CFURLAccess.h.
+const kCFURLUnknownError: SInt32 = -10;
+const kCFURLResourceNotFoundError: SInt32 = -12;
+const kCFURLUnknownPropertyKeyError: SInt32 = -16;
+
+// Property names from CFURLAccess.h. Apple's CFURLAccess.c defines each one
+// as a CFString whose contents equal the constant's name.
+const FILE_EXISTS: &str = "kCFURLFileExists";
+const FILE_DIRECTORY_CONTENTS: &str = "kCFURLFileDirectoryContents";
+const FILE_LENGTH: &str = "kCFURLFileLength";
+const FILE_LAST_MODIFICATION_TIME: &str = "kCFURLFileLastModificationTime";
+const FILE_POSIX_MODE: &str = "kCFURLFilePOSIXMode";
+const FILE_PROPERTIES: [&str; 5] = [
+    FILE_EXISTS,
+    FILE_DIRECTORY_CONTENTS,
+    FILE_LENGTH,
+    FILE_LAST_MODIFICATION_TIME,
+    FILE_POSIX_MODE,
+];
+
+fn write_error_code(env: &mut Environment, error_code: MutPtr<SInt32>, code: SInt32) {
+    if !error_code.is_null() {
+        env.mem.write(error_code, code);
+    }
+}
+
+/// Guest file system path of a `file:` URL, or [None] for other schemes.
+fn resource_path(env: &mut Environment, url: CFURLRef) -> Option<GuestPathBuf> {
+    if url.is_null() {
+        return None;
+    }
+    let is_file_url: bool = msg![env; url isFileURL];
+    if !is_file_url {
+        return None;
+    }
+    Some(ns_url::to_rust_path(env, url).into_owned())
+}
+
+/// Creates the value of a file property (one of [FILE_PROPERTIES]) for the
+/// file at `path`, following the CFFileURL property types documented in
+/// CFURLAccess.h. The returned object is owned by the caller. Returns [nil]
+/// if the property doesn't apply, e.g. the file doesn't exist.
+fn create_file_property(env: &mut Environment, path: &GuestPath, property: &str) -> id {
+    let exists = env.fs.exists(path);
+    if property == FILE_EXISTS {
+        let value: id = msg_class![env; NSNumber numberWithBool:exists];
+        return retain(env, value);
+    }
+    if !exists {
+        return nil;
+    }
+    match property {
+        FILE_LENGTH => {
+            let Ok(size) = env.fs.size(path) else {
+                return nil;
+            };
+            let value: id = msg_class![env; NSNumber numberWithLongLong:(size as i64)];
+            retain(env, value)
+        }
+        FILE_LAST_MODIFICATION_TIME => {
+            let Ok(secs) = env.fs.modified(path) else {
+                return nil;
+            };
+            let value: id = msg_class![env; NSDate dateWithTimeIntervalSince1970:(secs as f64)];
+            retain(env, value)
+        }
+        FILE_POSIX_MODE => {
+            let (_, readable, writable, executable) = env.fs.access(path);
+            let mut mode: i32 = if env.fs.is_dir(path) {
+                0o040000
+            } else {
+                0o100000
+            };
+            if readable {
+                mode |= 0o444;
+            }
+            if writable {
+                mode |= 0o200;
+            }
+            if executable {
+                mode |= 0o111;
+            }
+            let value: id = msg_class![env; NSNumber numberWithInt:mode];
+            retain(env, value)
+        }
+        FILE_DIRECTORY_CONTENTS => {
+            let Ok(names) = env.fs.enumerate(path) else {
+                return nil;
+            };
+            let children: Vec<GuestPathBuf> = names.map(|name| path.join(name)).collect();
+            let urls = children
+                .into_iter()
+                .map(|child| {
+                    let child_str = from_rust_string(env, child.as_str().to_string());
+                    let url: id = msg_class![env; NSURL fileURLWithPath:child_str];
+                    release(env, child_str);
+                    retain(env, url)
+                })
+                .collect();
+            ns_array::from_vec(env, urls)
+        }
+        _ => nil,
+    }
+}
+
+/// `CFTypeRef CFURLCreatePropertyFromResource(CFAllocatorRef alloc,
+///     CFURLRef url, CFStringRef property, SInt32 *errorCode)`
+///
+/// Legacy CFURLAccess API that returns one property of the resource at `url`,
+/// or NULL on failure. See CFURLAccess.h in the iOS SDK and Apple's
+/// documentation:
+/// https://developer.apple.com/documentation/corefoundation/1543376-cfurlcreatepropertyfromresource
+///
+/// Gamevil's MC_knl runtime (Illusia) sizes every resource it loads with
+/// `kCFURLFileLength`.
+fn CFURLCreatePropertyFromResource(
+    env: &mut Environment,
+    _allocator: CFAllocatorRef,
+    url: CFURLRef,
+    property: CFStringRef,
+    error_code: MutPtr<SInt32>,
+) -> super::CFTypeRef {
+    let Some(path) = resource_path(env, url) else {
+        write_error_code(env, error_code, kCFURLUnknownError);
+        return nil;
+    };
+    if property == nil {
+        write_error_code(env, error_code, kCFURLUnknownPropertyKeyError);
+        return nil;
+    }
+    let property = to_rust_string(env, property).into_owned();
+    let Some(property) = FILE_PROPERTIES.into_iter().find(|&p| p == property) else {
+        log!(
+            "CFURLCreatePropertyFromResource: unsupported property {:?}",
+            property
+        );
+        write_error_code(env, error_code, kCFURLUnknownPropertyKeyError);
+        return nil;
+    };
+    let value = create_file_property(env, &path, property);
+    if value == nil {
+        write_error_code(env, error_code, kCFURLResourceNotFoundError);
+    } else {
+        write_error_code(env, error_code, 0);
+    }
+    value
+}
+
 /// `Boolean CFURLCreateDataAndPropertiesFromResource(CFAllocatorRef alloc,
 ///     CFURLRef url, CFDataRef *data, CFDictionaryRef *properties,
-///     CFTypeRef desiredProperties, SInt32 *errorCode)`
+///     CFArrayRef desiredProperties, SInt32 *errorCode)`
 ///
 /// Legacy CFURLAccess API: loads a resource's bytes and/or a dictionary of
 /// its properties. Chrome uses it (via its plist/XML glue) to read local
@@ -1158,97 +1307,77 @@ fn CFURLGetTypeID(_env: &mut Environment) -> u32 {
 ///
 /// - `data` (optional) receives the resource contents as a CFData.
 /// - `properties` (optional) receives a dictionary with the properties named
-///   in `desiredProperties` (or all known ones when it is NULL): we support
-///   `kCFURLFileLength` (kCFURLFileLengthKey → kCFURLFileLength), the one
-///   property Chrome actually consults.
-/// - `errorCode` (optional) receives `kCFURLSuccess` (0) or `kCFURLUnknownError` (-10).
+///   in `desiredProperties`, or all known ones when it is NULL.
+/// - `errorCode` (optional) receives `kCFURLSuccess` (0) or a CFURLError.
 #[allow(clippy::too_many_arguments)]
 fn CFURLCreateDataAndPropertiesFromResource(
     env: &mut Environment,
-    _allocator: crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef,
+    _allocator: CFAllocatorRef,
     url: CFURLRef,
     data: MutPtr<cf_data::CFDataRef>,
     properties: MutPtr<id>,
-    _desired_properties: super::CFTypeRef,
+    desired_properties: super::CFTypeRef,
     error_code: MutPtr<SInt32>,
 ) -> bool {
-    const K_CF_URL_SUCCESS: SInt32 = 0;
-    const K_CF_URL_UNKNOWN_ERROR: SInt32 = -10;
-
-    if url.is_null() {
-        if !error_code.is_null() {
-            env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
-        }
-        return false;
-    }
-
-    // Get the file-system path for the URL.
-    const PATH_MAX: GuestUSize = 4096;
-    let path_buf: MutPtr<u8> = env.mem.alloc(PATH_MAX).cast();
-    let ok: bool = msg![env; url getFileSystemRepresentation:path_buf maxLength:PATH_MAX];
-    let path = if ok {
-        let cstr = env.mem.cstr_at_utf8(path_buf);
-        cstr.ok().map(|s| s.to_owned())
-    } else {
-        None
-    };
-    env.mem.free(path_buf.cast());
-
-    let Some(path) = path else {
-        if !error_code.is_null() {
-            env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
-        }
+    let Some(path) = resource_path(env, url) else {
+        write_error_code(env, error_code, kCFURLUnknownError);
         return false;
     };
-
-    let file_len = std::fs::metadata(&path).map(|m| m.len()).ok();
 
     if !data.is_null() {
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let length: CFIndex = bytes.len() as CFIndex;
-                let bytes_ptr = env.mem.alloc(bytes.len().max(1) as GuestUSize);
-                env.mem
-                    .bytes_at_mut(bytes_ptr.cast(), bytes.len() as GuestUSize)
-                    .copy_from_slice(&bytes);
-                let cf_data =
-                    cf_data::CFDataCreate(
-                        env,
-                        super::cf_allocator::kCFAllocatorDefault,
-                        bytes_ptr.cast::<u8>().cast_const(),
-                        length,
-                    );
-                env.mem.write(data, cf_data);
-            }
-            Err(err) => {
-                log_dbg!("CFURLCreateDataAndPropertiesFromResource: couldn't read {:?}: {}", path, err);
-                if !error_code.is_null() {
-                    env.mem.write(error_code, K_CF_URL_UNKNOWN_ERROR);
-                }
-                return false;
-            }
-        }
+        let Ok(bytes) = env.fs.read(&path) else {
+            log_dbg!(
+                "CFURLCreateDataAndPropertiesFromResource: couldn't read {:?}",
+                path
+            );
+            write_error_code(env, error_code, kCFURLResourceNotFoundError);
+            return false;
+        };
+        let length: CFIndex = bytes.len() as CFIndex;
+        let bytes_ptr = env.mem.alloc(bytes.len().max(1) as GuestUSize);
+        env.mem
+            .bytes_at_mut(bytes_ptr.cast(), bytes.len() as GuestUSize)
+            .copy_from_slice(&bytes);
+        let cf_data = cf_data::CFDataCreate(
+            env,
+            kCFAllocatorDefault,
+            bytes_ptr.cast::<u8>().cast_const(),
+            length,
+        );
+        env.mem.free(bytes_ptr);
+        env.mem.write(data, cf_data);
     }
 
     if !properties.is_null() {
-        let mut dict: id = msg_class![env; NSMutableDictionary dictionary];
-        if let Some(len) = file_len {
-            let key = get_static_str(env, "NSURLFileSize");
-            let len_i64 = len as i64;
-            let number: id = msg_class![env; NSNumber alloc];
-            let number: id = msg![env; number initWithLongLong:len_i64];
-            let _prev: () = msg![env; dict setObject:number forKey:key];
-            let _ = dict;
+        let wanted: Vec<&'static str> = if desired_properties == nil {
+            FILE_PROPERTIES.to_vec()
+        } else {
+            let count: NSUInteger = msg![env; desired_properties count];
+            let mut wanted = Vec::new();
+            for i in 0..count {
+                let name: id = msg![env; desired_properties objectAtIndex:i];
+                let name = to_rust_string(env, name);
+                if let Some(p) = FILE_PROPERTIES.into_iter().find(|&p| p == name) {
+                    wanted.push(p);
+                }
+            }
+            wanted
+        };
+        let dict: id = msg_class![env; NSMutableDictionary new];
+        for property in wanted {
+            let value = create_file_property(env, &path, property);
+            if value != nil {
+                let key = get_static_str(env, property);
+                let _: () = msg![env; dict setObject:value forKey:key];
+                release(env, value);
+            }
         }
         env.mem.write(properties, dict);
     }
 
-    if !error_code.is_null() {
-        env.mem.write(error_code, K_CF_URL_SUCCESS);
-    }
+    write_error_code(env, error_code, 0);
     true
 }
-
 
 // MARK: - CFPropertyList (CFPropertyList.h subset)
 
@@ -1286,6 +1415,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CFURLRetain(_)),
     export_c_func!(CFURLRelease(_)),
     // Resource access (CFURLAccess.h, deprecated by Apple but used by apps)
+    export_c_func!(CFURLCreatePropertyFromResource(_, _, _, _)),
     export_c_func!(CFURLCreateDataAndPropertiesFromResource(_, _, _, _, _, _)),
     export_c_func!(CFPropertyListCreateFromXMLData(_, _, _, _)),
     // File System Representation
@@ -1352,7 +1482,21 @@ pub const FUNCTIONS: FunctionExports = &[
 // that link with `-framework CoreFoundation` and reference (but don't call)
 // the keys can load.
 pub const CONSTANTS: ConstantExports = &[
-    ("_kCFURLFileLength", HostConstant::NSString("NSURLFileSize")),
+    // CFURLAccess.h property names (see FILE_PROPERTIES).
+    ("_kCFURLFileExists", HostConstant::NSString(FILE_EXISTS)),
+    (
+        "_kCFURLFileDirectoryContents",
+        HostConstant::NSString(FILE_DIRECTORY_CONTENTS),
+    ),
+    ("_kCFURLFileLength", HostConstant::NSString(FILE_LENGTH)),
+    (
+        "_kCFURLFileLastModificationTime",
+        HostConstant::NSString(FILE_LAST_MODIFICATION_TIME),
+    ),
+    (
+        "_kCFURLFilePOSIXMode",
+        HostConstant::NSString(FILE_POSIX_MODE),
+    ),
     ("_kCFURLFileSize", HostConstant::NSString("NSURLFileSize")),
     (
         "_kCFURLFileSizeKey",

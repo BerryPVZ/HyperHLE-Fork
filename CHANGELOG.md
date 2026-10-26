@@ -23,6 +23,11 @@ Quality and performance:
 
 Compatibility:
 
+- PAC-MAN Remix gets past the Namco logo. `CFRunLoopTimerSetNextFireDate`, `CFRunLoopTimerGetNextFireDate`, `CFRunLoopTimerGetInterval`, `CFRunLoopTimerDoesRepeat`, `CFRunLoopTimerIsValid` and `CFRunLoopTimerInvalidate` were stubs; they now act on the toll-free bridged `NSTimer`, which the game reschedules each frame.
+- Heavy Gunner HD gets past the Com2us logo. `CFRunLoopTimerCreate` returned a plain object (and read its callout and context arguments swapped) that never fired; it now returns an `NSTimer` that calls the callout at the requested fire date. `CFRunLoopRemoveTimer` now removes the timer.
+- Illusia gets past its loading screen instead of turning white. `CFURLCreatePropertyFromResource` is implemented (the game sizes each resource with `kCFURLFileLength`), `CFURLCreateDataAndPropertiesFromResource` reads from the guest file system, and the `kCFURLFile*` property names have Apple's values. Illusia also starts in landscape now.
+- The SpongeBob Movie Game: Sponge on the Run gets past its logo to the main menu. `stat` and `fstat` reported inode 0 for every file, so IL2CPP's `FileStream` treated any two open files as the same file and threw a "Sharing violation" IOException. Each guest file now has its own stable inode.
+
 - Native GLES 2.0 now enables `GL_OES_texture_3D` for shaders that use `sampler3D` when the host advertises the extension. This fixes Unity's built-in dither-mask shader failing to compile on Mesa and compatible drivers.
 
 - Fruit Ninja 1.8.0 no longer crashes when its menu music loops, and no longer draws its game into a portrait strip of the landscape screen. An `AudioQueue` AAC buffer holding a single ADTS frame couldn't be decoded, and the empty stand-in was queued in the wrong OpenAL format, which panicked. AAC queues now decode frame by frame with a decoder that persists across buffers, and a buffer that still can't be decoded is queued as silence in the source's format. Views now follow their autoresizing masks when their superview is resized, as on iOS, so the game's EAGLView fills its autorotated root view.

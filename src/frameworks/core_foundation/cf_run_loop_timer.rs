@@ -9,14 +9,13 @@
 
 use crate::abi::CallFromHost;
 use crate::abi::GuestFunction;
-use crate::dyld::FunctionExports;
+use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
-use crate::frameworks::core_foundation::cf_run_loop::{CFRunLoopMode, CFRunLoopRef};
 use crate::frameworks::core_foundation::time::{CFAbsoluteTime, CFTimeInterval};
 use crate::frameworks::core_foundation::CFIndex;
-use crate::mem::{MutPtr, MutVoidPtr, SafeRead};
+use crate::mem::{ConstVoidPtr, MutPtr, MutVoidPtr, SafeRead};
 use crate::objc::{
-    id, msg, msg_class, nil, objc_classes, Class, ClassExports, HostObject, NSZonePtr,
+    id, msg, msg_class, nil, objc_classes, release, retain, ClassExports, HostObject, NSZonePtr,
 };
 use crate::Environment;
 
@@ -36,33 +35,37 @@ pub struct CFRunLoopTimerContext {
 }
 unsafe impl SafeRead for CFRunLoopTimerContext {}
 
+/// `CFRunLoopTimerRef CFRunLoopTimerCreate(CFAllocatorRef allocator,
+///     CFAbsoluteTime fireDate, CFTimeInterval interval, CFOptionFlags flags,
+///     CFIndex order, CFRunLoopTimerCallBack callout,
+///     CFRunLoopTimerContext *context)`
+///
+/// Creates an `NSTimer` (the toll-free bridged type) that calls `callout`
+/// with `(timer, context->info)` when it fires. It first fires at `fireDate`
+/// and then every `interval` seconds, or only once if `interval` is 0. As a
+/// Create function it returns a +1 reference. See CFRunLoop.h and
+/// https://developer.apple.com/documentation/corefoundation/1542501-cfrunlooptimercreate
 fn CFRunLoopTimerCreate(
     env: &mut Environment,
     allocator: CFAllocatorRef,
-    _fire_date: CFAbsoluteTime, // TODO
+    fire_date: CFAbsoluteTime,
     interval: CFTimeInterval,
-    flags: CFOptionFlags,
-    order: CFIndex,
+    _flags: CFOptionFlags,
+    _order: CFIndex,
     callout: CFRunLoopTimerCallBack,
     context_ptr: MutPtr<CFRunLoopTimerContext>,
 ) -> CFRunLoopTimerRef {
+    // Apple's documentation says flags and order are currently ignored.
     assert!(allocator == kCFAllocatorDefault || env.mem.read(allocator).is_system_default()); // unimplemented
-    assert_eq!(flags, 0);
-    assert_eq!(order, 0);
 
     let info: MutVoidPtr = if !context_ptr.is_null() {
         let context = env.mem.read(context_ptr);
-        let version = context.version;
-        assert_eq!(version, 0);
-
-        // TODO: handle non-NULL callbacks
-        let retain_callback = context.release_callback;
-        assert!(retain_callback.to_ptr().is_null());
-        let release_callback = context.release_callback;
-        assert!(release_callback.to_ptr().is_null());
-        let copy_desc_callback = context.copy_desc_callback;
-        assert!(copy_desc_callback.to_ptr().is_null());
-
+        // CF retains the info pointer for the timer's lifetime. Timers are
+        // rarely destroyed, so we never call the release callback.
+        let retain_callback = context.retain_callback;
+        if !retain_callback.to_ptr().is_null() {
+            let _: ConstVoidPtr = retain_callback.call_from_host(env, (context.info.cast_const(),));
+        }
         context.info
     } else {
         MutVoidPtr::null()
@@ -74,36 +77,21 @@ fn CFRunLoopTimerCreate(
     let selector = env.objc.lookup_selector("timerFireMethod:").unwrap();
 
     let repeats = interval > 0.0;
-    msg_class![env; NSTimer timerWithTimeInterval:interval
-                                           target:target
-                                         selector:selector
-                                         userInfo:nil
-                                          repeats:repeats]
+    let timer: id = msg_class![env; NSTimer timerWithTimeInterval:interval
+                                                       target:target
+                                                     selector:selector
+                                                     userInfo:nil
+                                                      repeats:repeats];
+    // The timer retains its target.
+    release(env, target);
+
+    let date: id = msg_class![env; NSDate dateWithTimeIntervalSinceReferenceDate:fire_date];
+    let _: () = msg![env; timer setFireDate:date];
+
+    retain(env, timer)
 }
 
-fn CFRunLoopAddTimer(
-    env: &mut Environment,
-    run_loop: CFRunLoopRef,
-    timer: CFRunLoopTimerRef,
-    mode: CFRunLoopMode,
-) {
-    let run_loop_class: Class = msg![env; run_loop class];
-    assert_eq!(
-        run_loop_class,
-        env.objc.get_known_class("NSRunLoop", &mut env.mem)
-    );
-
-    () = msg![env; run_loop addTimer:timer forMode:mode];
-}
-
-fn CFRunLoopTimerInvalidate(env: &mut Environment, timer: CFRunLoopTimerRef) {
-    () = msg![env; timer invalidate];
-}
-
-pub const FUNCTIONS: FunctionExports = &[
-    // CFRunLoopTimerCreate, CFRunLoopAddTimer and CFRunLoopTimerInvalidate
-    // are exported from cf_run_loop; not duplicated here.
-];
+pub const FUNCTIONS: FunctionExports = &[export_c_func!(CFRunLoopTimerCreate(_, _, _, _, _, _, _))];
 
 /// Belongs to _touchHLE_CFTimerTarget
 #[derive(Default)]
