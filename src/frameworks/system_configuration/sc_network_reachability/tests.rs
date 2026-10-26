@@ -120,3 +120,48 @@ fn reachable_route_is_wifi_without_connection_or_intervention_requirements() {
         );
     }
 }
+
+// SCNetworkReachabilityScheduleWithRunLoop only queues the callout; the run
+// loop delivers it later. Calling it inline recursed in Where's My Perry,
+// whose callout schedules another target.
+// https://developer.apple.com/documentation/systemconfiguration/scnetworkreachabilityschedulewithrunloop(_:_:_:)
+#[test]
+fn scheduling_queues_one_initial_notification_for_the_run_loop() {
+    let callback = GuestFunction::from_addr_with_thumb_bit(0x1001);
+    let mut host = SCNetworkReachabilityHostObject::default();
+    host.replace_callback(
+        Some(callback),
+        Some(SCNetworkReachabilityContext {
+            info: MutVoidPtr::from_bits(0x30000),
+            ..Default::default()
+        }),
+    );
+    assert!(host.schedule());
+    // Scheduling again (another mode) before delivery adds no second callout.
+    assert!(!host.schedule());
+    assert_eq!(host.active_callbacks, 0);
+    let (delivered, info) = host.begin_scheduled_callback().unwrap();
+    assert_eq!(delivered.addr_with_thumb_bit(), 0x1001);
+    assert_eq!(info.to_bits(), 0x30000);
+    // A callout that schedules again queues a new notification instead of
+    // recursing.
+    assert!(host.schedule());
+    assert!(host.finish_callback().is_empty());
+    assert_eq!(host.active_callbacks, 0);
+}
+
+#[test]
+fn queued_notification_is_dropped_after_unschedule_or_unregister() {
+    let callback = Some(GuestFunction::from_addr_with_thumb_bit(0x1001));
+    let mut host = SCNetworkReachabilityHostObject::default();
+    host.replace_callback(callback, None);
+    assert!(host.schedule());
+    host.scheduled = false;
+    assert!(host.begin_scheduled_callback().is_none());
+    assert!(!host.notification_pending);
+
+    assert!(host.schedule());
+    host.replace_callback(None, None);
+    assert!(host.begin_scheduled_callback().is_none());
+    assert_eq!(host.active_callbacks, 0);
+}

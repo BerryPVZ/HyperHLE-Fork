@@ -357,6 +357,11 @@ com.wb.GreenLantern: --landscape-left --prefer-gles2-context
 # asset XML root reads as null and the game renders empty.
 com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 
+# Where's My Perry?: same Walaber engine as Where's My Water, so it also reads
+# xmlNode fields directly. Without the mirror every asset XML root reads as
+# null and SkeletonActor::init asserts on the first level load.
+com.disney.PerryGame: --xml-dom-mirror
+
 # Regular Show: Best Park in the Universe: reads globals.xml by walking xmlNode
 # struct fields directly, so it needs the libxml2 guest DOM mirror. Without it
 # the "fps" setting reads as 0, the frame interval becomes infinite and the
