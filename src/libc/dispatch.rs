@@ -140,7 +140,7 @@ pub struct State {
     queue_specifics: HashMap<(u32, u32), u32>,
     /// Per guest thread, the stack of queue handles currently executing a
     /// block, so that `dispatch_get_specific` can resolve against the running
-    /// queue. The main queue is assumed when the stack is empty.
+    /// queue. When the stack is empty, see [current_queue].
     current_queue_stacks: HashMap<ThreadId, Vec<u32>>,
     /// Active dispatch sources keyed by their opaque guest handles.
     pub(super) sources: HashMap<u32, dispatch_source::DispatchSource>,
@@ -178,13 +178,28 @@ pub(super) fn pop_current_queue(env: &mut Environment) {
     }
 }
 
+/// The queue running the caller. Outside of a submitted block, Apple's
+/// `dispatch_get_current_queue` "returns the main queue if the call is
+/// executed from the main thread. If the call is made from any other thread,
+/// this function returns the default concurrent queue."
+/// <https://developer.apple.com/documentation/dispatch/dispatch_get_current_queue()>
+/// <https://opensource.apple.com/source/libdispatch/libdispatch-84.5/man/dispatch_queue_create.3.auto.html>
+///
+/// Cut the Rope loads textures on an `NSThread` and only makes GL calls when
+/// `dispatch_get_current_queue() == &_dispatch_main_q`, so answering "main
+/// queue" there made it call GL on a thread with no EAGLContext.
 fn current_queue(env: &mut Environment) -> u32 {
     let thread = env.current_thread;
+    let fallback = if thread == 0 {
+        MAIN_QUEUE_PTR
+    } else {
+        GLOBAL_QUEUE_PTR
+    };
     get_state(env)
         .current_queue_stacks
         .get(&thread)
         .and_then(|stack| stack.last().copied())
-        .unwrap_or(MAIN_QUEUE_PTR)
+        .unwrap_or(fallback)
 }
 
 // MARK: - dispatch_once
@@ -1022,8 +1037,9 @@ fn dispatch_queue_get_specific(
 /// Returns the value associated with `key` on the queue currently executing
 /// the caller. We track the running queue via `current_queue_stacks`
 /// (pushed/popped around `dispatch_sync`/`dispatch_async` block execution);
-/// when nothing is running we resolve against the main queue, matching the
-/// behaviour callers rely on for "am I on queue X?" re-entrancy checks.
+/// when nothing is running we resolve against the main queue on the main
+/// thread (and the default global queue elsewhere, see [current_queue]),
+/// matching the behaviour callers rely on for "am I on queue X?" checks.
 /// <https://developer.apple.com/documentation/dispatch/1453099-dispatch_get_specific>
 fn dispatch_get_specific(env: &mut Environment, key: ConstVoidPtr) -> MutVoidPtr {
     let current = current_queue(env);
