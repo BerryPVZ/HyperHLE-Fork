@@ -186,6 +186,7 @@ pub struct State {
     time: time::State,
     errno: errno::State,
     clocale: clocale::State,
+    ctype: ctype::State,
     mach_o: mach_o::State,
     mach_vm: mach::vm_map::State,
     mach_ports: mach::mach_port::State,

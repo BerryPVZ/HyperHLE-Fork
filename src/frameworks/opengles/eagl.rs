@@ -30,7 +30,7 @@ use crate::Environment;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone)]
@@ -349,6 +349,8 @@ impl GLShadowState {
 #[derive(Default)]
 pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
+    /// Guest object addresses can be reused when a game session restarts.
+    present_token: usize,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -368,6 +370,8 @@ pub(super) struct EAGLContextHostObject {
     pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
 }
 impl HostObject for EAGLContextHostObject {}
+
+static NEXT_PRESENT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -410,6 +414,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)alloc {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
+        present_token: NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed),
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -1224,7 +1229,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                 mark_presented_directly(env, fullscreen_layer);
             }
             unsafe {
-                present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
+                let context_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
+                present_renderbuffer(env, renderbuffer, drawable, options, context_token);
             }
         }
     } else {
@@ -2181,6 +2187,19 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn presenter_cache_is_invalidated_across_recreated_contexts() {
+    let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(first, second);
+
+    invalidate_present_cache_for_context(first);
+    PRESENT_ES1_TEXTURE.with(|cell| cell.set(Some((42, 1024, 768))));
+    invalidate_present_cache_for_context(second);
+    PRESENT_ES1_TEXTURE.with(|cell| assert_eq!(cell.get(), None));
 }
 
 /// Drain the GL error queue. Returns whether there was anything in it.

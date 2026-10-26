@@ -86,11 +86,11 @@ fn toupper(env: &mut Environment, c: i32) -> i32 {
     __toupper(env, c)
 }
 
-/// Guest address of the lazily-built `__DefaultRuneLocale` table, so it is
-/// only built (and allocated) once per process instead of on every
-/// `__maskrune()` call or constant lookup.
-static DEFAULT_RUNE_LOCALE_ADDR: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+/// The guest address belongs to one Environment and must not outlive it.
+#[derive(Default)]
+pub struct State {
+    default_rune_locale_addr: Option<ConstVoidPtr>,
+}
 
 #[allow(non_camel_case_types)]
 type darwin_rune_t = wchar_t;
@@ -163,11 +163,8 @@ struct RuneLocale {
 unsafe impl SafeRead for RuneLocale {}
 
 fn get_default_rune_locale(env: &mut Environment) -> ConstVoidPtr {
-    use std::sync::atomic::Ordering;
-
-    let cached = DEFAULT_RUNE_LOCALE_ADDR.load(Ordering::Relaxed);
-    if cached != 0 {
-        return MutVoidPtr::from_bits(cached).cast_const();
+    if let Some(cached) = env.libc_state.ctype.default_rune_locale_addr {
+        return cached;
     }
 
     let mut runetype = [0u32; LOOKUP_TABLE_SIZE];
@@ -212,8 +209,9 @@ fn get_default_rune_locale(env: &mut Environment) -> ConstVoidPtr {
             charclass: Ptr::null(),
         })
         .cast();
-    DEFAULT_RUNE_LOCALE_ADDR.store(ptr.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    ptr.cast_const()
+    let ptr = ptr.cast_const();
+    env.libc_state.ctype.default_rune_locale_addr = Some(ptr);
+    ptr
 }
 
 pub const CONSTANTS: ConstantExports = &[(
