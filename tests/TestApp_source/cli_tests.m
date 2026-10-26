@@ -632,6 +632,32 @@ int test_dispatch_async_f_global_queue(void) {
   return check_dispatch_async_global_queue(YES);
 }
 
+// Apple: outside of a submitted block, dispatch_get_current_queue "returns the
+// main queue if the call is executed from the main thread. If the call is made
+// from any other thread, this function returns the default concurrent queue."
+// Cut the Rope (HyperHLE-Reborn issue 344) loads textures on an NSThread and
+// only calls GL when the current queue is the main queue.
+// https://developer.apple.com/documentation/dispatch/dispatch_get_current_queue()
+extern dispatch_queue_t dispatch_get_current_queue(void);
+static void *current_queue_worker(void *result) {
+  *(dispatch_queue_t *)result = dispatch_get_current_queue();
+  return NULL;
+}
+int test_dispatch_get_current_queue(void) {
+  if (dispatch_get_current_queue() != dispatch_get_main_queue())
+    return -1;
+  dispatch_queue_t worker_queue = NULL;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, current_queue_worker, &worker_queue))
+    return -2;
+  pthread_join(thread, NULL);
+  if (worker_queue == dispatch_get_main_queue())
+    return -3;
+  if (worker_queue != dispatch_get_global_queue(0, 0))
+    return -4;
+  return 0;
+}
+
 // From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
 // the image path and base, and the nearest lower symbol, for an address in
 // a loaded image, and returns 0 otherwise. Symbol names have no leading
@@ -7814,6 +7840,7 @@ struct {
     FUNC_DEF(test_dispatch_after_common_mode),
     FUNC_DEF(test_dispatch_async_global_queue),
     FUNC_DEF(test_dispatch_async_f_global_queue),
+    FUNC_DEF(test_dispatch_get_current_queue),
     FUNC_DEF(test_dladdr),
     FUNC_DEF(test_AVAsset_assetWithURL),
     FUNC_DEF(test_runloop_audio_queue),
