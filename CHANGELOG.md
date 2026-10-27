@@ -23,6 +23,8 @@ Quality and performance:
 
 Compatibility:
 
+- JellyCar and JellyCar 2 enable the libxml2 guest DOM mirror by default. Their XML scene catalogs use libxml2 and guest xmlNode parsing helpers, so the default exposes the DOM structure those loaders expect.
+
 - JellyCar 3 loads its UI assets and progresses past the menu. The game's Walaber-engine asset loader reads `xmlNode` struct fields directly, so without the libxml2 guest DOM mirror every `TextureAtlas`/`BitmapFont`/`SoundList`/`Curve`/`Widgets` XML was rejected as invalid and menus rendered without atlas textures and fonts; it now gets `--xml-dom-mirror` by default like Where's My Water. Its database migration also ran into `near "Column": syntax error`: the bundled `libsqlite3.dylib` was built from SQLite 3.6.10, whose parser lacks the `COLUMNKW` identifier fallback that iPhone OS 3.0/3.1's own SQLite 3.6.12 has, so the game's `db_update_2_3.sql` (which uses bare `Column` as a column name) aborted and the level-pack/schema updates never applied. The dylib is now rebuilt from SQLite 3.6.12, matching the OS version touchHLE emulates, and the game's database migrates to version 4.
 
 - PAC-MAN Remix gets past the Namco logo. `CFRunLoopTimerSetNextFireDate`, `CFRunLoopTimerGetNextFireDate`, `CFRunLoopTimerGetInterval`, `CFRunLoopTimerDoesRepeat`, `CFRunLoopTimerIsValid` and `CFRunLoopTimerInvalidate` were stubs; they now act on the toll-free bridged `NSTimer`, which the game reschedules each frame.

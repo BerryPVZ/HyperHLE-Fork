@@ -362,6 +362,11 @@ com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
 # null and SkeletonActor::init asserts on the first level load.
 com.disney.PerryGame: --xml-dom-mirror
 
+# JellyCar and JellyCar 2: both use the Walaber XML loader and pass xmlNode
+# fields into guest parsing helpers for their scene/level catalogs.
+com.walaber.jellycar: --xml-dom-mirror
+com.disney.jellyCar2: --xml-dom-mirror
+
 # JellyCar 3: same Walaber engine family as Where's My Water (asset loader
 # walks xmlNode struct fields for TextureAtlas/BitmapFont/SoundList/Curve/
 # Widgets files). Without the libxml2 guest DOM mirror every asset XML reads
