@@ -352,33 +352,8 @@ com.dodreams.crashonwheels: --landscape-left --prefer-gles2-context --force-comp
 # Green Lantern: native 480x320 landscape OpenGL ES 2 profile.
 com.wb.GreenLantern: --landscape-left --prefer-gles2-context
 
-# Where's My Water?: iPhone portrait OpenGL ES 1 profile. Needs the libxml2
-# guest DOM mirror (the game reads xmlNode struct fields directly), else every
-# asset XML root reads as null and the game renders empty.
-com.disney.SwampyGame: --device-family=iphone-3gs --xml-dom-mirror
-
-# Where's My Perry?: same Walaber engine as Where's My Water, so it also reads
-# xmlNode fields directly. Without the mirror every asset XML root reads as
-# null and SkeletonActor::init asserts on the first level load.
-com.disney.PerryGame: --xml-dom-mirror
-
-# JellyCar and JellyCar 2: both use the Walaber XML loader and pass xmlNode
-# fields into guest parsing helpers for their scene/level catalogs.
-com.walaber.jellycar: --xml-dom-mirror
-com.disney.jellyCar2: --xml-dom-mirror
-
-# JellyCar 3: same Walaber engine family as Where's My Water (asset loader
-# walks xmlNode struct fields for TextureAtlas/BitmapFont/SoundList/Curve/
-# Widgets files). Without the libxml2 guest DOM mirror every asset XML reads
-# as invalid, so atlases/fonts/widgets fail to load and the menus render with
-# missing textures.
-com.disney.JellyCar3: --xml-dom-mirror
-
-# Regular Show: Best Park in the Universe: reads globals.xml by walking xmlNode
-# struct fields directly, so it needs the libxml2 guest DOM mirror. Without it
-# the "fps" setting reads as 0, the frame interval becomes infinite and the
-# game never gets past the splash screen.
-com.turner.bestparkintheuniverse: --xml-dom-mirror
+# Where's My Water?: iPhone portrait OpenGL ES 1 profile.
+com.disney.SwampyGame: --device-family=iphone-3gs
 
 # LEGO Ninjago: The Final Battle
 # Uses OpenAL streaming audio; keep its fixed-function landscape profile and
