@@ -388,6 +388,7 @@ struct AppPickerDelegateHostObject {
     cheat_engine: Option<bool>,
     trace_gl_errors: Option<bool>,
     preserve_aspect_ratio: Option<bool>,
+    show_lock_screen: Option<bool>,
     force_composition: Option<bool>,
     gles_native: Option<bool>,
     fullscreen: Option<bool>,
@@ -417,6 +418,7 @@ struct PickerSettings {
     orientation: Option<DeviceOrientation>,
     fullscreen: bool,
     preserve_aspect_ratio: bool,
+    show_lock_screen: bool,
     gles_native: bool,
     force_composition: bool,
     show_fps: bool,
@@ -436,6 +438,7 @@ impl PickerSettings {
             orientation: None,
             fullscreen: options.fullscreen,
             preserve_aspect_ratio: options.preserve_aspect_ratio,
+            show_lock_screen: true,
             gles_native,
             force_composition: options.force_composition,
             show_fps: options.print_fps,
@@ -473,6 +476,7 @@ impl PickerSettings {
                 }
                 "fullscreen" => set_bool(value, &mut settings.fullscreen),
                 "preserve_aspect_ratio" => set_bool(value, &mut settings.preserve_aspect_ratio),
+                "show_lock_screen" => set_bool(value, &mut settings.show_lock_screen),
                 "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
@@ -505,6 +509,7 @@ impl PickerSettings {
              orientation={orientation}\n\
              fullscreen={}\n\
              preserve_aspect_ratio={}\n\
+             show_lock_screen={}\n\
              gles_native={}\n\
              force_composition={}\n\
              show_fps={}\n\
@@ -518,6 +523,7 @@ impl PickerSettings {
                 .map_or_else(|| "default".to_string(), |n| n.to_string()),
             self.fullscreen,
             self.preserve_aspect_ratio,
+            self.show_lock_screen,
             self.gles_native,
             self.force_composition,
             self.show_fps,
@@ -703,6 +709,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())preserveAspectRatio:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).preserve_aspect_ratio = Some(switch_state);
+}
+- (())showLockScreen:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_lock_screen = Some(switch_state);
 }
 - (())forceComposition:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1069,6 +1079,7 @@ fn app_picker_inner(
     let mut quick_options_show_fps = picker_settings.show_fps;
     let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
+    let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
     let mut quick_options_force_composition_override = Some(picker_settings.force_composition);
     let mut quick_options_cheat_engine = picker_settings.cheat_engine;
     let mut quick_options_gles_native = picker_settings.gles_native;
@@ -1133,7 +1144,7 @@ fn app_picker_inner(
     chrome_views.extend(page_dots.iter().copied());
 
     let main_run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    if show_lock_screen {
+    if show_lock_screen && picker_settings.show_lock_screen {
         run_lock_screen(
             env,
             main_run_loop,
@@ -1590,6 +1601,8 @@ fn app_picker_inner(
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             env.window_mut()
                 .set_preserve_aspect_ratio(preserve_aspect_ratio);
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.show_lock_screen) {
+            quick_options_show_lock_screen = enabled;
         } else if let Some(force_composition) = std::mem::take(&mut host_obj.force_composition) {
             quick_options_force_composition_override = Some(force_composition);
         } else if let Some(gles_native) = std::mem::take(&mut host_obj.gles_native) {
@@ -1634,6 +1647,7 @@ fn app_picker_inner(
         picker_settings.orientation = quick_options_orientation;
         picker_settings.fullscreen = quick_options_fullscreen;
         picker_settings.preserve_aspect_ratio = quick_options_preserve_aspect_ratio;
+        picker_settings.show_lock_screen = quick_options_show_lock_screen;
         picker_settings.gles_native = quick_options_gles_native;
         picker_settings.force_composition =
             quick_options_force_composition_override.unwrap_or(env.options.force_composition);
@@ -2192,17 +2206,53 @@ fn update_icon_grid(
 }
 
 
-/// Play a short, original two-part chime when the lock screen is dismissed.
+/// Prepare the sound before the lock screen becomes interactive so opening the
+/// audio device and decoding a custom file cannot interrupt the swipe.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn play_unlock_sound() -> Result<AudioQueue<i16>, String> {
+fn prepare_unlock_sound() -> Result<(AudioQueue<i16>, Vec<i16>), String> {
+    let custom = paths::user_data_base_path().join(paths::UNLOCK_SOUND_FILE);
+    let pcm = if custom.exists() {
+        match std::fs::read(&custom)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                crate::audio::decode_host_caf(bytes)
+                    .map_err(|()| "unsupported CAF audio format".to_string())
+            }) {
+            Ok((bytes, rate, channels))
+                if (8_000..=192_000).contains(&rate)
+                    && (1..=2).contains(&channels)
+                    && !bytes.is_empty()
+                    && bytes.len() % (channels as usize * 2) == 0 =>
+            {
+                Some((bytes, rate, channels))
+            }
+            Ok(_) => {
+                log!("Warning: {} has unsupported PCM properties; using built-in unlock sound", custom.display());
+                None
+            }
+            Err(error) => {
+                log!("Warning: could not use {}: {error}; using built-in unlock sound", custom.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
     let sdl = sdl2::init()?;
     let audio = sdl.audio()?;
     let desired = AudioSpecDesired {
-        freq: Some(44_100),
-        channels: Some(1),
+        freq: Some(pcm.as_ref().map_or(44_100, |(_, rate, _)| *rate as i32)),
+        channels: Some(pcm.as_ref().map_or(1, |(_, _, channels)| *channels as u8)),
         samples: None,
     };
     let queue = audio.open_queue::<i16, _>(None, &desired)?;
+    if let Some((bytes, _, _)) = pcm {
+        let samples = bytes
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect();
+        return Ok((queue, samples));
+    }
     let rate = queue.spec().freq as f32;
     let sample_count = (rate * 0.36) as usize;
     let mut samples = Vec::with_capacity(sample_count);
@@ -2227,9 +2277,7 @@ fn play_unlock_sound() -> Result<AudioQueue<i16>, String> {
         let value = 0.11 * click + 0.17 * tone(0.015, 1050.0) + 0.15 * tone(0.105, 790.0);
         samples.push((value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
     }
-    queue.queue_audio(&samples)?;
-    queue.resume();
-    Ok(queue)
+    Ok((queue, samples))
 }
 
 /// Construct and display the iPhone OS 4 lock screen over the picker wallpaper.
@@ -2419,6 +2467,14 @@ fn run_lock_screen(
                               action:slider_selector
                     forControlEvents:UIControlEventValueChanged];
     () = msg![env; track addSubview:slider];
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let unlock_sound = match env.on_parent_stack_in_coroutine(|_, _| prepare_unlock_sound()) {
+        Ok(sound) => Some(sound),
+        Err(error) => {
+            log!("Warning: could not prepare unlock sound: {error}");
+            None
+        }
+    };
     () = msg![env; parent addSubview:lock];
 
     {
@@ -2428,6 +2484,8 @@ fn run_lock_screen(
     }
     let started = Instant::now();
     let mut clock_updated = Instant::now();
+    let mut shimmer_updated = Instant::now() - Duration::from_millis(34);
+    let mut last_knob_progress = -1.0f32;
     loop {
         run_run_loop_single_iteration(env, run_loop);
         let (unlocked, mut progress) = {
@@ -2443,17 +2501,23 @@ fn run_lock_screen(
             () = msg![env; slider setValue:progress];
             env.objc.borrow_mut::<AppPickerDelegateHostObject>(delegate).lock_slider_progress = progress;
         }
-        let elapsed = started.elapsed().as_secs_f64();
-        let sweep = (elapsed % 2.4) / 2.4 * (shimmer_letters.len() as f64 + 4.0) - 2.0;
-        for (index, &letter) in shimmer_letters.iter().enumerate() {
-            let distance = (index as f64 - sweep).abs();
-            let glow = (1.0 - distance / 2.2).clamp(0.0, 1.0) as CGFloat;
-            () = msg![env; letter setAlpha:(0.58 + glow * 0.42)];
+        if shimmer_updated.elapsed() >= Duration::from_millis(33) {
+            shimmer_updated = Instant::now();
+            let elapsed = started.elapsed().as_secs_f64();
+            let sweep = (elapsed % 2.4) / 2.4 * (shimmer_letters.len() as f64 + 4.0) - 2.0;
+            for (index, &letter) in shimmer_letters.iter().enumerate() {
+                let distance = (index as f64 - sweep).abs();
+                let glow = (1.0 - distance / 2.2).clamp(0.0, 1.0) as CGFloat;
+                () = msg![env; letter setAlpha:(0.58 + glow * 0.42)];
+            }
         }
-        let mut knob_frame: CGRect = msg![env; knob frame];
-        let travel = (track_width - thumb_width - 8.0).max(0.0);
-        knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
-        () = msg![env; knob setFrame:knob_frame];
+        if progress != last_knob_progress {
+            last_knob_progress = progress;
+            let mut knob_frame: CGRect = msg![env; knob frame];
+            let travel = (track_width - thumb_width - 8.0).max(0.0);
+            knob_frame.origin.x = 4.0 + travel * progress as CGFloat;
+            () = msg![env; knob setFrame:knob_frame];
+        }
         if clock_updated.elapsed() >= Duration::from_secs(1) {
             clock_updated = Instant::now();
             // Keep both clocks on the same timestamp while the lock screen is
@@ -2474,13 +2538,18 @@ fn run_lock_screen(
         host.swipe_left = false;
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let _unlock_sound = match env.on_parent_stack_in_coroutine(|_, _| play_unlock_sound()) {
-        Ok(queue) => Some(queue),
-        Err(error) => {
-            log!("Warning: could not play unlock sound: {error}");
-            None
+    let _unlock_sound = unlock_sound.and_then(|(queue, samples)| {
+        match queue.queue_audio(&samples) {
+            Ok(()) => {
+                queue.resume();
+                Some(queue)
+            }
+            Err(error) => {
+                log!("Warning: could not play unlock sound: {error}");
+                None
+            }
         }
-    };
+    });
     animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
         let p = ease_in_out_cubic(t) as CGFloat;
         let mut frame: CGRect = msg![env; lock frame];
@@ -3846,6 +3915,12 @@ fn setup_settings(
             true,
         ),
     ];
+    graphics_rows.push(SettingsRow::Toggle(
+        "Show slide to unlock",
+        "showLockScreen:",
+        picker_settings.show_lock_screen,
+        true,
+    ));
     if show_fullscreen_row {
         graphics_rows.push(SettingsRow::Toggle(
             "Keep aspect ratio on resize",
