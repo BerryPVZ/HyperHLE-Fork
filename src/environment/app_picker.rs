@@ -41,7 +41,6 @@ use crate::options::Options;
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -2208,7 +2207,6 @@ fn update_icon_grid(
 
 /// Prepare the sound before the lock screen becomes interactive so opening the
 /// audio device and decoding a custom file cannot interrupt the swipe.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn prepare_unlock_sound() -> Result<(AudioQueue<i16>, Vec<i16>), String> {
     let custom = paths::user_data_base_path().join(paths::UNLOCK_SOUND_FILE);
     let pcm = if custom.exists() {
@@ -2467,7 +2465,6 @@ fn run_lock_screen(
                               action:slider_selector
                     forControlEvents:UIControlEventValueChanged];
     () = msg![env; track addSubview:slider];
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let unlock_sound = match env.on_parent_stack_in_coroutine(|_, _| prepare_unlock_sound()) {
         Ok(sound) => Some(sound),
         Err(error) => {
@@ -2537,7 +2534,6 @@ fn run_lock_screen(
         host.swipe_right = false;
         host.swipe_left = false;
     }
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let _unlock_sound = unlock_sound.and_then(|(queue, samples)| {
         match queue.queue_audio(&samples) {
             Ok(()) => {
