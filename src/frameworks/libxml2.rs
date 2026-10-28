@@ -7,11 +7,11 @@
 //!
 //! Every entry point dispatches to the real, vendored libxml2 (built in
 //! `vendor/libxml2`) via the [`touchHLE_libxml2_wrapper`] crate.  The guest
-//! never sees a host pointer directly: every libxml2 object (`xmlDoc *`,
-//! `xmlNode *`, `xmlAttr *`, `xmlTextReader *`, `xmlXPathObject *`, …) is
-//! recorded in a global handle table and exchanged with the guest as an
-//! opaque 32-bit handle, while every returned `xmlChar *` is copied into
-//! freshly-allocated guest memory.
+//! never sees a host pointer directly: most libxml2 object pointers are
+//! exchanged with the guest as opaque 32-bit handles, while every returned
+//! `xmlChar *` is copied into freshly-allocated guest memory. `xmlNode *` trees
+//! returned by `xmlDocGetRootElement` are mirrored into guest memory so guest
+//! code can read the public `xmlNode` fields just as it can on iOS.
 //!
 //! Coverage spans every major libxml2 sub-module: parser, tree, xmlreader,
 //! xmlwriter, xmlsave, xpath, xinclude, xpointer, DTD/Schemas/RelaxNG/
@@ -53,12 +53,11 @@ struct HandleTable {
     next_id: u32,
     by_id: HashMap<u32, *mut c_void>,
     by_ptr: HashMap<usize, u32>,
-    /// Guest-memory DOM mirror. Some guests (e.g. Where's My Water /
-    /// `com.disney.SwampyGame`) read libxml2 node struct fields directly
-    /// (`node->name`, `node->children`, `node->type`, …) instead of only using
-    /// the API accessors. Opaque handles can't satisfy that, so for nodes we
-    /// hand the guest a real guest-memory struct laid out like 32-bit
-    /// `xmlNode`, and map it back to the host node here.
+    /// Guest-memory DOM mirror. Guest code can read libxml2's public node
+    /// fields (`node->name`, `node->children`, `node->type`, …) directly, so
+    /// the tree returned by `xmlDocGetRootElement` is materialized as real
+    /// guest-memory structs laid out like 32-bit `xmlNode`, and mapped back
+    /// to host nodes here.
     mirror_host_to_guest: HashMap<usize, u32>,
     mirror_guest_to_host: HashMap<u32, usize>,
     /// Per host-doc list of (guest_struct_addr, owned guest allocations) so a
@@ -832,15 +831,10 @@ fn xmlFreeDoc(env: &mut Environment, doc: u32) {
 fn xmlDocGetRootElement(env: &mut Environment, doc: u32) -> u32 {
     let p = h2doc(doc);
     let root = unsafe { xml::xmlDocGetRootElement(p) };
-    // Guest DOM mirror: hand the guest a real guest-memory `xmlNode` struct it
-    // can walk by direct field access (`node->name`/`children`/`next`/…), which
-    // games like Where's My Water (com.disney.SwampyGame) require. Opt-in via
-    // `--xml-dom-mirror` / `TOUCHHLE_XML_MIRROR=1`; off by default so API-only
-    // guests (which read nodes only through libxml2 accessors) are unaffected.
-    if env.options.xml_dom_mirror {
-        return mirror_node(env, root as *mut c_void, p as usize);
-    }
-    id_for(root as *mut c_void)
+    // `xmlNode` is a public libxml2 struct, not an opaque handle. Always give
+    // the guest a matching in-guest DOM tree so direct field access works for
+    // every app without a per-game option.
+    mirror_node(env, root as *mut c_void, p as usize)
 }
 
 #[allow(non_snake_case)]

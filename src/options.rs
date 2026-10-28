@@ -286,12 +286,6 @@ pub struct Options {
     /// unbound locations to the implementation:
     /// <https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glBindAttribLocation.xml>
     pub reverse_attrib_locations: bool,
-    /// Expose a real guest-memory `xmlNode` struct tree ("DOM mirror") from
-    /// libxml2 instead of opaque handles, for games that read node struct
-    /// fields directly (`node->name`/`children`/`next`/…). Needed by Where's My
-    /// Water (`com.disney.SwampyGame`). Opt in with `--xml-dom-mirror` or
-    /// `TOUCHHLE_XML_MIRROR=1`; off by default so API-only guests are unaffected.
-    pub xml_dom_mirror: bool,
 }
 
 impl Default for Options {
@@ -385,9 +379,6 @@ impl Default for Options {
                 .unwrap_or(false),
             fix_movie_player: false,
             reverse_attrib_locations: false,
-            xml_dom_mirror: std::env::var_os("TOUCHHLE_XML_MIRROR")
-                .map(|value| value != "0")
-                .unwrap_or(false),
         }
     }
 }
@@ -417,8 +408,6 @@ impl Options {
             self.preserve_aspect_ratio = false;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
-        } else if arg == "--xml-dom-mirror" {
-            self.xml_dom_mirror = true;
         } else if arg == "--fix-movie-player" {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
@@ -844,5 +833,11 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn xml_dom_mirror_is_not_a_user_option() {
+        let mut options = Options::default();
+        assert_eq!(options.parse_argument("--xml-dom-mirror"), Ok(false));
     }
 }
