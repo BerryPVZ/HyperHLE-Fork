@@ -999,8 +999,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     // delayed, so this needs to be checked before returning.
     let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
 
-    // The iOS host always counts frames so it can show its own FPS overlay.
-    if env.options.print_fps || cfg!(target_os = "ios") {
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
         env
             .objc
             .borrow_mut::<EAGLContextHostObject>(this)

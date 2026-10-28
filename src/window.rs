@@ -1351,7 +1351,7 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
-            show_fps_counter: Cell::new(false),
+            show_fps_counter: Cell::new(options.print_fps),
             fps_frame_count: Cell::new(0),
             fps_last_log: RefCell::new(Instant::now()),
             perf_hints: crate::perf_hints::PerfHints::new(
@@ -2080,26 +2080,23 @@ impl Window {
                     self.toggle_fullscreen();
                     continue;
                 }
-                // Toggle FPS counter with F9
                 E::KeyDown {
-                    keycode: Some(sdl2::keyboard::Keycode::F10),
+                    keycode: Some(sdl2::keyboard::Keycode::F1),
                     repeat: false,
                     ..
                 } => {
-                    // This is a hack for the user: we can't easily modify Options
-                    // while the environment is running without some synchronization,
-                    // but for debugging we can just log that the key was pressed.
-                    // Actually, if we want to toggle it, we need access to env.options.
-                    echo!("F10 pressed: Toggle Verbose GLES (requires env.options access)");
+                    let enabled = !crate::gles::present::onscreen_fps_enabled();
+                    self.set_show_fps_counter(enabled);
+                    echo!("FPS overlay {}", if enabled { "enabled" } else { "disabled" });
                     continue;
                 }
                 E::KeyDown {
-                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    keycode: Some(sdl2::keyboard::Keycode::F2),
+                    repeat: false,
                     ..
                 } => {
-                    let new = !self.show_fps_counter.get();
-                    self.set_show_fps_counter(new);
-                    echo!("FPS counter {}", if new { "enabled" } else { "disabled" });
+                    let corner = crate::gles::present::cycle_onscreen_fps_corner();
+                    echo!("FPS overlay moved to {corner}");
                     continue;
                 }
                 E::KeyDown {

@@ -12,6 +12,7 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 - Builds for Android, iOS, Windows, macOS, and Linux. The iOS app comes from [Applesauce](https://github.com/johnny901901901/Applesauce); see [`platform/ios`](platform/ios/README.md).
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
+- On-screen FPS panel with frame-time graph; press **F1** to toggle it and **F2** to move it between screen corners. Mobile builds expose the same option in the app picker.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
 - Download build artifacts from the [HyperHLE GitHub Actions workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml).
 

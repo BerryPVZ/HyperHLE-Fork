@@ -1735,13 +1735,9 @@ fn app_picker_inner(
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
+    env.window_mut().set_show_fps_counter(quick_options_show_fps);
     if quick_options_show_fps {
-        // Reuse existing CLI flag to enable FPS logging/counter behaviour.
         option_args.push("--print-fps".to_string());
-        // Also enable the on-screen FPS overlay both via env var and runtime
-        // flag so users don't need to set env vars manually.
-        std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
-        crate::gles::present::set_onscreen_fps_enabled(true);
     } else {
         option_args.push("--no-print-fps".to_string());
     }

@@ -320,6 +320,9 @@ Other options:
     --print-fps
     --no-print-fps
         Logs the current framerate (FPS) to the console once per second.
+        On desktop, press F1 to toggle the on-screen FPS panel and F2 to move
+        it between screen corners. Mobile builds expose the panel in the app
+        picker.
 
     --fps-limit=...
         Modify or disable the framerate (FPS) limit.

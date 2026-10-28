@@ -122,7 +122,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         }
     }
 
-    if env.options.print_fps || cfg!(target_os = "ios") {
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
         env.framework_state
             .core_animation
             .composition
