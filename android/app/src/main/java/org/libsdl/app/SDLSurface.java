@@ -132,6 +132,17 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
 
         Log.v("SDL", "Window size: " + width + "x" + height);
         Log.v("SDL", "Device size: " + nDeviceWidth + "x" + nDeviceHeight);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Surface surface = holder.getSurface();
+            if (surface.isValid()) {
+                try {
+                    surface.setFrameRate(60.0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+                    Log.i("SDL", "Requested 60 Hz surface frame rate for emulator pacing.");
+                } catch (RuntimeException e) {
+                    Log.w("SDL", "Could not request 60 Hz surface frame rate.", e);
+                }
+            }
+        }
         SDLActivity.nativeSetScreenResolution(width, height, nDeviceWidth, nDeviceHeight, mDisplay.getRefreshRate());
         SDLActivity.onNativeResize();
 

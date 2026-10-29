@@ -22,13 +22,12 @@ use crate::gles::{
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::Options;
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode, VsyncMode};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -47,6 +46,42 @@ pub fn angle_backend_available() -> bool {
 #[cfg(target_os = "android")]
 fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
     !gles_native && !angle_unavailable
+}
+
+fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::video::SwapInterval> {
+    match mode {
+        VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
+        VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
+        VsyncMode::Auto if is_android => Some(sdl2::video::SwapInterval::VSync),
+        VsyncMode::Auto => None,
+    }
+}
+
+#[cfg(test)]
+mod swap_interval_tests {
+    use super::{swap_interval_for_mode, VsyncMode};
+    use sdl2::video::SwapInterval;
+
+    #[test]
+    fn auto_uses_display_sync_on_android() {
+        assert!(matches!(
+            swap_interval_for_mode(VsyncMode::Auto, true),
+            Some(SwapInterval::VSync)
+        ));
+    }
+
+    #[test]
+    fn auto_keeps_driver_default_on_desktop() {
+        assert!(swap_interval_for_mode(VsyncMode::Auto, false).is_none());
+    }
+
+    #[test]
+    fn explicit_off_remains_available_on_android() {
+        assert!(matches!(
+            swap_interval_for_mode(VsyncMode::Off, true),
+            Some(SwapInterval::Immediate)
+        ));
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -916,6 +951,7 @@ pub struct Window {
     scale_hack: NonZeroU32,
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
+    perf_context_token: usize,
     /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
     /// OpenGL ES context, captured at window creation. Used to detect the host
     /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
@@ -938,9 +974,6 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
-    show_fps_counter: Cell<bool>,
-    fps_frame_count: Cell<u32>,
-    fps_last_log: RefCell<Instant>,
     /// Host scheduling / power-management hints for the emulator thread
     /// (Android). Fed once per presented frame from [Window::swap_window].
     perf_hints: crate::perf_hints::PerfHints,
@@ -949,6 +982,15 @@ pub struct Window {
     /// certain SDL functions (that call JNI functions) are on the main
     /// stack on Android.
     pub(super) on_main_stack: bool,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn base_window_title() -> String {
+    if crate::branding().is_empty() {
+        format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
+    } else {
+        format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
+    }
 }
 
 impl Window {
@@ -1005,6 +1047,7 @@ impl Window {
         launch_image: Option<(Image, bool)>,
         options: &Options,
     ) -> Result<Window, String> {
+        crate::gles::perf_overlay::configure_from_options(options);
         #[cfg(target_os = "android")]
         {
             let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
@@ -1329,6 +1372,7 @@ impl Window {
             scale_hack,
             host_screen_size,
             internal_gl_ins: None,
+            perf_context_token: crate::gles::perf_overlay::allocate_context_token(),
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
@@ -1351,9 +1395,6 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
-            show_fps_counter: Cell::new(false),
-            fps_frame_count: Cell::new(0),
-            fps_last_log: RefCell::new(Instant::now()),
             perf_hints: crate::perf_hints::PerfHints::new(
                 options.perf_hints,
                 options
@@ -1422,29 +1463,10 @@ impl Window {
             ));
         }
 
-        // Swap interval. EGL's swap interval is a property of the window
-        // surface, which every context created for this window shares, so
-        // setting it once here (with the internal context current) covers the
-        // app's EAGL contexts too.
-        //
-        // On Android the default (1, i.e. vsync) is a poor fit: the emulator
-        // already paces frames itself (`--fps-limit`, on by default) and the
-        // Android compositor synchronises to the display regardless, so a
-        // blocking swap can't prevent tearing, it can only stall the emulator
-        // thread — and a stall on top of a frame that already took nearly a
-        // refresh interval turns "almost 60 FPS" into a hard 30 FPS. Desktop
-        // drivers are left at their default unless asked otherwise.
-        let swap_interval = match options.vsync {
-            crate::options::VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
-            crate::options::VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
-            crate::options::VsyncMode::Auto => {
-                if env::consts::OS == "android" {
-                    Some(sdl2::video::SwapInterval::Immediate)
-                } else {
-                    None
-                }
-            }
-        };
+        // The Android surface requests a 60 Hz mode, matching the default
+        // frame limit. Synchronize swaps to that display cadence; explicit
+        // --vsync=off remains available for drivers where interval 1 regresses.
+        let swap_interval = swap_interval_for_mode(options.vsync, env::consts::OS == "android");
         if let Some(swap_interval) = swap_interval {
             let vsync_on = matches!(swap_interval, sdl2::video::SwapInterval::VSync);
             match window.video_ctx.gl_set_swap_interval(swap_interval) {
@@ -2080,26 +2102,23 @@ impl Window {
                     self.toggle_fullscreen();
                     continue;
                 }
-                // Toggle FPS counter with F9
                 E::KeyDown {
-                    keycode: Some(sdl2::keyboard::Keycode::F10),
+                    keycode: Some(sdl2::keyboard::Keycode::F1),
                     repeat: false,
                     ..
                 } => {
-                    // This is a hack for the user: we can't easily modify Options
-                    // while the environment is running without some synchronization,
-                    // but for debugging we can just log that the key was pressed.
-                    // Actually, if we want to toggle it, we need access to env.options.
-                    echo!("F10 pressed: Toggle Verbose GLES (requires env.options access)");
+                    let enabled = !crate::gles::present::onscreen_fps_enabled();
+                    self.set_show_fps_counter(enabled);
+                    echo!("Performance display {}", if enabled { "enabled" } else { "disabled" });
                     continue;
                 }
                 E::KeyDown {
-                    keycode: Some(sdl2::keyboard::Keycode::F11),
+                    keycode: Some(sdl2::keyboard::Keycode::F2),
+                    repeat: false,
                     ..
                 } => {
-                    let new = !self.show_fps_counter.get();
-                    self.set_show_fps_counter(new);
-                    echo!("FPS counter {}", if new { "enabled" } else { "disabled" });
+                    let corner = crate::gles::present::cycle_onscreen_fps_corner();
+                    echo!("Performance display moved to {corner}");
                     continue;
                 }
                 E::KeyDown {
@@ -2655,6 +2674,7 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                self.perf_context_token,
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -2671,37 +2691,12 @@ impl Window {
     pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
         self.perf_hints.frame_presented();
+        crate::gles::perf_overlay::record_host_present();
 
-        // FPS logging / UI: count frames and print once per second if enabled.
-        if self.show_fps_counter.get() {
-            // Increment frame count.
-            let frames = self.fps_frame_count.get().saturating_add(1);
-            self.fps_frame_count.set(frames);
-
-            let now = Instant::now();
-            // Borrow last log time
-            let mut last = self.fps_last_log.borrow_mut();
-            let elapsed = now.duration_since(*last);
-            if elapsed >= Duration::from_secs(1) {
-                // Compute FPS (frames in elapsed duration)
-                let fps = (frames as f32) / (elapsed.as_secs_f32().max(1e-6));
-                // Log to stdout / echo
-                echo!("FPS: {:.1}", fps);
-                // Reset counters
-                *last = now;
-                self.fps_frame_count.set(0);
-
-                // Also show FPS in the window title so it's visible when the
-                // app is running fullscreen or without console.
-                let base_title = if crate::branding().is_empty() {
-                    format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
-                } else {
-                    format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
-                };
-                let title = format!("{} - FPS: {:.1}", base_title, fps);
-                // Ignore any error setting the title.
-                let _ = self.window.set_title(&title);
-            }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if let Some(summary) = crate::gles::perf_overlay::take_title_bar_summary() {
+            let title = format!("{} - {}", base_window_title(), summary);
+            let _ = self.window.set_title(&title);
         }
     }
 
@@ -2932,6 +2927,10 @@ impl Window {
         self.host_framebuffer
     }
 
+    pub(crate) fn perf_context_token(&self) -> usize {
+        self.perf_context_token
+    }
+
     /// Special offset to add to y co-ordinates, only when drawing to screen.
     pub fn viewport_y_offset(&self) -> u32 {
         #[cfg(target_os = "macos")]
@@ -3013,12 +3012,25 @@ impl Window {
         self.on_main_stack
     }
 
-    /// Toggle FPS counter at runtime.
     pub fn set_show_fps_counter(&mut self, enabled: bool) {
-        self.show_fps_counter.set(enabled);
-        // Also enable the on-screen FPS overlay so runtime toggles apply to
-        // the graphical overlay as well as the window title/console logging.
-        crate::gles::present::set_onscreen_fps_enabled(enabled);
+        crate::gles::perf_overlay::set_enabled(enabled);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if !enabled || crate::gles::perf_overlay::mode() != crate::options::PerformanceOverlayMode::TitleBar {
+            let _ = self.window.set_title(&base_window_title());
+        }
+    }
+
+    pub fn set_performance_overlay_settings(
+        &mut self,
+        enabled: bool,
+        mode: PerformanceOverlayMode,
+        corner: PerformanceOverlayCorner,
+    ) {
+        crate::gles::perf_overlay::configure(enabled, mode, corner);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if !enabled || mode != PerformanceOverlayMode::TitleBar {
+            let _ = self.window.set_title(&base_window_title());
+        }
     }
 }
 

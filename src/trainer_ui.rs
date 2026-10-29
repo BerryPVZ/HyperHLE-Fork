@@ -1203,31 +1203,52 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
 
 /// Entry point for native OpenGL ES 2.0 present paths (see
 /// present_renderbuffer_es2), which lack the fixed-function pipeline.
+fn prepare_es2_overlay_context(context_token: usize) {
+    let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
+    if *stored != Some(context_token) {
+        *stored = Some(context_token);
+        drop(stored);
+        *OVERLAY_PROGRAM.lock().unwrap() = None;
+        *OVERLAY_VBO.lock().unwrap() = None;
+        *OVERLAY_WHITE_TEX.lock().unwrap() = None;
+        invalidate_atlas();
+    }
+}
+
 pub unsafe fn draw_es2(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
     context_token: usize,
 ) {
-    // When the game switches EAGL contexts (e.g. between apps or between
-    // context instances), all our cached GL objects (program, VBO, atlas
-    // texture) belong to a dead context. Drop them so they get rebuilt.
-    {
-        let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
-        if *stored != Some(context_token) {
-            *stored = Some(context_token);
-            drop(stored);
-            *OVERLAY_PROGRAM.lock().unwrap() = None;
-            *OVERLAY_VBO.lock().unwrap() = None;
-            // The solid-quad texture is context-owned too. Reusing its old
-            // name can sample an unrelated texture in the new context.
-            *OVERLAY_WHITE_TEX.lock().unwrap() = None;
-            invalidate_atlas();
-        }
-    }
+    prepare_es2_overlay_context(context_token);
     let Some(quads) = build_scene(gles, viewport) else {
         return;
     };
     render_es2(gles, viewport, &quads);
+}
+
+pub unsafe fn draw_texture_es2(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    context_token: usize,
+    texture: GLuint,
+    rect: (f32, f32, f32, f32),
+    uv: (f32, f32),
+) {
+    prepare_es2_overlay_context(context_token);
+    let quad = Quad {
+        tex: texture,
+        x: rect.0,
+        y: rect.1,
+        w: rect.2,
+        h: rect.3,
+        u0: 0.0,
+        v0: 0.0,
+        u1: uv.0,
+        v1: uv.1,
+        col: (1.0, 1.0, 1.0, 1.0),
+    };
+    render_es2(gles, viewport, &[quad]);
 }
 
 /// Build the overlay scene (shared by both renderers). Returns None when the
@@ -1819,6 +1840,7 @@ unsafe fn ensure_overlay_white_tex(gles: &mut dyn GLES) -> GLuint {
 /// rest of the presenter state afterwards.
 unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads: &[Quad]) {
     use crate::gles::gles2_raw as gles2;
+    use gles2::types::*;
 
     if quads.is_empty() {
         return;
@@ -1829,10 +1851,6 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     if program.a_pos < 0 || program.a_uv < 0 || program.a_col < 0 {
         return;
     }
-    let vbo = ensure_overlay_vbo(gles);
-    let white = ensure_overlay_white_tex(gles);
-
-    // Save state we touch.
     let mut old_program: GLint = 0;
     gles.GetIntegerv(gles2::CURRENT_PROGRAM, &mut old_program);
     let mut old_array_buffer: GLint = 0;
@@ -1843,14 +1861,68 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut old_tex0: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
+    let mut old_color_mask = [gles2::TRUE; 4];
+    gles.GetBooleanv(gles2::COLOR_WRITEMASK, old_color_mask.as_mut_ptr());
+    let overlay_caps = [
+        gles2::SCISSOR_TEST,
+        gles2::DEPTH_TEST,
+        gles2::CULL_FACE,
+        gles2::STENCIL_TEST,
+        gles2::SAMPLE_ALPHA_TO_COVERAGE,
+    ];
+    let old_overlay_caps = overlay_caps.map(|cap| (cap, gles.IsEnabled(cap) != 0));
+    let mut old_blend_src_rgb: GLint = 0;
+    let mut old_blend_dst_rgb: GLint = 0;
+    let mut old_blend_src_alpha: GLint = 0;
+    let mut old_blend_dst_alpha: GLint = 0;
+    gles.GetIntegerv(0x80C9, &mut old_blend_src_rgb);
+    gles.GetIntegerv(0x80C8, &mut old_blend_dst_rgb);
+    gles.GetIntegerv(0x80CB, &mut old_blend_src_alpha);
+    gles.GetIntegerv(0x80CA, &mut old_blend_dst_alpha);
     let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
-    let mut attrib_states = [0u8; 3];
-    for (slot, &attrib) in attrib_states.iter_mut().zip(attribs.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attrib as GLuint, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
+    const VERTEX_ATTRIB_ARRAY_ENABLED: GLenum = 0x8622;
+    const VERTEX_ATTRIB_ARRAY_SIZE: GLenum = 0x8623;
+    const VERTEX_ATTRIB_ARRAY_STRIDE: GLenum = 0x8624;
+    const VERTEX_ATTRIB_ARRAY_TYPE: GLenum = 0x8625;
+    const VERTEX_ATTRIB_ARRAY_POINTER: GLenum = 0x8645;
+    const VERTEX_ATTRIB_ARRAY_NORMALIZED: GLenum = 0x886A;
+    const VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: GLenum = 0x889F;
+    struct SavedAttrib {
+        index: GLuint,
+        enabled: GLint,
+        buffer: GLint,
+        size: GLint,
+        stride: GLint,
+        type_: GLint,
+        normalized: GLint,
+        pointer: *mut GLvoid,
     }
+    let mut attrib_states = attribs.map(|index| SavedAttrib {
+        index,
+        enabled: 0,
+        buffer: 0,
+        size: 0,
+        stride: 0,
+        type_: 0,
+        normalized: 0,
+        pointer: std::ptr::null_mut(),
+    });
+    for state in &mut attrib_states {
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.enabled);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut state.buffer);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_SIZE, &mut state.size);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.stride);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_TYPE, &mut state.type_);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_NORMALIZED, &mut state.normalized);
+        gles.GetVertexAttribPointerv(state.index, VERTEX_ATTRIB_ARRAY_POINTER, &mut state.pointer);
+    }
+    let vbo = ensure_overlay_vbo(gles);
+    let white = ensure_overlay_white_tex(gles);
 
+    gles.ColorMask(gles2::TRUE, gles2::TRUE, gles2::TRUE, gles2::TRUE);
+    for (cap, _) in old_overlay_caps {
+        gles.Disable(cap);
+    }
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
     gles.Uniform1i(program.u_tex, 0);
@@ -1918,16 +1990,44 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
         gles.DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
     }
 
-    for (&attr, &was) in attribs.iter().zip(attrib_states.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attr as _);
+    for state in &attrib_states {
+        gles.BindBuffer(gles2::ARRAY_BUFFER, state.buffer as _);
+        gles.VertexAttribPointer(
+            state.index,
+            state.size,
+            state.type_ as _,
+            state.normalized as _,
+            state.stride,
+            state.pointer as *const GLvoid,
+        );
+        if state.enabled != 0 {
+            gles.EnableVertexAttribArray(state.index);
         } else {
-            gles.DisableVertexAttribArray(attr as _);
+            gles.DisableVertexAttribArray(state.index);
         }
     }
-    if !blend_was_on {
+    gles.BlendFuncSeparate(
+        old_blend_src_rgb as _,
+        old_blend_dst_rgb as _,
+        old_blend_src_alpha as _,
+        old_blend_dst_alpha as _,
+    );
+    if blend_was_on {
+        gles.Enable(gles2::BLEND);
+    } else {
         gles.Disable(gles2::BLEND);
     }
+    for (cap, was_enabled) in old_overlay_caps {
+        if was_enabled {
+            gles.Enable(cap);
+        }
+    }
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
     gles.BindTexture(gles2::TEXTURE_2D, old_tex0 as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as _);

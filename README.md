@@ -12,6 +12,8 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 - Builds for Android, iOS, Windows, macOS, and Linux. The iOS app comes from [Applesauce](https://github.com/johnny901901901/Applesauce); see [`platform/ios`](platform/ios/README.md).
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
+- SharpEmu-style performance display: full counters with a 128-frame graph, minimal panel, or title-bar summary. **F1** toggles it; **F2** cycles panel corners. Mobile builds expose Full/Minimal modes in the app picker; `titlebar` falls back to Minimal where the OS has no title bar.
+- The GLES backend reports `Q DIRECT` and tracked `GLALLOC` storage instead of inventing Vulkan queue/allocation counts. Android GPU load uses readable vendor counters; kernels that hide them can still show `GPU N/A`. `GC 0/0/0` is expected because HyperHLE is written in Rust and has no garbage collector.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
 - Download build artifacts from the [HyperHLE GitHub Actions workflow](https://github.com/KlugKlugTG/HyperHLE-Reborn/actions/workflows/HyperHLE_release.yml).
 
