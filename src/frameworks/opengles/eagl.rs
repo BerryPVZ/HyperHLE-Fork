@@ -1003,6 +1003,9 @@ pub const CLASSES: ClassExports = objc_classes! {
         || cfg!(target_os = "ios")
         || crate::gles::present::onscreen_fps_enabled()
     {
+        if crate::gles::perf_overlay::enabled() {
+            crate::gles::perf_overlay::record_guest_flip();
+        }
         env
             .objc
             .borrow_mut::<EAGLContextHostObject>(this)

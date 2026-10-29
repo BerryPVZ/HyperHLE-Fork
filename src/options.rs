@@ -34,6 +34,61 @@ pub enum Button {
 /// Highest iOS version currently exposed by the emulator compatibility layer.
 pub const LATEST_IOS_VERSION: (i32, i32, i32) = (12, 0, 0);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerformanceOverlayMode {
+    Full,
+    Minimal,
+    TitleBar,
+}
+
+impl PerformanceOverlayMode {
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "minimal" => Some(Self::Minimal),
+            "titlebar" => Some(Self::TitleBar),
+            _ => None,
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::TitleBar => "titlebar",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerformanceOverlayCorner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+impl PerformanceOverlayCorner {
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "topleft" => Some(Self::TopLeft),
+            "topright" => Some(Self::TopRight),
+            "bottomright" => Some(Self::BottomRight),
+            "bottomleft" => Some(Self::BottomLeft),
+            _ => None,
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::TopLeft => "topleft",
+            Self::TopRight => "topright",
+            Self::BottomRight => "bottomright",
+            Self::BottomLeft => "bottomleft",
+        }
+    }
+}
+
 /// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
 /// host window when the app draws into a fullscreen `CAEAGLLayer`
 /// (`--present-mode=`).
@@ -146,6 +201,9 @@ pub struct Options {
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
     pub print_fps: bool,
+    pub performance_overlay_enabled: bool,
+    pub performance_overlay_mode: PerformanceOverlayMode,
+    pub performance_overlay_corner: PerformanceOverlayCorner,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
     /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
@@ -320,6 +378,13 @@ impl Default for Options {
             preferred_languages: None,
             headless: false,
             print_fps: false,
+            performance_overlay_enabled: true,
+            performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
+                PerformanceOverlayMode::Minimal
+            } else {
+                PerformanceOverlayMode::TitleBar
+            },
+            performance_overlay_corner: PerformanceOverlayCorner::TopRight,
             fps_limit: Some(60.0),
             force_composition: false,
             present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
@@ -588,6 +653,18 @@ impl Options {
             self.print_fps = true;
         } else if arg == "--no-print-fps" {
             self.print_fps = false;
+        } else if let Some(value) = arg.strip_prefix("--overlay=") {
+            self.performance_overlay_enabled = match value {
+                "on" => true,
+                "off" => false,
+                _ => return Err("Invalid value for --overlay=".to_string()),
+            };
+        } else if let Some(value) = arg.strip_prefix("--overlay-mode=") {
+            self.performance_overlay_mode = PerformanceOverlayMode::from_short_name(value)
+                .ok_or_else(|| "Invalid value for --overlay-mode=".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--overlay-corner=") {
+            self.performance_overlay_corner = PerformanceOverlayCorner::from_short_name(value)
+                .ok_or_else(|| "Invalid value for --overlay-corner=".to_string())?;
         } else if let Some(value) = arg.strip_prefix("--fps-limit=") {
             if value == "off" {
                 self.fps_limit = None;
@@ -833,6 +910,30 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn performance_overlay_options_parse_and_validate() {
+        let mut options = Options::default();
+        assert!(options.performance_overlay_enabled);
+        let default_mode = if cfg!(any(target_os = "android", target_os = "ios")) {
+            PerformanceOverlayMode::Minimal
+        } else {
+            PerformanceOverlayMode::TitleBar
+        };
+        assert_eq!(options.performance_overlay_mode, default_mode);
+        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::TopRight);
+
+        assert!(options.parse_argument("--overlay=off").unwrap());
+        assert!(!options.performance_overlay_enabled);
+        assert!(options.parse_argument("--overlay=on").unwrap());
+        assert!(options.performance_overlay_enabled);
+        assert!(options.parse_argument("--overlay-mode=full").unwrap());
+        assert_eq!(options.performance_overlay_mode, PerformanceOverlayMode::Full);
+        assert!(options.parse_argument("--overlay-corner=bottomleft").unwrap());
+        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::BottomLeft);
+        assert!(options.parse_argument("--overlay-mode=invalid").is_err());
+        assert!(options.parse_argument("--overlay-corner=invalid").is_err());
     }
 
     #[test]

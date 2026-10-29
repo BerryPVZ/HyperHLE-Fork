@@ -317,12 +317,25 @@ Other options:
         argc/argv) rather than processed by touchHLE. This option can't be used
         via touchHLE_options.txt or touchHLE_default_options.txt.
 
+    --overlay=on|off
+        Start the performance display enabled or hidden. It is enabled by
+        default. The mode defaults to Title bar on desktop and Minimal on
+        mobile. F1 toggles it for the current run; F2 moves the on-screen panel
+        clockwise through the four corners. TOUCHHLE_OVERLAY=0 starts hidden,
+        but F1 can still enable it.
+
+    --overlay-mode=full|minimal|titlebar
+        Show all counters and the frame-time graph, only FPS/CPU/GPU/time, or
+        the minimal summary in the desktop window title bar. Unsupported values
+        show N/A; MEM is process resident memory.
+
+    --overlay-corner=topleft|topright|bottomright|bottomleft
+        Choose the saved corner for the on-screen panel. F2 changes the corner
+        for the current run only.
+
     --print-fps
     --no-print-fps
-        Logs the current framerate (FPS) to the console once per second.
-        On desktop, press F1 to toggle the on-screen FPS panel and F2 to move
-        it between screen corners. Mobile builds expose the panel in the app
-        picker.
+        Separately log FPS to the console once per second.
 
     --fps-limit=...
         Modify or disable the framerate (FPS) limit.

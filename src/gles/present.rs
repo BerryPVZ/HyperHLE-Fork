@@ -11,26 +11,12 @@ use super::GLES;
 use crate::matrix::Matrix;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::sync::OnceLock;
-
-const FRAME_HISTORY_SIZE: usize = 48;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct FpsCounter {
     time: Instant,
-    last_frame: Instant,
     frames: u32,
 }
-
-static LAST_FPS_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
-static GLYPH_TEXTURES: OnceLock<Mutex<Option<Vec<u32>>>> = OnceLock::new();
-static ONSCREEN_FPS_ENABLED: AtomicBool = AtomicBool::new(false);
-static ONSCREEN_FPS_CONFIGURED: AtomicBool = AtomicBool::new(false);
-static FRAME_TIME_HISTORY: [AtomicU32; FRAME_HISTORY_SIZE] =
-    [const { AtomicU32::new(0) }; FRAME_HISTORY_SIZE];
-static FRAME_TIME_HISTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
-static OVERLAY_CORNER: AtomicUsize = AtomicUsize::new(0);
 
 // DIAG (TOUCHHLE_STALL_DIAG): epoch-millis of the last presented frame, updated
 // at the top of present_frame. The main run loop reads this to detect a guest
@@ -58,12 +44,8 @@ pub fn ms_since_last_present() -> Option<u64> {
 
 impl FpsCounter {
     pub fn start() -> Self {
-        LAST_FPS_TEXT.get_or_init(|| Mutex::new(String::new()));
-        GLYPH_TEXTURES.get_or_init(|| Mutex::new(None));
-        let now = Instant::now();
         FpsCounter {
-            time: now,
-            last_frame: now,
+            time: Instant::now(),
             frames: 0,
         }
     }
@@ -71,13 +53,6 @@ impl FpsCounter {
     pub fn count_frame(&mut self, label: std::fmt::Arguments<'_>, log_output: bool) {
         self.frames += 1;
         let now = Instant::now();
-        let frame_duration = now.duration_since(self.last_frame).as_secs_f32() * 1000.0;
-        self.last_frame = now;
-        if onscreen_fps_enabled() {
-            let index =
-                FRAME_TIME_HISTORY_INDEX.fetch_add(1, Ordering::Relaxed) % FRAME_HISTORY_SIZE;
-            FRAME_TIME_HISTORY[index].store(frame_duration.to_bits(), Ordering::Relaxed);
-        }
         let duration = now - self.time;
         if duration >= Duration::from_secs(1) {
             self.time = now;
@@ -87,54 +62,16 @@ impl FpsCounter {
             if log_output {
                 echo!("touchHLE: {} FPS: {:.2}", label, fps);
             }
-            if onscreen_fps_enabled() {
-                let text = format!("FPS {:.1}", fps);
-                if let Some(mutex) = LAST_FPS_TEXT.get() {
-                    if let Ok(mut s) = mutex.lock() {
-                        *s = text;
-                    }
-                }
-            }
         }
     }
 }
 
 pub fn onscreen_fps_enabled() -> bool {
-    if ONSCREEN_FPS_CONFIGURED.load(Ordering::SeqCst) {
-        ONSCREEN_FPS_ENABLED.load(Ordering::SeqCst)
-    } else {
-        crate::env_flag_cached!("TOUCHHLE_ONSCREEN_FPS")
-    }
-}
-
-pub fn set_onscreen_fps_enabled(enabled: bool) {
-    let was_enabled = onscreen_fps_enabled();
-    ONSCREEN_FPS_ENABLED.store(enabled, Ordering::SeqCst);
-    ONSCREEN_FPS_CONFIGURED.store(true, Ordering::SeqCst);
-    if enabled && !was_enabled {
-        for sample in &FRAME_TIME_HISTORY {
-            sample.store(0, Ordering::Relaxed);
-        }
-        FRAME_TIME_HISTORY_INDEX.store(0, Ordering::Relaxed);
-        if let Some(text) = LAST_FPS_TEXT.get() {
-            if let Ok(mut text) = text.lock() {
-                text.clear();
-            }
-        }
-    }
+    crate::gles::perf_overlay::enabled()
 }
 
 pub fn cycle_onscreen_fps_corner() -> &'static str {
-    let corner = OVERLAY_CORNER
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1)
-        % 4;
-    match corner {
-        0 => "top-left",
-        1 => "top-right",
-        2 => "bottom-right",
-        _ => "bottom-left",
-    }
+    crate::gles::perf_overlay::cycle_corner()
 }
 
 /// Present the the latest frame (e.g. the app's splash screen or rendering
@@ -267,399 +204,12 @@ pub unsafe fn present_frame(
     }
 
     if onscreen_fps_enabled() {
-        if let Some(mutex) = LAST_FPS_TEXT.get() {
-            if let Ok(text) = mutex.lock() {
-                if !text.is_empty() {
-                    draw_onscreen_panel(gles, viewport, &text);
-                }
-            }
-        }
+        crate::gles::perf_overlay::draw(gles, viewport);
     }
 
     // Cheat Engine-style trainer overlay (floating button + panel). Drawn
-    // last so it sits on top of everything, including the FPS overlay.
+    // last so it sits on top of everything, including the performance display.
     crate::trainer_ui::draw(gles, viewport);
 
     gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
-}
-
-// --- Tiny bitmap font & overlay drawing implementation ---
-const GLYPH_W: u32 = 8;
-const GLYPH_H: u32 = 8;
-
-const GLYPH_CHARS: &str = "0123456789:.FPSM";
-// Each glyph is 8 bytes, each bit is a pixel (MSB left).
-const GLYPH_BITMAPS: &[[u8; 8]] = &[
-    // 0
-    [0x3C, 0x66, 0x6E, 0x7E, 0x76, 0x66, 0x3C, 0x00],
-    // 1
-    [0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00],
-    // 2
-    [0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00],
-    // 3
-    [0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00],
-    // 4
-    [0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x1E, 0x00],
-    // 5
-    [0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00],
-    // 6
-    [0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00],
-    // 7
-    [0x7E, 0x66, 0x0C, 0x18, 0x18, 0x18, 0x18, 0x00],
-    // 8
-    [0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00],
-    // 9
-    [0x3C, 0x66, 0x66, 0x3E, 0x06, 0x66, 0x3C, 0x00],
-    // : (colon)
-    [0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00],
-    // . (dot)
-    [0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00],
-    // F
-    [0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00],
-    // P
-    [0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00],
-    // S
-    [0x3C, 0x66, 0x30, 0x1C, 0x06, 0x66, 0x3C, 0x00],
-    // M
-    [0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00],
-];
-
-fn glyph_index(ch: char) -> Option<usize> {
-    GLYPH_CHARS.chars().position(|c| c == ch)
-}
-
-unsafe fn ensure_glyph_textures(gles: &mut dyn GLES) -> Option<Vec<u32>> {
-    use gles11::types::*;
-    let lock = GLYPH_TEXTURES.get().unwrap().lock().unwrap();
-    if lock.is_some() {
-        return lock.clone();
-    }
-    drop(lock);
-
-    let mut guard = GLYPH_TEXTURES.get().unwrap().lock().unwrap();
-    if guard.is_some() {
-        return guard.clone();
-    }
-
-    let count = GLYPH_BITMAPS.len();
-    let mut texs = Vec::with_capacity(count);
-    for i in 0..count {
-        let mut tex: GLuint = 0;
-        gles.GenTextures(1, &mut tex);
-        gles.BindTexture(gles11::TEXTURE_2D, tex);
-        // Build RGBA data from bitmap
-        let mut data = vec![0u8; (GLYPH_W * GLYPH_H * 4) as usize];
-        let bmp = GLYPH_BITMAPS[i];
-        for y in 0..GLYPH_H {
-            let row = bmp[y as usize];
-            for x in 0..GLYPH_W {
-                let bit = (row >> (7 - x)) & 1;
-                let idx = ((y * GLYPH_W + x) * 4) as usize;
-                if bit != 0 {
-                    data[idx] = 255; // R
-                    data[idx + 1] = 255;
-                    data[idx + 2] = 255;
-                    data[idx + 3] = 255; // A
-                } else {
-                    data[idx] = 0;
-                    data[idx + 1] = 0;
-                    data[idx + 2] = 0;
-                    data[idx + 3] = 0;
-                }
-            }
-        }
-        gles.TexImage2D(
-            gles11::TEXTURE_2D,
-            0,
-            gles11::RGBA as _,
-            GLYPH_W as _,
-            GLYPH_H as _,
-            0,
-            gles11::RGBA,
-            gles11::UNSIGNED_BYTE,
-            data.as_ptr() as *const _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_MIN_FILTER,
-            gles11::NEAREST as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_MAG_FILTER,
-            gles11::NEAREST as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_WRAP_S,
-            gles11::CLAMP_TO_EDGE as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_WRAP_T,
-            gles11::CLAMP_TO_EDGE as _,
-        );
-        texs.push(tex);
-    }
-    *guard = Some(texs.clone());
-    Some(texs)
-}
-
-unsafe fn draw_onscreen_panel(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), fps_text: &str) {
-    use gles11::types::*;
-
-    let (_, _, viewport_width, viewport_height) = viewport;
-    if viewport_width < 24 || viewport_height < 24 {
-        return;
-    }
-
-    let scale = if viewport_width >= 240 && viewport_height >= 80 {
-        2.0
-    } else {
-        1.0
-    };
-    let desired_width: f32 = if scale == 2.0 { 240.0 } else { 180.0 };
-    let panel_width = desired_width.min(viewport_width.saturating_sub(16) as f32);
-    let panel_height = if scale == 2.0 { 64.0 } else { 42.0 };
-    let margin = 8.0;
-    let corner = OVERLAY_CORNER.load(Ordering::Relaxed) % 4;
-    let panel_x = if corner == 1 || corner == 2 {
-        (viewport_width as f32 - panel_width - margin).max(0.0)
-    } else {
-        margin
-    };
-    let panel_y = if corner >= 2 {
-        (viewport_height as f32 - panel_height - margin).max(0.0)
-    } else {
-        margin
-    };
-    let font_scale = scale;
-    let glyph_width = GLYPH_W as f32 * font_scale;
-    let glyph_height = GLYPH_H as f32 * font_scale;
-    let fps = fps_text
-        .strip_prefix("FPS ")
-        .and_then(|value| value.parse::<f32>().ok())
-        .unwrap_or(0.0);
-    let latest_sample = FRAME_TIME_HISTORY_INDEX.load(Ordering::Relaxed);
-    let frame_ms = if latest_sample == 0 {
-        0.0
-    } else {
-        f32::from_bits(
-            FRAME_TIME_HISTORY[(latest_sample - 1) % FRAME_HISTORY_SIZE].load(Ordering::Relaxed),
-        )
-    };
-    let color = if fps >= 50.0 {
-        [0.28, 0.92, 0.56]
-    } else if fps >= 30.0 {
-        [1.0, 0.72, 0.28]
-    } else {
-        [1.0, 0.34, 0.34]
-    };
-
-    let mut old_active_texture: GLint = 0;
-    gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut old_active_texture);
-    let mut old_texture: GLint = 0;
-    gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
-    let mut old_matrix_mode: GLint = 0;
-    gles.GetIntegerv(gles11::MATRIX_MODE, &mut old_matrix_mode);
-    let mut old_blend_src: GLint = 0;
-    let mut old_blend_dst: GLint = 0;
-    gles.GetIntegerv(gles11::BLEND_SRC, &mut old_blend_src);
-    gles.GetIntegerv(gles11::BLEND_DST, &mut old_blend_dst);
-    let old_blend = gles.IsEnabled(gles11::BLEND);
-    let old_texture_2d = gles.IsEnabled(gles11::TEXTURE_2D);
-    let mut old_vertex_array: GLboolean = gles11::FALSE;
-    let mut old_texture_array: GLboolean = gles11::FALSE;
-    gles.GetBooleanv(gles11::VERTEX_ARRAY, &mut old_vertex_array);
-    gles.GetBooleanv(gles11::TEXTURE_COORD_ARRAY, &mut old_texture_array);
-
-    let Some(textures) = ensure_glyph_textures(gles) else {
-        gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
-        gles.ActiveTexture(old_active_texture as _);
-        return;
-    };
-
-    gles.MatrixMode(gles11::PROJECTION);
-    gles.PushMatrix();
-    gles.LoadIdentity();
-    gles.Orthof(
-        0.0,
-        viewport_width as _,
-        viewport_height as _,
-        0.0,
-        -1.0,
-        1.0,
-    );
-    gles.MatrixMode(gles11::MODELVIEW);
-    gles.PushMatrix();
-    gles.LoadIdentity();
-    gles.EnableClientState(gles11::VERTEX_ARRAY);
-    gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
-    gles.Disable(gles11::TEXTURE_2D);
-    gles.Enable(gles11::BLEND);
-    gles.BlendFunc(gles11::SRC_ALPHA, gles11::ONE_MINUS_SRC_ALPHA);
-
-    let panel_vertices = [
-        panel_x,
-        panel_y,
-        panel_x + panel_width,
-        panel_y,
-        panel_x,
-        panel_y + panel_height,
-        panel_x + panel_width,
-        panel_y + panel_height,
-    ];
-    gles.VertexPointer(
-        2,
-        gles11::FLOAT,
-        0,
-        panel_vertices.as_ptr() as *const GLvoid,
-    );
-    gles.Color4f(0.025, 0.035, 0.055, 0.88);
-    gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
-
-    let accent_vertices = [
-        panel_x,
-        panel_y,
-        panel_x + 3.0,
-        panel_y,
-        panel_x,
-        panel_y + panel_height,
-        panel_x + 3.0,
-        panel_y + panel_height,
-    ];
-    gles.VertexPointer(
-        2,
-        gles11::FLOAT,
-        0,
-        accent_vertices.as_ptr() as *const GLvoid,
-    );
-    gles.Color4f(color[0], color[1], color[2], 1.0);
-    gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
-
-    let graph_width = (panel_width - 122.0).clamp(0.0, 54.0);
-    let graph_height = panel_height - 22.0;
-    let graph_x = panel_x + panel_width - graph_width - 10.0;
-    let graph_y = panel_y + (panel_height - graph_height) / 2.0;
-    if graph_width >= 30.0 {
-        let graph_bg = [
-            graph_x,
-            graph_y,
-            graph_x + graph_width,
-            graph_y,
-            graph_x,
-            graph_y + graph_height,
-            graph_x + graph_width,
-            graph_y + graph_height,
-        ];
-        gles.VertexPointer(2, gles11::FLOAT, 0, graph_bg.as_ptr() as *const GLvoid);
-        gles.Color4f(0.12, 0.15, 0.19, 0.9);
-        gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
-
-        let mut bars = [0.0f32; FRAME_HISTORY_SIZE * 12];
-        let mut vertices = 0usize;
-        let next_sample = FRAME_TIME_HISTORY_INDEX.load(Ordering::Relaxed);
-        let bar_width = graph_width / FRAME_HISTORY_SIZE as f32;
-        for column in 0..FRAME_HISTORY_SIZE {
-            let sample = f32::from_bits(
-                FRAME_TIME_HISTORY[(next_sample + column) % FRAME_HISTORY_SIZE]
-                    .load(Ordering::Relaxed),
-            );
-            if sample <= 0.0 {
-                continue;
-            }
-            let height = (sample / 40.0).clamp(0.06, 1.0) * (graph_height - 2.0);
-            let left = graph_x + column as f32 * bar_width;
-            let right = left + (bar_width - 0.35).max(0.5);
-            let bottom = graph_y + graph_height - 1.0;
-            let top = bottom - height;
-            bars[vertices..vertices + 12].copy_from_slice(&[
-                left, top, left, bottom, right, top, right, top, left, bottom, right, bottom,
-            ]);
-            vertices += 12;
-        }
-        if vertices > 0 {
-            gles.VertexPointer(2, gles11::FLOAT, 0, bars.as_ptr() as *const GLvoid);
-            gles.Color4f(color[0], color[1], color[2], 0.95);
-            gles.DrawArrays(gles11::TRIANGLES, 0, (vertices / 2) as _);
-        }
-    }
-
-    gles.Enable(gles11::TEXTURE_2D);
-    gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
-    let texture_coords: [f32; 8] = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0];
-    let mut draw_text = |text: &str, x: f32, y: f32, tint: [f32; 4]| {
-        gles.Color4f(tint[0], tint[1], tint[2], tint[3]);
-        let mut x_px = x;
-        for ch in text.chars() {
-            if let Some(index) = glyph_index(ch) {
-                gles.BindTexture(gles11::TEXTURE_2D, textures[index]);
-                let x1 = x_px + glyph_width;
-                let y1 = y + glyph_height;
-                let vertices = [x_px, y, x_px, y1, x1, y, x1, y1];
-                gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
-                gles.TexCoordPointer(
-                    2,
-                    gles11::FLOAT,
-                    0,
-                    texture_coords.as_ptr() as *const GLvoid,
-                );
-                gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
-                x_px += glyph_width + 2.0;
-            } else {
-                x_px += glyph_width / 2.0;
-            }
-        }
-    };
-
-    draw_text(
-        fps_text,
-        panel_x + 10.0,
-        panel_y + if scale == 2.0 { 8.0 } else { 5.0 },
-        [color[0], color[1], color[2], 1.0],
-    );
-    draw_text(
-        &format!("{frame_ms:.1} MS"),
-        panel_x + 10.0,
-        panel_y + if scale == 2.0 { 34.0 } else { 21.0 },
-        [0.78, 0.82, 0.88, 1.0],
-    );
-    drop(draw_text);
-
-    gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
-    gles.ActiveTexture(old_active_texture as _);
-    if old_blend != gles11::TRUE {
-        gles.Disable(gles11::BLEND);
-    }
-    if old_texture_2d != gles11::TRUE {
-        gles.Disable(gles11::TEXTURE_2D);
-    }
-    if old_vertex_array != gles11::TRUE {
-        gles.DisableClientState(gles11::VERTEX_ARRAY);
-    }
-    if old_texture_array != gles11::TRUE {
-        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
-    }
-    gles.BlendFunc(old_blend_src as _, old_blend_dst as _);
-    gles.MatrixMode(gles11::MODELVIEW);
-    gles.PopMatrix();
-    gles.MatrixMode(gles11::PROJECTION);
-    gles.PopMatrix();
-    gles.MatrixMode(old_matrix_mode as _);
-}
-
-#[cfg(test)]
-mod overlay_tests {
-    use super::*;
-
-    #[test]
-    fn overlay_corner_cycles_in_clockwise_order() {
-        let start = OVERLAY_CORNER.load(Ordering::SeqCst);
-        OVERLAY_CORNER.store(0, Ordering::SeqCst);
-        assert_eq!(cycle_onscreen_fps_corner(), "top-right");
-        assert_eq!(cycle_onscreen_fps_corner(), "bottom-right");
-        assert_eq!(cycle_onscreen_fps_corner(), "bottom-left");
-        assert_eq!(cycle_onscreen_fps_corner(), "top-left");
-        OVERLAY_CORNER.store(start, Ordering::SeqCst);
-    }
 }

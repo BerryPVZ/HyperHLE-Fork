@@ -22,13 +22,12 @@ use crate::gles::{
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::Options;
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::surface::Surface;
 use sdl2_sys::SDL_PowerState;
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::f32::consts::{FRAC_PI_2, PI};
@@ -938,9 +937,6 @@ pub struct Window {
     virtual_cursor_last: Option<(f32, f32, bool, bool)>,
     virtual_cursor_last_unsticky: Option<(f32, f32, Instant)>,
     virtual_accelerometer_last: Option<(f32, f32, bool)>,
-    show_fps_counter: Cell<bool>,
-    fps_frame_count: Cell<u32>,
-    fps_last_log: RefCell<Instant>,
     /// Host scheduling / power-management hints for the emulator thread
     /// (Android). Fed once per presented frame from [Window::swap_window].
     perf_hints: crate::perf_hints::PerfHints,
@@ -949,6 +945,14 @@ pub struct Window {
     /// certain SDL functions (that call JNI functions) are on the main
     /// stack on Android.
     pub(super) on_main_stack: bool,
+}
+
+fn base_window_title() -> String {
+    if crate::branding().is_empty() {
+        format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
+    } else {
+        format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
+    }
 }
 
 impl Window {
@@ -1005,6 +1009,7 @@ impl Window {
         launch_image: Option<(Image, bool)>,
         options: &Options,
     ) -> Result<Window, String> {
+        crate::gles::perf_overlay::configure_from_options(options);
         #[cfg(target_os = "android")]
         {
             let angle_unavailable = ANDROID_ANGLE_UNAVAILABLE.load(Ordering::Relaxed);
@@ -1351,9 +1356,6 @@ impl Window {
             virtual_cursor_last: None,
             virtual_cursor_last_unsticky: None,
             virtual_accelerometer_last: None,
-            show_fps_counter: Cell::new(options.print_fps),
-            fps_frame_count: Cell::new(0),
-            fps_last_log: RefCell::new(Instant::now()),
             perf_hints: crate::perf_hints::PerfHints::new(
                 options.perf_hints,
                 options
@@ -2087,7 +2089,7 @@ impl Window {
                 } => {
                     let enabled = !crate::gles::present::onscreen_fps_enabled();
                     self.set_show_fps_counter(enabled);
-                    echo!("FPS overlay {}", if enabled { "enabled" } else { "disabled" });
+                    echo!("Performance display {}", if enabled { "enabled" } else { "disabled" });
                     continue;
                 }
                 E::KeyDown {
@@ -2096,7 +2098,7 @@ impl Window {
                     ..
                 } => {
                     let corner = crate::gles::present::cycle_onscreen_fps_corner();
-                    echo!("FPS overlay moved to {corner}");
+                    echo!("Performance display moved to {corner}");
                     continue;
                 }
                 E::KeyDown {
@@ -2668,37 +2670,11 @@ impl Window {
     pub fn swap_window(&mut self) {
         self.window.gl_swap_window();
         self.perf_hints.frame_presented();
+        crate::gles::perf_overlay::record_host_present();
 
-        // FPS logging / UI: count frames and print once per second if enabled.
-        if self.show_fps_counter.get() {
-            // Increment frame count.
-            let frames = self.fps_frame_count.get().saturating_add(1);
-            self.fps_frame_count.set(frames);
-
-            let now = Instant::now();
-            // Borrow last log time
-            let mut last = self.fps_last_log.borrow_mut();
-            let elapsed = now.duration_since(*last);
-            if elapsed >= Duration::from_secs(1) {
-                // Compute FPS (frames in elapsed duration)
-                let fps = (frames as f32) / (elapsed.as_secs_f32().max(1e-6));
-                // Log to stdout / echo
-                echo!("FPS: {:.1}", fps);
-                // Reset counters
-                *last = now;
-                self.fps_frame_count.set(0);
-
-                // Also show FPS in the window title so it's visible when the
-                // app is running fullscreen or without console.
-                let base_title = if crate::branding().is_empty() {
-                    format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
-                } else {
-                    format!("{} {} {}", crate::DISPLAY_NAME, crate::branding(), crate::VERSION)
-                };
-                let title = format!("{} - FPS: {:.1}", base_title, fps);
-                // Ignore any error setting the title.
-                let _ = self.window.set_title(&title);
-            }
+        if let Some(summary) = crate::gles::perf_overlay::take_title_bar_summary() {
+            let title = format!("{} - {}", base_window_title(), summary);
+            let _ = self.window.set_title(&title);
         }
     }
 
@@ -3010,12 +2986,23 @@ impl Window {
         self.on_main_stack
     }
 
-    /// Toggle FPS counter at runtime.
     pub fn set_show_fps_counter(&mut self, enabled: bool) {
-        self.show_fps_counter.set(enabled);
-        // Also enable the on-screen FPS overlay so runtime toggles apply to
-        // the graphical overlay as well as the window title/console logging.
-        crate::gles::present::set_onscreen_fps_enabled(enabled);
+        crate::gles::perf_overlay::set_enabled(enabled);
+        if !enabled || crate::gles::perf_overlay::mode() != crate::options::PerformanceOverlayMode::TitleBar {
+            let _ = self.window.set_title(&base_window_title());
+        }
+    }
+
+    pub fn set_performance_overlay_settings(
+        &mut self,
+        enabled: bool,
+        mode: PerformanceOverlayMode,
+        corner: PerformanceOverlayCorner,
+    ) {
+        crate::gles::perf_overlay::configure(enabled, mode, corner);
+        if !enabled || mode != PerformanceOverlayMode::TitleBar {
+            let _ = self.window.set_title(&base_window_title());
+        }
     }
 }
 

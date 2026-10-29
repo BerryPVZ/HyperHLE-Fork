@@ -1,0 +1,1000 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+use super::gles11_raw as gles11;
+use super::GLES;
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+const PANEL_WIDTH: usize = 390;
+const PANEL_HEIGHT: usize = 194;
+const MINIMAL_WIDTH: usize = 300;
+const MINIMAL_HEIGHT: usize = 48;
+const FONT_WIDTH: usize = 5;
+const FONT_HEIGHT: usize = 7;
+const FONT_SCALE: usize = 2;
+const CELL_WIDTH: usize = 12;
+const LINE_HEIGHT: usize = 18;
+const HISTORY_SIZE: usize = 128;
+const PIXEL_BYTES: usize = PANEL_WIDTH * PANEL_HEIGHT * 4;
+
+static ENABLED: AtomicBool = AtomicBool::new(true);
+static MODE: AtomicUsize = AtomicUsize::new(2);
+static CORNER: AtomicUsize = AtomicUsize::new(1);
+static GUEST_FLIPS: AtomicU64 = AtomicU64::new(0);
+static HOST_PRESENTS: AtomicU64 = AtomicU64::new(0);
+static GUEST_DRAWS: AtomicU64 = AtomicU64::new(0);
+static LAST_GUEST_FRAME_NS: AtomicU64 = AtomicU64::new(0);
+static SESSION_START_NS: AtomicU64 = AtomicU64::new(0);
+static HISTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
+static FRAME_MILLISECONDS: [AtomicU32; HISTORY_SIZE] = [const { AtomicU32::new(0) }; HISTORY_SIZE];
+static PROCESS_ORIGIN: OnceLock<Instant> = OnceLock::new();
+static OVERLAY_TEXTURE: AtomicU32 = AtomicU32::new(0);
+static PIXELS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
+
+struct Stats {
+    window_start: Instant,
+    previous_cpu_seconds: Option<f64>,
+    fps: f64,
+    present_fps: f64,
+    draws_per_second: f64,
+    cpu_percent: Option<f64>,
+    resident_memory_mb: Option<u64>,
+    frame_label: String,
+    elapsed: String,
+    full_lines: [String; 6],
+    minimal_lines: [String; 2],
+    title_summary: String,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            previous_cpu_seconds: process_cpu_seconds(),
+            fps: 0.0,
+            present_fps: 0.0,
+            draws_per_second: 0.0,
+            cpu_percent: None,
+            resident_memory_mb: resident_memory_mb(),
+            frame_label: "0.0 MS".to_string(),
+            elapsed: "00:00:00".to_string(),
+            full_lines: [
+                "FPS 0.0 PRES 0.0 0.0 MS".to_string(),
+                "DRAWS 0/S 0/F Q N/A".to_string(),
+                "ALLOC N/A MB/S GC N/A".to_string(),
+                "MEM N/A BUF N/A IMG N/A".to_string(),
+                "CPU N/A GPU N/A".to_string(),
+                "TIME 00:00:00 VKALLOC N/A".to_string(),
+            ],
+            minimal_lines: [
+                "FPS 0.0 CPU N/A".to_string(),
+                "GPU N/A TIME 00:00:00".to_string(),
+            ],
+            title_summary: "FPS 0.0 | CPU N/A | GPU N/A | TIME 00:00:00".to_string(),
+        }
+    }
+}
+
+fn origin() -> Instant {
+    *PROCESS_ORIGIN.get_or_init(Instant::now)
+}
+
+fn process_elapsed_ns() -> u64 {
+    origin().elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn session_elapsed_seconds() -> u64 {
+    process_elapsed_ns().saturating_sub(SESSION_START_NS.load(Ordering::Relaxed)) / 1_000_000_000
+}
+
+fn stats() -> &'static Mutex<Stats> {
+    STATS.get_or_init(|| Mutex::new(Stats::new()))
+}
+
+fn reset_session() {
+    let now = process_elapsed_ns();
+    SESSION_START_NS.store(now, Ordering::Relaxed);
+    GUEST_FLIPS.store(0, Ordering::Relaxed);
+    HOST_PRESENTS.store(0, Ordering::Relaxed);
+    GUEST_DRAWS.store(0, Ordering::Relaxed);
+    LAST_GUEST_FRAME_NS.store(0, Ordering::Relaxed);
+    HISTORY_INDEX.store(0, Ordering::Relaxed);
+    for sample in &FRAME_MILLISECONDS {
+        sample.store(0, Ordering::Relaxed);
+    }
+    if let Ok(mut current) = stats().lock() {
+        *current = Stats::new();
+    }
+}
+
+fn reset_measurements() {
+    GUEST_FLIPS.store(0, Ordering::Relaxed);
+    HOST_PRESENTS.store(0, Ordering::Relaxed);
+    GUEST_DRAWS.store(0, Ordering::Relaxed);
+    LAST_GUEST_FRAME_NS.store(0, Ordering::Relaxed);
+    HISTORY_INDEX.store(0, Ordering::Relaxed);
+    for sample in &FRAME_MILLISECONDS {
+        sample.store(0, Ordering::Relaxed);
+    }
+    if let Ok(mut current) = stats().lock() {
+        *current = Stats::new();
+    }
+}
+
+pub fn hidden_by_environment() -> bool {
+    std::env::var("TOUCHHLE_OVERLAY")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(false)
+}
+
+pub fn configure_from_options(options: &Options) {
+    let enabled = (options.performance_overlay_enabled
+        || crate::env_flag_cached!("TOUCHHLE_ONSCREEN_FPS"))
+        && !hidden_by_environment();
+    configure(
+        enabled,
+        options.performance_overlay_mode,
+        options.performance_overlay_corner,
+    );
+}
+
+pub fn configure(enabled: bool, mode: PerformanceOverlayMode, corner: PerformanceOverlayCorner) {
+    ENABLED.store(enabled, Ordering::Relaxed);
+    MODE.store(mode_index(mode), Ordering::Relaxed);
+    CORNER.store(corner_index(corner), Ordering::Relaxed);
+    reset_session();
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_enabled(enabled: bool) {
+    if ENABLED.swap(enabled, Ordering::Relaxed) != enabled && enabled {
+        reset_measurements();
+    }
+}
+
+pub fn mode() -> PerformanceOverlayMode {
+    match MODE.load(Ordering::Relaxed) {
+        0 => PerformanceOverlayMode::Full,
+        1 => PerformanceOverlayMode::Minimal,
+        _ => PerformanceOverlayMode::TitleBar,
+    }
+}
+
+pub fn corner() -> PerformanceOverlayCorner {
+    match CORNER.load(Ordering::Relaxed) {
+        0 => PerformanceOverlayCorner::TopLeft,
+        1 => PerformanceOverlayCorner::TopRight,
+        2 => PerformanceOverlayCorner::BottomRight,
+        _ => PerformanceOverlayCorner::BottomLeft,
+    }
+}
+
+pub fn cycle_corner() -> &'static str {
+    let corner = CORNER.fetch_add(1, Ordering::Relaxed).wrapping_add(1) % 4;
+    match corner {
+        0 => "top-left",
+        1 => "top-right",
+        2 => "bottom-right",
+        _ => "bottom-left",
+    }
+}
+
+fn mode_index(mode: PerformanceOverlayMode) -> usize {
+    match mode {
+        PerformanceOverlayMode::Full => 0,
+        PerformanceOverlayMode::Minimal => 1,
+        PerformanceOverlayMode::TitleBar => 2,
+    }
+}
+
+fn corner_index(corner: PerformanceOverlayCorner) -> usize {
+    match corner {
+        PerformanceOverlayCorner::TopLeft => 0,
+        PerformanceOverlayCorner::TopRight => 1,
+        PerformanceOverlayCorner::BottomRight => 2,
+        PerformanceOverlayCorner::BottomLeft => 3,
+    }
+}
+
+pub fn record_guest_flip() {
+    if !enabled() {
+        return;
+    }
+    let now = process_elapsed_ns();
+    let session_start = SESSION_START_NS.load(Ordering::Relaxed);
+    if session_start == 0 {
+        SESSION_START_NS.store(now, Ordering::Relaxed);
+    }
+    let last = LAST_GUEST_FRAME_NS.swap(now, Ordering::Relaxed);
+    if last != 0 && now > last {
+        let index = HISTORY_INDEX.fetch_add(1, Ordering::Relaxed) % HISTORY_SIZE;
+        let milliseconds = (now - last) as f32 / 1_000_000.0;
+        FRAME_MILLISECONDS[index].store(milliseconds.to_bits(), Ordering::Relaxed);
+    }
+    GUEST_FLIPS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_host_present() {
+    if enabled() {
+        HOST_PRESENTS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub fn record_draw() {
+    if enabled() {
+        GUEST_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn refresh_stats(stats: &mut Stats) -> bool {
+    let now = Instant::now();
+    let elapsed = now.duration_since(stats.window_start).as_secs_f64();
+    if elapsed < 1.0 {
+        return false;
+    }
+    stats.window_start = now;
+    stats.fps = GUEST_FLIPS.swap(0, Ordering::Relaxed) as f64 / elapsed;
+    stats.present_fps = HOST_PRESENTS.swap(0, Ordering::Relaxed) as f64 / elapsed;
+    stats.draws_per_second = GUEST_DRAWS.swap(0, Ordering::Relaxed) as f64 / elapsed;
+
+    let cpu_now = process_cpu_seconds();
+    stats.cpu_percent = match (cpu_now, stats.previous_cpu_seconds) {
+        (Some(now), Some(previous)) => Some(
+            (((now - previous).max(0.0) / elapsed)
+                / std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(1) as f64
+                * 100.0)
+                .clamp(0.0, 100.0),
+        ),
+        _ => None,
+    };
+    stats.previous_cpu_seconds = cpu_now;
+    stats.resident_memory_mb = resident_memory_mb();
+    let gpu = gpu_percent_label();
+
+    let history_index = HISTORY_INDEX.load(Ordering::Relaxed);
+    let last_frame_ms = if history_index == 0 {
+        0.0
+    } else {
+        f32::from_bits(
+            FRAME_MILLISECONDS[(history_index - 1) % HISTORY_SIZE].load(Ordering::Relaxed),
+        ) as f64
+    };
+    if stats.fps > 0.0 {
+        stats.frame_label = format!(
+            "{:.1} MS",
+            if last_frame_ms > 0.0 {
+                last_frame_ms
+            } else {
+                1000.0 / stats.fps
+            }
+        );
+    } else {
+        let last_guest = LAST_GUEST_FRAME_NS.load(Ordering::Relaxed);
+        let now_ns = process_elapsed_ns();
+        if last_guest != 0 && now_ns > last_guest {
+            stats.frame_label = format!(
+                "STALL {:.1}S",
+                (now_ns - last_guest) as f64 / 1_000_000_000.0
+            );
+        } else if stats.present_fps > 0.0 {
+            stats.frame_label = format!("{:.1} MS", 1000.0 / stats.present_fps);
+        } else {
+            stats.frame_label = "0.0 MS".to_string();
+        }
+    }
+
+    let seconds = session_elapsed_seconds();
+    stats.elapsed = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        (seconds / 60) % 60,
+        seconds % 60
+    );
+    let cpu = stats
+        .cpu_percent
+        .map_or_else(|| "N/A".to_string(), |value| format!("{value:.0}%"));
+    let memory = stats
+        .resident_memory_mb
+        .map_or_else(|| "N/A".to_string(), |value| format!("{value}M"));
+    let draws_per_frame = if stats.fps > 0.0 {
+        stats.draws_per_second / stats.fps
+    } else {
+        0.0
+    };
+    stats.full_lines = [
+        format!(
+            "FPS {:.1}  PRES {:.1}  {}",
+            stats.fps, stats.present_fps, stats.frame_label
+        ),
+        format!(
+            "DRAWS {:.0}/S  {:.0}/F  Q N/A",
+            stats.draws_per_second, draws_per_frame
+        ),
+        "ALLOC N/A MB/S  GC N/A".to_string(),
+        format!("MEM {}  BUF N/A  IMG N/A", memory),
+        format!("CPU {}  GPU {}", cpu, gpu),
+        format!("TIME {}  VKALLOC N/A", stats.elapsed),
+    ];
+    stats.minimal_lines = [
+        format!("FPS {:.1}  CPU {}", stats.fps, cpu),
+        format!("GPU {}  TIME {}", gpu, stats.elapsed),
+    ];
+    stats.title_summary = format!(
+        "FPS {:.1} | CPU {} | GPU {} | TIME {}",
+        stats.fps, cpu, gpu, stats.elapsed
+    );
+    true
+}
+
+pub fn take_title_bar_summary() -> Option<String> {
+    if !enabled() || mode() != PerformanceOverlayMode::TitleBar {
+        return None;
+    }
+    let mut stats = stats().lock().ok()?;
+    refresh_stats(&mut stats).then(|| stats.title_summary.clone())
+}
+
+pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
+    use gles11::types::*;
+
+    if !enabled() || mode() == PerformanceOverlayMode::TitleBar {
+        return;
+    }
+    let selected_mode = mode();
+    let (display_width, display_height) = if selected_mode == PerformanceOverlayMode::Full {
+        (PANEL_WIDTH, PANEL_HEIGHT)
+    } else {
+        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+    };
+    let (_, _, viewport_width, viewport_height) = viewport;
+    let horizontal_margin = 12.min(viewport_width as usize / 2);
+    let vertical_margin = 12.min(viewport_height as usize / 2);
+    let width = (viewport_width as usize)
+        .saturating_sub(2 * horizontal_margin)
+        .min(display_width);
+    let height = (viewport_height as usize)
+        .saturating_sub(2 * vertical_margin)
+        .min(display_height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let selected_corner = corner();
+    let left = if matches!(
+        selected_corner,
+        PerformanceOverlayCorner::TopRight | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_width as usize - horizontal_margin - width
+    } else {
+        horizontal_margin
+    };
+    let top = if matches!(
+        selected_corner,
+        PerformanceOverlayCorner::BottomLeft | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_height as usize - vertical_margin - height
+    } else {
+        vertical_margin
+    };
+
+    let Ok(mut stats) = stats().lock() else {
+        return;
+    };
+    refresh_stats(&mut stats);
+    let Ok(mut pixels) = PIXELS
+        .get_or_init(|| Mutex::new(vec![0; PIXEL_BYTES]))
+        .lock()
+    else {
+        return;
+    };
+    fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+
+    let mut old_active_texture: GLint = 0;
+    gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut old_active_texture);
+    gles.ActiveTexture(gles11::TEXTURE0);
+    let mut old_texture: GLint = 0;
+    gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
+    let mut old_matrix_mode: GLint = 0;
+    gles.GetIntegerv(gles11::MATRIX_MODE, &mut old_matrix_mode);
+    let mut old_vertex_array: GLboolean = gles11::FALSE;
+    let mut old_texture_array: GLboolean = gles11::FALSE;
+    gles.GetBooleanv(gles11::VERTEX_ARRAY, &mut old_vertex_array);
+    gles.GetBooleanv(gles11::TEXTURE_COORD_ARRAY, &mut old_texture_array);
+    let old_blend = gles.IsEnabled(gles11::BLEND);
+    let old_texture_2d = gles.IsEnabled(gles11::TEXTURE_2D);
+    let old_overlay_caps = [
+        (gles11::SCISSOR_TEST, gles.IsEnabled(gles11::SCISSOR_TEST)),
+        (gles11::DEPTH_TEST, gles.IsEnabled(gles11::DEPTH_TEST)),
+        (gles11::CULL_FACE, gles.IsEnabled(gles11::CULL_FACE)),
+        (gles11::STENCIL_TEST, gles.IsEnabled(gles11::STENCIL_TEST)),
+    ];
+    let mut old_color = [0.0; 4];
+    gles.GetFloatv(gles11::CURRENT_COLOR, old_color.as_mut_ptr());
+    let mut old_array_buffer: GLint = 0;
+    gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
+    let mut old_vertex_size: GLint = 0;
+    let mut old_vertex_type: GLint = 0;
+    let mut old_vertex_stride: GLint = 0;
+    let mut old_vertex_pointer: *const GLvoid = std::ptr::null();
+    gles.GetIntegerv(gles11::VERTEX_ARRAY_SIZE, &mut old_vertex_size);
+    gles.GetIntegerv(gles11::VERTEX_ARRAY_TYPE, &mut old_vertex_type);
+    gles.GetIntegerv(gles11::VERTEX_ARRAY_STRIDE, &mut old_vertex_stride);
+    gles.GetPointerv(gles11::VERTEX_ARRAY_POINTER, &mut old_vertex_pointer);
+    let mut old_texcoord_size: GLint = 0;
+    let mut old_texcoord_type: GLint = 0;
+    let mut old_texcoord_stride: GLint = 0;
+    let mut old_texcoord_pointer: *const GLvoid = std::ptr::null();
+    gles.GetIntegerv(gles11::TEXTURE_COORD_ARRAY_SIZE, &mut old_texcoord_size);
+    gles.GetIntegerv(gles11::TEXTURE_COORD_ARRAY_TYPE, &mut old_texcoord_type);
+    gles.GetIntegerv(gles11::TEXTURE_COORD_ARRAY_STRIDE, &mut old_texcoord_stride);
+    gles.GetPointerv(
+        gles11::TEXTURE_COORD_ARRAY_POINTER,
+        &mut old_texcoord_pointer,
+    );
+
+    let mut texture = OVERLAY_TEXTURE.load(Ordering::Relaxed);
+    if texture == 0 {
+        gles.GenTextures(1, &mut texture);
+        OVERLAY_TEXTURE.store(texture, Ordering::Relaxed);
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+        gles.TexImage2D(
+            gles11::TEXTURE_2D,
+            0,
+            gles11::RGBA as _,
+            PANEL_WIDTH as _,
+            PANEL_HEIGHT as _,
+            0,
+            gles11::RGBA,
+            gles11::UNSIGNED_BYTE,
+            std::ptr::null(),
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MIN_FILTER,
+            gles11::NEAREST as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_MAG_FILTER,
+            gles11::NEAREST as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_S,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+        gles.TexParameteri(
+            gles11::TEXTURE_2D,
+            gles11::TEXTURE_WRAP_T,
+            gles11::CLAMP_TO_EDGE as _,
+        );
+    } else {
+        gles.BindTexture(gles11::TEXTURE_2D, texture);
+    }
+    gles.TexSubImage2D(
+        gles11::TEXTURE_2D,
+        0,
+        0,
+        0,
+        PANEL_WIDTH as _,
+        PANEL_HEIGHT as _,
+        gles11::RGBA,
+        gles11::UNSIGNED_BYTE,
+        pixels.as_ptr() as *const GLvoid,
+    );
+
+    gles.MatrixMode(gles11::PROJECTION);
+    gles.PushMatrix();
+    gles.LoadIdentity();
+    gles.Orthof(
+        0.0,
+        viewport_width as _,
+        viewport_height as _,
+        0.0,
+        -1.0,
+        1.0,
+    );
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.PushMatrix();
+    gles.LoadIdentity();
+    gles.EnableClientState(gles11::VERTEX_ARRAY);
+    gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
+    gles.Enable(gles11::TEXTURE_2D);
+    gles.Disable(gles11::BLEND);
+    gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    for (capability, _) in &old_overlay_caps {
+        gles.Disable(*capability);
+    }
+    let x0 = left as f32;
+    let y0 = top as f32;
+    let x1 = x0 + width as f32;
+    let y1 = y0 + height as f32;
+    let u1 = width as f32 / PANEL_WIDTH as f32;
+    let v1 = height as f32 / PANEL_HEIGHT as f32;
+    let vertices = [x0, y0, x1, y0, x0, y1, x1, y1];
+    let texcoords = [0.0, 0.0, u1, 0.0, 0.0, v1, u1, v1];
+    gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
+
+    gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
+    gles.TexCoordPointer(2, gles11::FLOAT, 0, texcoords.as_ptr() as *const GLvoid);
+    gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
+
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer as _);
+    gles.VertexPointer(
+        old_vertex_size,
+        old_vertex_type as _,
+        old_vertex_stride,
+        old_vertex_pointer,
+    );
+    gles.TexCoordPointer(
+        old_texcoord_size,
+        old_texcoord_type as _,
+        old_texcoord_stride,
+        old_texcoord_pointer,
+    );
+    gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
+
+    for (capability, was_enabled) in old_overlay_caps {
+        if was_enabled == gles11::TRUE {
+            gles.Enable(capability);
+        }
+    }
+
+    gles.BindTexture(gles11::TEXTURE_2D, old_texture as _);
+    if old_blend == gles11::TRUE {
+        gles.Enable(gles11::BLEND);
+    } else {
+        gles.Disable(gles11::BLEND);
+    }
+    if old_texture_2d != gles11::TRUE {
+        gles.Disable(gles11::TEXTURE_2D);
+    }
+    if old_vertex_array != gles11::TRUE {
+        gles.DisableClientState(gles11::VERTEX_ARRAY);
+    }
+    if old_texture_array != gles11::TRUE {
+        gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
+    }
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.PopMatrix();
+    gles.MatrixMode(gles11::PROJECTION);
+    gles.PopMatrix();
+    gles.MatrixMode(old_matrix_mode as _);
+    gles.ActiveTexture(old_active_texture as _);
+}
+
+fn fill_pixels(
+    buffer: &mut [u8],
+    stats: &Stats,
+    mode: PerformanceOverlayMode,
+    display_width: usize,
+) {
+    for pixel in buffer.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[0x14, 0x18, 0x20, 0xFF]);
+    }
+    if mode == PerformanceOverlayMode::Full {
+        let colors = [
+            [0x60, 0xFF, 0x60],
+            [0xFF, 0xFF, 0xFF],
+            [0xB0, 0xD0, 0xFF],
+            [0xB0, 0xB0, 0xB0],
+            [0xB0, 0xB0, 0xB0],
+            [0xFF, 0xD0, 0x80],
+        ];
+        for (index, line) in stats.full_lines.iter().enumerate() {
+            draw_string(
+                buffer,
+                8,
+                6 + index * LINE_HEIGHT,
+                line,
+                colors[index],
+                display_width,
+            );
+        }
+        draw_frame_graph(buffer, 8, 118, PANEL_WIDTH - 16, PANEL_HEIGHT - 124);
+    } else {
+        draw_string(
+            buffer,
+            8,
+            6,
+            &stats.minimal_lines[0],
+            [0x60, 0xFF, 0x60],
+            display_width,
+        );
+        draw_string(
+            buffer,
+            8,
+            6 + LINE_HEIGHT,
+            &stats.minimal_lines[1],
+            [0xFF, 0xD0, 0x80],
+            display_width,
+        );
+    }
+}
+
+fn draw_frame_graph(buffer: &mut [u8], x: usize, y: usize, width: usize, height: usize) {
+    if height < 8 {
+        return;
+    }
+    draw_horizontal_line(
+        buffer,
+        x,
+        y + height - (16.7 / 40.0 * height as f64) as usize,
+        width,
+        [0x30, 0x60, 0x30],
+    );
+    draw_horizontal_line(
+        buffer,
+        x,
+        y + height - (33.3 / 40.0 * height as f64) as usize,
+        width,
+        [0x30, 0x30, 0x60],
+    );
+    let bar_width = (width / HISTORY_SIZE).max(1);
+    let history_index = HISTORY_INDEX.load(Ordering::Relaxed);
+    for column in 0..HISTORY_SIZE {
+        let milliseconds = f32::from_bits(
+            FRAME_MILLISECONDS[(history_index + column) % HISTORY_SIZE].load(Ordering::Relaxed),
+        ) as f64;
+        if milliseconds <= 0.0 {
+            continue;
+        }
+        let bar_height = (milliseconds / 40.0 * height as f64).min(height as f64) as usize;
+        let bar_x = x + column * bar_width;
+        if bar_x + bar_width > x + width {
+            break;
+        }
+        let color = if milliseconds <= 17.5 {
+            [0x40, 0xE0, 0x40]
+        } else if milliseconds <= 34.0 {
+            [0xE0, 0xC0, 0x30]
+        } else {
+            [0xE8, 0x40, 0x40]
+        };
+        for row in 0..bar_height {
+            for pixel_x in 0..bar_width {
+                set_pixel(buffer, bar_x + pixel_x, y + height - 1 - row, color);
+            }
+        }
+    }
+}
+
+fn draw_horizontal_line(buffer: &mut [u8], x: usize, y: usize, width: usize, color: [u8; 3]) {
+    for pixel_x in 0..width {
+        set_pixel(buffer, x + pixel_x, y, color);
+    }
+}
+
+fn draw_string(
+    buffer: &mut [u8],
+    x: usize,
+    y: usize,
+    text: &str,
+    color: [u8; 3],
+    display_width: usize,
+) {
+    let mut pen_x = x;
+    for character in text.bytes() {
+        let rows = glyph_rows(character.to_ascii_uppercase());
+        for (row_index, bits) in rows.iter().enumerate() {
+            for column in 0..FONT_WIDTH {
+                if bits & (1 << (FONT_WIDTH - 1 - column)) == 0 {
+                    continue;
+                }
+                for scale_y in 0..FONT_SCALE {
+                    for scale_x in 0..FONT_SCALE {
+                        set_pixel(
+                            buffer,
+                            pen_x + column * FONT_SCALE + scale_x,
+                            y + row_index * FONT_SCALE + scale_y,
+                            color,
+                        );
+                    }
+                }
+            }
+        }
+        pen_x += CELL_WIDTH;
+        if pen_x + CELL_WIDTH > display_width {
+            break;
+        }
+    }
+}
+
+fn glyph_rows(character: u8) -> [u8; FONT_HEIGHT] {
+    match character {
+        b'A' => [14, 17, 17, 31, 17, 17, 17],
+        b'B' => [30, 17, 17, 30, 17, 17, 30],
+        b'C' => [14, 17, 16, 16, 16, 17, 14],
+        b'D' => [30, 17, 17, 17, 17, 17, 30],
+        b'E' => [31, 16, 16, 30, 16, 16, 31],
+        b'F' => [31, 16, 16, 30, 16, 16, 16],
+        b'G' => [14, 17, 16, 23, 17, 17, 15],
+        b'I' => [14, 4, 4, 4, 4, 4, 14],
+        b'K' => [17, 18, 20, 24, 20, 18, 17],
+        b'L' => [16, 16, 16, 16, 16, 16, 31],
+        b'M' => [17, 27, 21, 21, 17, 17, 17],
+        b'N' => [17, 25, 21, 19, 17, 17, 17],
+        b'O' => [14, 17, 17, 17, 17, 17, 14],
+        b'P' => [30, 17, 17, 30, 16, 16, 16],
+        b'Q' => [14, 17, 17, 17, 21, 18, 13],
+        b'R' => [30, 17, 17, 30, 20, 18, 17],
+        b'S' => [15, 16, 16, 14, 1, 1, 30],
+        b'T' => [31, 4, 4, 4, 4, 4, 4],
+        b'U' => [17, 17, 17, 17, 17, 17, 14],
+        b'V' => [17, 17, 17, 17, 17, 10, 4],
+        b'W' => [17, 17, 17, 21, 21, 21, 10],
+        b'0' => [14, 17, 19, 21, 25, 17, 14],
+        b'1' => [4, 12, 4, 4, 4, 4, 14],
+        b'2' => [14, 17, 1, 2, 4, 8, 31],
+        b'3' => [30, 1, 1, 14, 1, 1, 30],
+        b'4' => [2, 6, 10, 18, 31, 2, 2],
+        b'5' => [31, 16, 16, 30, 1, 1, 30],
+        b'6' => [14, 16, 16, 30, 17, 17, 14],
+        b'7' => [31, 1, 2, 4, 8, 8, 8],
+        b'8' => [14, 17, 17, 14, 17, 17, 14],
+        b'9' => [14, 17, 17, 15, 1, 1, 14],
+        b':' => [0, 4, 4, 0, 4, 4, 0],
+        b'.' => [0, 0, 0, 0, 0, 4, 4],
+        b'/' => [1, 2, 4, 8, 16, 0, 0],
+        b'%' => [17, 2, 4, 8, 17, 0, 0],
+        b'|' => [4, 4, 4, 4, 4, 4, 4],
+        b'+' => [0, 4, 4, 31, 4, 4, 0],
+        _ => [0; FONT_HEIGHT],
+    }
+}
+
+fn set_pixel(buffer: &mut [u8], x: usize, y: usize, color: [u8; 3]) {
+    if x >= PANEL_WIDTH || y >= PANEL_HEIGHT {
+        return;
+    }
+    let offset = (y * PANEL_WIDTH + x) * 4;
+    buffer[offset] = color[0];
+    buffer[offset + 1] = color[1];
+    buffer[offset + 2] = color[2];
+    buffer[offset + 3] = 0xFF;
+}
+
+#[cfg(unix)]
+fn process_cpu_seconds() -> Option<f64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let time = |value: libc::timeval| value.tv_sec as f64 + value.tv_usec as f64 / 1_000_000.0;
+    Some(time(usage.ru_utime) + time(usage.ru_stime))
+}
+
+#[cfg(target_os = "windows")]
+fn process_cpu_seconds() -> Option<f64> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    if unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    let ticks = |time: FILETIME| ((time.dwHighDateTime as u64) << 32) | time.dwLowDateTime as u64;
+    Some((ticks(kernel) + ticks(user)) as f64 / 10_000_000.0)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn process_cpu_seconds() -> Option<f64> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn resident_memory_mb() -> Option<u64> {
+    let resident_pages = std::fs::read_to_string("/proc/self/statm")
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    (page_size > 0).then(|| resident_pages * page_size as u64 / (1024 * 1024))
+}
+
+#[cfg(target_os = "windows")]
+fn resident_memory_mb() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = PROCESS_MEMORY_COUNTERS::default();
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) } == 0 {
+        return None;
+    }
+    Some(counters.WorkingSetSize as u64 / (1024 * 1024))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+fn resident_memory_mb() -> Option<u64> {
+    None
+}
+
+fn gpu_percent_label() -> String {
+    let value = gpu_percent();
+    request_gpu_sample();
+    value.map_or_else(|| "N/A".to_string(), |percent| format!("{percent:.0}%"))
+}
+
+#[cfg(target_os = "windows")]
+static GPU_PERCENT_BITS: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+#[cfg(target_os = "windows")]
+static GPU_SAMPLE_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static GPU_QUERY: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_os = "windows")]
+static GPU_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(target_os = "windows")]
+fn gpu_percent() -> Option<f64> {
+    let value = f64::from_bits(GPU_PERCENT_BITS.load(Ordering::Relaxed));
+    value.is_finite().then_some(value)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn gpu_percent() -> Option<f64> {
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn request_gpu_sample() {
+    if GPU_SAMPLE_PENDING
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("touchHLE-GPU-meter".to_string())
+        .spawn(|| {
+            let value = collect_gpu_sample().unwrap_or(f64::NAN);
+            GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
+            GPU_SAMPLE_PENDING.store(false, Ordering::Relaxed);
+        })
+        .is_err()
+    {
+        GPU_SAMPLE_PENDING.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn request_gpu_sample() {}
+
+#[cfg(target_os = "windows")]
+fn collect_gpu_sample() -> Option<f64> {
+    use windows_sys::Win32::System::Performance::{
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
+        PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+        PDH_MORE_DATA,
+    };
+
+    let query_handle = GPU_QUERY.load(Ordering::Relaxed);
+    let counter_handle = GPU_COUNTER.load(Ordering::Relaxed);
+    let (query, counter) = if query_handle == 0 {
+        let mut query: PDH_HQUERY = std::ptr::null_mut();
+        if unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) } != 0 {
+            return None;
+        }
+        let path = format!(
+            "\\GPU Engine(pid_{}_*)\\Utilization Percentage",
+            std::process::id()
+        );
+        let path: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut counter: PDH_HCOUNTER = std::ptr::null_mut();
+        if unsafe { PdhAddEnglishCounterW(query, path.as_ptr(), 0, &mut counter) } != 0 {
+            unsafe { PdhCloseQuery(query) };
+            return None;
+        }
+        if unsafe { PdhCollectQueryData(query) } != 0 {
+            unsafe { PdhCloseQuery(query) };
+            return None;
+        }
+        GPU_COUNTER.store(counter as usize, Ordering::Relaxed);
+        GPU_QUERY.store(query as usize, Ordering::Relaxed);
+        return None;
+    } else {
+        (query_handle as PDH_HQUERY, counter_handle as PDH_HCOUNTER)
+    };
+
+    if unsafe { PdhCollectQueryData(query) } != 0 {
+        return None;
+    }
+    let mut buffer_bytes = 0u32;
+    let mut item_count = 0u32;
+    let status = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buffer_bytes,
+            &mut item_count,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != PDH_MORE_DATA || buffer_bytes == 0 {
+        return None;
+    }
+    let item_size = std::mem::size_of::<PDH_FMT_COUNTERVALUE_ITEM_W>();
+    if buffer_bytes as usize % item_size != 0 {
+        return None;
+    }
+    let capacity = buffer_bytes as usize / item_size;
+    let mut items = vec![PDH_FMT_COUNTERVALUE_ITEM_W::default(); capacity];
+    let status = unsafe {
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_DOUBLE,
+            &mut buffer_bytes,
+            &mut item_count,
+            items.as_mut_ptr(),
+        )
+    };
+    if status != 0 || item_count as usize > items.len() {
+        return None;
+    }
+    let mut maximum: Option<f64> = None;
+    for item in &items[..item_count as usize] {
+        if item.FmtValue.CStatus > 1 {
+            continue;
+        }
+        let value = unsafe { item.FmtValue.Anonymous.doubleValue };
+        if value.is_finite() && value >= 0.0 {
+            maximum = Some(
+                maximum
+                    .map_or(value, |current| current.max(value))
+                    .min(100.0),
+            );
+        }
+    }
+    maximum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corner_cycle_matches_sharpemu_clockwise_order() {
+        let saved = CORNER.swap(0, Ordering::Relaxed);
+        assert_eq!(cycle_corner(), "top-right");
+        assert_eq!(cycle_corner(), "bottom-right");
+        assert_eq!(cycle_corner(), "bottom-left");
+        assert_eq!(cycle_corner(), "top-left");
+        CORNER.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn text_font_covers_all_overlay_labels() {
+        let text = "FPS | PRES MS DRAWS S F Q N/A ALLOC MB GC MEM BUF IMG CPU GPU TIME VKALLOC STALL 0123456789";
+        assert!(text
+            .bytes()
+            .all(|character| glyph_rows(character.to_ascii_uppercase())
+                .iter()
+                .any(|row| *row != 0)
+                || character == b' '));
+    }
+}

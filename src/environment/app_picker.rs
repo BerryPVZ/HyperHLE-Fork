@@ -37,7 +37,7 @@ use crate::fs::BundleData;
 use crate::image::Image;
 use crate::mem::Ptr;
 use crate::objc::{id, msg, msg_class, nil, objc_classes, release, ClassExports, HostObject};
-use crate::options::Options;
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
@@ -384,6 +384,8 @@ struct AppPickerDelegateHostObject {
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
     show_fps: Option<bool>,
+    overlay_mode: Option<PerformanceOverlayMode>,
+    overlay_corner: Option<PerformanceOverlayCorner>,
     cheat_engine: Option<bool>,
     trace_gl_errors: Option<bool>,
     preserve_aspect_ratio: Option<bool>,
@@ -421,6 +423,8 @@ struct PickerSettings {
     gles_native: bool,
     force_composition: bool,
     show_fps: bool,
+    overlay_mode: PerformanceOverlayMode,
+    overlay_corner: PerformanceOverlayCorner,
     trace_gl_errors: bool,
     cheat_engine: bool,
     network: bool,
@@ -440,7 +444,9 @@ impl PickerSettings {
             show_lock_screen: true,
             gles_native,
             force_composition: options.force_composition,
-            show_fps: options.print_fps,
+            show_fps: options.performance_overlay_enabled,
+            overlay_mode: options.performance_overlay_mode,
+            overlay_corner: options.performance_overlay_corner,
             trace_gl_errors: options.trace_gl_errors,
             cheat_engine: quick_options_trainer_enabled(options),
             network: options.network_access,
@@ -479,6 +485,16 @@ impl PickerSettings {
                 "gles_native" => set_bool(value, &mut settings.gles_native),
                 "force_composition" => set_bool(value, &mut settings.force_composition),
                 "show_fps" => set_bool(value, &mut settings.show_fps),
+                "overlay_mode" => {
+                    if let Some(mode) = PerformanceOverlayMode::from_short_name(value) {
+                        settings.overlay_mode = mode;
+                    }
+                }
+                "overlay_corner" => {
+                    if let Some(corner) = PerformanceOverlayCorner::from_short_name(value) {
+                        settings.overlay_corner = corner;
+                    }
+                }
                 "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "network" => set_bool(value, &mut settings.network),
@@ -512,6 +528,8 @@ impl PickerSettings {
              gles_native={}\n\
              force_composition={}\n\
              show_fps={}\n\
+             overlay_mode={}\n\
+             overlay_corner={}\n\
              trace_gl_errors={}\n\
              cheat_engine={}\n\
              network={}\n\
@@ -526,6 +544,8 @@ impl PickerSettings {
             self.gles_native,
             self.force_composition,
             self.show_fps,
+            self.overlay_mode.short_name(),
+            self.overlay_corner.short_name(),
             self.trace_gl_errors,
             self.cheat_engine,
             self.network,
@@ -721,19 +741,31 @@ const CLASSES: ClassExports = objc_classes! {
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).gles_native = Some(switch_state);
 }
+- (())overlayModeFull {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_mode = Some(PerformanceOverlayMode::Full);
+}
+- (())overlayModeMinimal {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_mode = Some(PerformanceOverlayMode::Minimal);
+}
+- (())overlayModeTitleBar {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_mode = Some(PerformanceOverlayMode::TitleBar);
+}
+- (())overlayCornerTopLeft {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::TopLeft);
+}
+- (())overlayCornerTopRight {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::TopRight);
+}
+- (())overlayCornerBottomRight {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::BottomRight);
+}
+- (())overlayCornerBottomLeft {
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).overlay_corner = Some(PerformanceOverlayCorner::BottomLeft);
+}
 - (())showFPS:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).show_fps = Some(switch_state);
-    // Immediately reflect the runtime change so users see the overlay without
-    // having to re-launch or wait for the option to be applied.
-    // SAFETY: calling into the runtime-level API is safe from the UI thread.
-    if switch_state {
-        std::env::set_var("TOUCHHLE_ONSCREEN_FPS", "1");
-        crate::gles::present::set_onscreen_fps_enabled(true);
-    } else {
-        std::env::remove_var("TOUCHHLE_ONSCREEN_FPS");
-        crate::gles::present::set_onscreen_fps_enabled(false);
-    }
+    env.window_mut().set_show_fps_counter(switch_state);
 }
 - (())cheatEngine:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1061,12 +1093,16 @@ fn app_picker_inner(
         .set_preserve_aspect_ratio(picker_settings.preserve_aspect_ratio);
     let quick_options_gles_native_switch_enabled = angle_backend_available;
     let show_fullscreen_row = !crate::window::Window::rotatable_fullscreen();
+    let overlay_hidden_by_environment = crate::gles::perf_overlay::hidden_by_environment();
+    let initial_quick_options_show_fps =
+        picker_settings.show_fps && !overlay_hidden_by_environment;
     let settings = setup_settings(
         env,
         delegate,
         main_view,
         app_frame,
         &picker_settings,
+        initial_quick_options_show_fps,
         quick_options_gles_native_switch_enabled,
         show_fullscreen_row,
     );
@@ -1075,7 +1111,9 @@ fn app_picker_inner(
     let mut quick_options_orientation = picker_settings.orientation;
     let mut quick_options_analog_stick_tilt_controls = picker_settings.analog_stick_tilt_controls;
     let mut quick_options_network = picker_settings.network;
-    let mut quick_options_show_fps = picker_settings.show_fps;
+    let mut quick_options_show_fps = initial_quick_options_show_fps;
+    let mut quick_options_overlay_mode = picker_settings.overlay_mode;
+    let mut quick_options_overlay_corner = picker_settings.overlay_corner;
     let mut quick_options_trace_gl_errors = picker_settings.trace_gl_errors;
     let mut quick_options_preserve_aspect_ratio = picker_settings.preserve_aspect_ratio;
     let mut quick_options_show_lock_screen = picker_settings.show_lock_screen;
@@ -1094,6 +1132,13 @@ fn app_picker_inner(
 
     update_scale_hack_buttons(env, &settings.scale_hack_buttons, quick_options_scale_hack);
     update_orientation_buttons(env, &settings.orientation_buttons, quick_options_orientation);
+    update_performance_overlay_buttons(
+        env,
+        &settings.overlay_mode_buttons,
+        &settings.overlay_corner_buttons,
+        quick_options_overlay_mode,
+        quick_options_overlay_corner,
+    );
     refresh_dropdown(
         env,
         &settings.device_dropdown,
@@ -1591,6 +1636,35 @@ fn app_picker_inner(
             quick_options_cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
             quick_options_show_fps = enabled;
+            picker_settings.show_fps = enabled;
+        } else if let Some(mode) = std::mem::take(&mut host_obj.overlay_mode) {
+            quick_options_overlay_mode = mode;
+            update_performance_overlay_buttons(
+                env,
+                &settings.overlay_mode_buttons,
+                &settings.overlay_corner_buttons,
+                quick_options_overlay_mode,
+                quick_options_overlay_corner,
+            );
+            env.window_mut().set_performance_overlay_settings(
+                quick_options_show_fps,
+                quick_options_overlay_mode,
+                quick_options_overlay_corner,
+            );
+        } else if let Some(corner) = std::mem::take(&mut host_obj.overlay_corner) {
+            quick_options_overlay_corner = corner;
+            update_performance_overlay_buttons(
+                env,
+                &settings.overlay_mode_buttons,
+                &settings.overlay_corner_buttons,
+                quick_options_overlay_mode,
+                quick_options_overlay_corner,
+            );
+            env.window_mut().set_performance_overlay_settings(
+                quick_options_show_fps,
+                quick_options_overlay_mode,
+                quick_options_overlay_corner,
+            );
         } else if let Some(trace_gl_errors) = std::mem::take(&mut host_obj.trace_gl_errors) {
             quick_options_trace_gl_errors = trace_gl_errors;
         } else if let Some(preserve_aspect_ratio) =
@@ -1650,7 +1724,8 @@ fn app_picker_inner(
         picker_settings.gles_native = quick_options_gles_native;
         picker_settings.force_composition =
             quick_options_force_composition_override.unwrap_or(env.options.force_composition);
-        picker_settings.show_fps = quick_options_show_fps;
+        picker_settings.overlay_mode = quick_options_overlay_mode;
+        picker_settings.overlay_corner = quick_options_overlay_corner;
         picker_settings.trace_gl_errors = quick_options_trace_gl_errors;
         picker_settings.cheat_engine = quick_options_cheat_engine;
         picker_settings.network = quick_options_network;
@@ -1735,12 +1810,23 @@ fn app_picker_inner(
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
 
-    env.window_mut().set_show_fps_counter(quick_options_show_fps);
-    if quick_options_show_fps {
-        option_args.push("--print-fps".to_string());
-    } else {
-        option_args.push("--no-print-fps".to_string());
-    }
+    env.window_mut().set_performance_overlay_settings(
+        quick_options_show_fps,
+        quick_options_overlay_mode,
+        quick_options_overlay_corner,
+    );
+    option_args.push(format!(
+        "--overlay={}",
+        if quick_options_show_fps { "on" } else { "off" }
+    ));
+    option_args.push(format!(
+        "--overlay-mode={}",
+        quick_options_overlay_mode.short_name()
+    ));
+    option_args.push(format!(
+        "--overlay-corner={}",
+        quick_options_overlay_corner.short_name()
+    ));
 
     if let Some(enabled) = quick_options_force_composition_override {
         option_args.push(quick_options_force_composition_argument(enabled).to_string());
@@ -3557,6 +3643,34 @@ fn update_orientation_buttons(
     );
 }
 
+fn update_performance_overlay_buttons(
+    env: &mut Environment,
+    mode_buttons: &[id],
+    corner_buttons: &[id],
+    mode: PerformanceOverlayMode,
+    corner: PerformanceOverlayCorner,
+) {
+    update_segment_buttons(
+        env,
+        mode_buttons,
+        match mode {
+            PerformanceOverlayMode::Full => 0,
+            PerformanceOverlayMode::Minimal => 1,
+            PerformanceOverlayMode::TitleBar => 2,
+        },
+    );
+    update_segment_buttons(
+        env,
+        corner_buttons,
+        match corner {
+            PerformanceOverlayCorner::TopLeft => 0,
+            PerformanceOverlayCorner::TopRight => 1,
+            PerformanceOverlayCorner::BottomRight => 2,
+            PerformanceOverlayCorner::BottomLeft => 3,
+        },
+    );
+}
+
 /// Creates a horizontal row of segment-style buttons inside `parent`.
 fn make_segment_buttons(
     env: &mut Environment,
@@ -3645,6 +3759,8 @@ struct SettingsStuff {
     scroll_origin_y: CGFloat,
     scale_hack_buttons: [id; 5],
     orientation_buttons: [id; 4],
+    overlay_mode_buttons: Vec<id>,
+    overlay_corner_buttons: Vec<id>,
     /// The "Device model" dropdown.
     device_dropdown: SettingsDropdown,
     /// The "Language" dropdown.
@@ -3743,6 +3859,7 @@ fn setup_settings(
     super_view: id,
     app_frame: CGRect,
     picker_settings: &PickerSettings,
+    show_fps: bool,
     gles_native_switch_enabled: bool,
     show_fullscreen_row: bool,
 ) -> SettingsStuff {
@@ -3899,7 +4016,24 @@ fn setup_settings(
             picker_settings.force_composition,
                 true,
             ),
-        SettingsRow::Toggle("Show FPS", "showFPS:", picker_settings.show_fps, true),
+        SettingsRow::Toggle("Performance display", "showFPS:", show_fps, true),
+        SettingsRow::Segmented(
+            "Display mode",
+            &[
+                ("Full", "overlayModeFull"),
+                ("Minimal", "overlayModeMinimal"),
+                ("Title bar", "overlayModeTitleBar"),
+            ],
+        ),
+        SettingsRow::Segmented(
+            "Screen corner",
+            &[
+                ("Top left", "overlayCornerTopLeft"),
+                ("Top right", "overlayCornerTopRight"),
+                ("Bottom right", "overlayCornerBottomRight"),
+                ("Bottom left", "overlayCornerBottomLeft"),
+            ],
+        ),
         SettingsRow::Toggle(
             "Trace GL errors",
             "traceGLErrors:",
@@ -3949,6 +4083,8 @@ fn setup_settings(
     let mut orientation_buttons: Vec<id> = Vec::new();
     let mut device_dropdown: Option<SettingsDropdown> = None;
     let mut language_dropdown: Option<SettingsDropdown> = None;
+    let mut overlay_mode_buttons = Vec::new();
+    let mut overlay_corner_buttons = Vec::new();
     let mut scroll_items: Vec<(id, CGFloat, CGFloat)> = Vec::new();
     // Where the lists of both dropdowns open: just under the navigation bar.
     let menu_origin = CGPoint {
@@ -4008,10 +4144,12 @@ fn setup_settings(
                         rect(side, row_y + 28.0, inner_width - 2.0 * side, 24.0),
                         buttons,
                     );
-                    if buttons[0].1 == "scaleHackDefault" {
-                        scale_hack_buttons = seg_buttons;
-                    } else {
-                        orientation_buttons = seg_buttons;
+                    match buttons[0].1 {
+                        "scaleHackDefault" => scale_hack_buttons = seg_buttons,
+                        "orientationDefault" => orientation_buttons = seg_buttons,
+                        "overlayModeFull" => overlay_mode_buttons = seg_buttons,
+                        "overlayCornerTopLeft" => overlay_corner_buttons = seg_buttons,
+                        _ => unreachable!(),
                     }
                 }
                 SettingsRow::DeviceDropdown => {
@@ -4130,6 +4268,8 @@ fn setup_settings(
         scroll_origin_y: SETTINGS_NAV_BAR_HEIGHT + status_offset,
         scale_hack_buttons: scale_hack_buttons.try_into().unwrap(),
         orientation_buttons: orientation_buttons.try_into().unwrap(),
+        overlay_mode_buttons,
+        overlay_corner_buttons,
         device_dropdown: device_dropdown
             .expect("the settings screen always has a device model row"),
         language_dropdown: language_dropdown

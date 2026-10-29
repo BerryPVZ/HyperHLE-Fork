@@ -1601,6 +1601,7 @@ fn glDrawTexfOES(
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexfOES(x, y, z, width, height)
     })
 }
@@ -1620,6 +1621,7 @@ fn glDrawTexiOES(env: &mut Environment, x: GLint, y: GLint, z: GLint, width: GLi
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexiOES(x, y, z, width, height)
     })
 }
@@ -1646,35 +1648,41 @@ fn glDrawTexxOES(
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexxOES(x, y, z, width, height)
     })
 }
 fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexfvOES(coords) }
     })
 }
 fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexivOES(coords) }
     })
 }
 fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexxvOES(coords) }
     })
 }
 fn glDrawTexsOES(env: &mut Environment, x: i16, y: i16, z: i16, width: i16, height: i16) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexsOES(x, y, z, width, height)
     })
 }
 fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexsvOES(coords) }
     })
 }
@@ -2153,6 +2161,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             gles.Disable(0x0b44); // GL_CULL_FACE
         }
 
+        crate::gles::perf_overlay::record_draw();
         gles.DrawArrays(mode, first, count);
         restore_fog_state_values(gles, fog_state_backup);
         for index in disabled_arrays {
@@ -2411,6 +2420,7 @@ fn glDrawElements(
 
         let indices =
             translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
+        crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
         if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -6726,6 +6736,7 @@ fn glDrawRangeElements(
             let total_bytes = (count as GuestUSize) * bytes_per_index;
             mem.bytes_at(indices.cast(), total_bytes).as_ptr().cast()
         };
+        crate::gles::perf_overlay::record_draw();
         gles.DrawRangeElements(mode, start, end, count, type_, host_ptr)
     });
 }
@@ -6738,6 +6749,7 @@ fn glDrawArraysInstanced(
     instance_count: GLsizei,
 ) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawArraysInstanced(mode, first, count, instance_count)
     });
 }
@@ -6764,6 +6776,7 @@ fn glDrawElementsInstanced(
             let total_bytes = (count as GuestUSize) * bytes_per_index;
             mem.bytes_at(indices.cast(), total_bytes).as_ptr().cast()
         };
+        crate::gles::perf_overlay::record_draw();
         gles.DrawElementsInstanced(mode, count, type_, host_ptr, instance_count)
     });
 }
