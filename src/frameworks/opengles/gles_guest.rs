@@ -52,10 +52,18 @@ const TEXTURE_CUBE_MAP: GLenum = 0x8513;
 const TEXTURE_BINDING_CUBE_MAP: GLenum = 0x8514;
 const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
 const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+const TEXTURE_3D: GLenum = 0x806F;
+const TEXTURE_BINDING_3D: GLenum = 0x806A;
+const TEXTURE_2D_ARRAY: GLenum = 0x8C1A;
+const TEXTURE_BINDING_2D_ARRAY: GLenum = 0x8C1D;
 
 fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
     if target == gles11::TEXTURE_2D {
         Some(gles11::TEXTURE_BINDING_2D)
+    } else if target == TEXTURE_3D {
+        Some(TEXTURE_BINDING_3D)
+    } else if target == TEXTURE_2D_ARRAY {
+        Some(TEXTURE_BINDING_2D_ARRAY)
     } else if target == TEXTURE_CUBE_MAP
         || (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target)
     {
@@ -1017,17 +1025,16 @@ fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
 }
 fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>) {
     if n <= 0 || buffers.is_null() {
-        // Nothing to delete (n < 0 would be GL_INVALID_VALUE on a real
-        // driver; don't turn it into a host-side panic).
         return;
     }
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
-        for i in 0..n_usize {
-            shadow.on_buffers_deleted(mem.read(buffers + i));
+        let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(buffers + i)).collect();
+        for buffer in &deleted {
+            shadow.on_buffers_deleted(*buffer);
         }
-        let buffers = mem.ptr_at(buffers, n_usize);
-        unsafe { gles.DeleteBuffers(n, buffers) }
+        unsafe { gles.DeleteBuffers(n, deleted.as_ptr()) };
+        crate::gles::perf_overlay::delete_gl_buffers(shadow.resource_group_token, &deleted);
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
@@ -1120,7 +1127,7 @@ fn glBufferData(
     data: ConstPtr<GLvoid>,
     usage: GLenum,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
         {
@@ -1148,13 +1155,39 @@ fn glBufferData(
                 log!("BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}", bn, size, floats);
             }
         }
+        let binding = match target {
+            ARRAY_BUFFER => gles11::ARRAY_BUFFER_BINDING,
+            ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
+            0x88EB => 0x88ED,
+            0x88EC => 0x88EF,
+            0x8F36 => 0x8F36,
+            0x8F37 => 0x8F37,
+            0x8A11 => 0x8A28,
+            0x8C8E => 0x8C8F,
+            0x8F3F => 0x8F43,
+            0x90EE => 0x90EF,
+            0x90D2 => 0x90D3,
+            0x92C0 => 0x92C1,
+            _ => 0,
+        };
+        let mut bound_buffer: GLint = 0;
+        if binding != 0 {
+            gles.GetIntegerv(binding, &mut bound_buffer);
+        }
         let data: *const GLvoid = if data.is_null() {
             std::ptr::null()
         } else {
             mem.ptr_at(data.cast::<u8>(), size.try_into().unwrap())
                 .cast()
         };
-        gles.BufferData(target, size as HostGLsizeiptr, data, usage)
+        gles.BufferData(target, size as HostGLsizeiptr, data, usage);
+        if bound_buffer > 0 && size >= 0 {
+            crate::gles::perf_overlay::record_gl_buffer_allocation(
+                shadow.resource_group_token,
+                bound_buffer as GLuint,
+                size as u64,
+            );
+        }
     })
 }
 fn glBufferSubData(
@@ -2729,8 +2762,12 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
         // over it would be undefined behaviour.
         let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(textures + i)).collect();
         unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
-        for texture in deleted {
-            shadow.forget_pvrtc_texture(texture);
+        for texture in &deleted {
+            shadow.forget_pvrtc_texture(*texture);
+            crate::gles::perf_overlay::delete_gl_texture(
+                shadow.resource_group_token,
+                *texture,
+            );
         }
     })
 }
@@ -3009,6 +3046,116 @@ fn image_size_estimate(pixel_count: GuestUSize, format: GLenum, type_: GLenum) -
         GuestUSize::MAX
     })
 }
+fn texture_level_bytes(width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    let bytes_per_pixel = match type_ {
+        gles11::UNSIGNED_BYTE => match format {
+            gles11::ALPHA | gles11::LUMINANCE => Some(1),
+            gles11::LUMINANCE_ALPHA => Some(2),
+            gles11::RGB => Some(3),
+            gles11::RGBA | gles11::BGRA_EXT => Some(4),
+            _ => None,
+        },
+        gles11::UNSIGNED_SHORT_5_6_5
+        | gles11::UNSIGNED_SHORT_4_4_4_4
+        | gles11::UNSIGNED_SHORT_5_5_5_1 => Some(2),
+        _ => None,
+    };
+    bytes_per_pixel.map_or(0, |bytes_per_pixel| {
+        (width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(bytes_per_pixel)
+    })
+}
+
+fn copied_texture_level_bytes(width: GLsizei, height: GLsizei, internalformat: GLenum) -> u64 {
+    texture_storage_level_bytes(width, height, internalformat)
+}
+
+fn texture_storage_bytes_per_pixel(internalformat: GLenum) -> Option<u64> {
+    match internalformat {
+        gles11::ALPHA | gles11::LUMINANCE | 0x8229 | 0x8055 | 0x8F94 => Some(1),
+        gles11::LUMINANCE_ALPHA
+        | 0x822A
+        | 0x822B
+        | 0x822D
+        | 0x8056
+        | 0x8057
+        | 0x8D62
+        | 0x8F95
+        | 0x81A5 => Some(2),
+        gles11::RGB | 0x8051 | 0x8C41 | 0x8F96 => Some(3),
+        gles11::RGBA
+        | 0x8052
+        | 0x8058
+        | 0x8059
+        | 0x8C43
+        | 0x8F97
+        | 0x81A6
+        | 0x81A7
+        | 0x88F0
+        | 0x8CAC
+        | 0x822C
+        | 0x822E
+        | 0x822F => Some(4),
+        0x8053 | 0x8054 | 0x881B => Some(6),
+        0x8230 | 0x805A | 0x805B | 0x881A => Some(8),
+        0x8815 => Some(12),
+        0x8814 => Some(16),
+        0x8CAD => Some(8),
+        _ => None,
+    }
+}
+
+fn texture_storage_level_bytes(width: GLsizei, height: GLsizei, internalformat: GLenum) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    let Some(bytes_per_pixel) = texture_storage_bytes_per_pixel(internalformat) else {
+        return 0;
+    };
+    (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(bytes_per_pixel)
+}
+
+fn texture_storage_volume_bytes(
+    width: GLsizei,
+    height: GLsizei,
+    depth: GLsizei,
+    internalformat: GLenum,
+) -> u64 {
+    if depth <= 0 {
+        return 0;
+    }
+    texture_storage_level_bytes(width, height, internalformat).saturating_mul(depth as u64)
+}
+
+fn compressed_texture_level_bytes(
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+    image_size: usize,
+) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    if let Some(format) = crate::gles::util::PalettedTextureFormat::get_info(internalformat) {
+        let size = texture_level_bytes(
+            width,
+            height,
+            format.palette_entry_format,
+            format.palette_entry_type,
+        );
+        if size > 0 {
+            return size;
+        }
+    }
+    image_size as u64
+}
+
 fn glTexImage2D(
     env: &mut Environment,
     target: GLenum,
@@ -3054,6 +3201,7 @@ fn glTexImage2D(
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
+        let storage_size = texture_level_bytes(width, height, format, type_);
         let pixels = if pixels.is_null() {
             std::ptr::null()
         } else {
@@ -3074,6 +3222,13 @@ fn glTexImage2D(
         );
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
+            crate::gles::perf_overlay::record_gl_image_allocation(
+                shadow.resource_group_token,
+                target,
+                texture,
+                level,
+                storage_size,
+            );
         }
         if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3244,6 +3399,18 @@ fn glCompressedTexImage2D(
                 gles11::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
+            if border == 0 {
+                if let Some(texture) = bound_texture {
+                    crate::gles::perf_overlay::record_gl_image_allocation(
+                        shadow.resource_group_token,
+                        target,
+                        texture,
+                        level,
+                        texture_level_bytes(width, height, gles11::RGBA, gles11::UNSIGNED_BYTE),
+                    );
+                }
+            }
+
             // Record this as a PVRTC level so later glCompressedTexSubImage2D
             // updates (how MCSM actually fills these atlases) take the
             // software-decode-into-RGBA path instead of handing PVRTC bytes to
@@ -3292,6 +3459,13 @@ fn glCompressedTexImage2D(
                             height,
                             internalformat,
                         );
+                        crate::gles::perf_overlay::record_gl_image_allocation(
+                            shadow.resource_group_token,
+                            target,
+                            texture,
+                            level,
+                            texture_level_bytes(width, height, gles11::RGBA, gles11::UNSIGNED_BYTE),
+                        );
                     }
                 }
                 if fix_filter {
@@ -3318,6 +3492,22 @@ fn glCompressedTexImage2D(
         // (visible at default level) but rate-limited per (format, error)
         // pair so a frame-by-frame texture stream can't flood the console.
         let post_err = gles.GetError();
+        if post_err == 0 {
+            if let Some(texture) = bound_texture {
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    compressed_texture_level_bytes(
+                        internalformat,
+                        width,
+                        height,
+                        image_size_usize,
+                    ),
+                );
+            }
+        }
         if post_err != 0 {
             use std::sync::atomic::{AtomicU64, Ordering};
             // Pack (internalformat << 32) | post_err into a single 64-bit
@@ -3382,6 +3572,13 @@ fn glCopyTexImage2D(
         gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
+            crate::gles::perf_overlay::record_gl_image_allocation(
+                shadow.resource_group_token,
+                target,
+                texture,
+                level,
+                copied_texture_level_bytes(width, height, internalformat),
+            );
         }
     })
 }
@@ -6948,12 +7145,9 @@ fn glTexImage3D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        // PIXEL_UNPACK_BUFFER bound: pixels is a buffer offset. Otherwise
-        // it's a guest pointer to a host-readable image.
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let mut buf: GLint = 0;
-        // `GL_PIXEL_UNPACK_BUFFER_BINDING` (0x88EF) is an ES 3.0 / GL 2.1+
-        // enum; not present in our gles11 binding. Use the literal value.
         gles.GetIntegerv(0x88EF, &mut buf);
         let host_pixels: *const GLvoid = if buf != 0 || pixels.is_null() {
             pixels.cast::<u8>().to_bits() as usize as *const GLvoid
@@ -6972,7 +7166,20 @@ fn glTexImage3D(
             format,
             type_,
             host_pixels,
-        )
+        );
+        if border == 0 {
+            if let Some(texture) = bound_texture {
+                let level_bytes = texture_level_bytes(width, height, format, type_)
+                    .saturating_mul(depth.max(0) as u64);
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    level_bytes,
+                );
+            }
+        }
     });
 }
 
@@ -7050,6 +7257,26 @@ fn glTexStorage2D(
         gles.TexStorage2D(target, levels, internalformat, width, height);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture(texture);
+            crate::gles::perf_overlay::clear_gl_image_allocations(
+                shadow.resource_group_token,
+                texture,
+            );
+            let cube_faces = if target == TEXTURE_CUBE_MAP { 6 } else { 1 };
+            let mut level_width = width;
+            let mut level_height = height;
+            for level in 0..levels.max(0) {
+                let size = texture_storage_level_bytes(level_width, level_height, internalformat)
+                    .saturating_mul(cube_faces);
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    size,
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+            }
         }
     });
 }
@@ -7074,8 +7301,39 @@ fn glTexStorage3D(
     height: GLsizei,
     depth: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexStorage3D(target, levels, internalformat, width, height, depth)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.TexStorage3D(target, levels, internalformat, width, height, depth);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture(texture);
+            crate::gles::perf_overlay::clear_gl_image_allocations(
+                shadow.resource_group_token,
+                texture,
+            );
+            let mut level_width = width;
+            let mut level_height = height;
+            let mut level_depth = depth;
+            for level in 0..levels.max(0) {
+                let size = texture_storage_volume_bytes(
+                    level_width,
+                    level_height,
+                    level_depth,
+                    internalformat,
+                );
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    size,
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+                if target == TEXTURE_3D {
+                    level_depth = (level_depth / 2).max(1);
+                }
+            }
+        }
     });
 }
 
@@ -7293,7 +7551,8 @@ fn glCompressedTexImage3D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let data = if data.is_null() {
             std::ptr::null()
         } else {
@@ -7310,7 +7569,18 @@ fn glCompressedTexImage3D(
             border,
             image_size,
             data,
-        )
+        );
+        if border == 0 && image_size > 0 {
+            if let Some(texture) = bound_texture {
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    image_size as u64,
+                );
+            }
+        }
     });
 }
 
@@ -9086,5 +9356,27 @@ mod reversed_attrib_location_tests {
         );
         // A mat4 takes four locations.
         assert_eq!(reversed_attrib_locations(&[(0, 4), (4, 1)]), [1, 0]);
+    }
+}
+
+#[cfg(test)]
+mod performance_texture_size_tests {
+    use super::{texture_level_bytes, texture_storage_level_bytes, texture_storage_volume_bytes};
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn estimates_common_texture_storage_formats() {
+        assert_eq!(
+            texture_level_bytes(10, 10, gles11::RGBA, gles11::UNSIGNED_BYTE),
+            400
+        );
+        assert_eq!(texture_storage_level_bytes(16, 8, 0x8058), 512);
+        assert_eq!(
+            texture_storage_level_bytes(16, 8, gles11::RGB565_OES),
+            256
+        );
+        assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
+        assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
+        assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
     }
 }

@@ -135,9 +135,8 @@ impl PresentMode {
 /// (`--vsync=`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VsyncMode {
-    /// Android: off (the emulator paces frames itself and the Android
-    /// compositor already synchronises to the display, so a blocking swap only
-    /// adds stalls). Other platforms: leave the driver's default alone.
+    /// Android: synchronize swaps to the display. Other platforms: leave the
+    /// driver's default alone.
     Auto,
     /// Swap interval 1: every swap waits for the next vertical refresh.
     On,

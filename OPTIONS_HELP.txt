@@ -328,7 +328,10 @@ Other options:
         Show all counters and the frame-time graph, only FPS/CPU/GPU/time, or
         the minimal summary in the desktop window title bar. On Android/iOS,
         titlebar falls back to Minimal because the OS has no window title bar.
-        Unsupported values show N/A; MEM is process resident memory.
+        Metrics unavailable from the host remain N/A; MEM is process resident
+        memory. Q DIRECT and GLALLOC describe HyperHLE's GLES path, not Vulkan.
+        GC stays 0/0/0 because the Rust runtime has no garbage collector. Android
+        GPU load is read from vendor kernel counters when the app can access them.
 
     --overlay-corner=topleft|topright|bottomright|bottomleft
         Choose the saved corner for the on-screen panel. F2 changes the corner
@@ -397,11 +400,10 @@ Other options:
         Whether presenting a frame waits for the display's vertical refresh.
         One of:
 
-        'auto' (default): on Android, off — HyperHLE paces frames itself (see
-        --fps-limit) and the Android compositor is synchronised to the display
-        anyway, so a blocking swap can only stall the emulator (a frame that
-        takes slightly longer than one refresh then costs two, i.e. 60 FPS
-        becomes 30 FPS). On other systems the driver's default is left alone.
+        'auto' (default): on Android, synchronize swaps to the display; on
+        Android 11 and newer, the surface also requests 60 Hz to match the
+        default --fps-limit. On other systems the driver's default is left
+        alone.
 
         'on': every swap waits for the next refresh (swap interval 1).
 

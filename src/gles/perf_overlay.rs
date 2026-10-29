@@ -6,6 +6,7 @@
 use super::gles11_raw as gles11;
 use super::GLES;
 use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -41,6 +42,7 @@ static ES1_TEXTURE: Mutex<Option<CachedTexture>> = Mutex::new(None);
 static ES2_TEXTURE: Mutex<Option<CachedTexture>> = Mutex::new(None);
 static PIXELS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
+static GUEST_RESOURCES: OnceLock<Mutex<GuestResourceTracker>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct CachedTexture {
@@ -49,10 +51,111 @@ struct CachedTexture {
     pixel_version: u64,
 }
 
+#[derive(Default)]
+struct GuestResourceTracker {
+    group_references: HashMap<usize, usize>,
+    buffers: HashMap<(usize, u32), u64>,
+    images: HashMap<(usize, u32, u32, i32), u64>,
+    buffer_bytes: u64,
+    image_bytes: u64,
+    live_allocations: u64,
+    peak_allocations: u64,
+}
+
+impl GuestResourceTracker {
+    fn register_context(&mut self, group: usize) {
+        *self.group_references.entry(group).or_default() += 1;
+    }
+
+    fn unregister_context(&mut self, group: usize) {
+        let remove_group = match self.group_references.get_mut(&group) {
+            Some(references) if *references > 1 => {
+                *references -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if !remove_group {
+            return;
+        }
+        self.group_references.remove(&group);
+        self.buffers.retain(|(owner, _), _| *owner != group);
+        self.images.retain(|(owner, _, _, _), _| *owner != group);
+        self.buffer_bytes = self.buffers.values().copied().fold(0, u64::saturating_add);
+        self.image_bytes = self.images.values().copied().fold(0, u64::saturating_add);
+        self.update_live_allocations();
+    }
+
+    fn set_buffer_size(&mut self, group: usize, buffer: u32, size: u64) {
+        if group == 0 || buffer == 0 {
+            return;
+        }
+        let key = (group, buffer);
+        let previous = if size == 0 {
+            self.buffers.remove(&key).unwrap_or(0)
+        } else {
+            self.buffers.insert(key, size).unwrap_or(0)
+        };
+        self.buffer_bytes = self.buffer_bytes.saturating_sub(previous).saturating_add(size);
+        self.update_live_allocations();
+    }
+
+    fn delete_buffer(&mut self, group: usize, buffer: u32) {
+        let previous = self.buffers.remove(&(group, buffer)).unwrap_or(0);
+        self.buffer_bytes = self.buffer_bytes.saturating_sub(previous);
+        self.update_live_allocations();
+    }
+
+    fn set_image_size(&mut self, group: usize, target: u32, texture: u32, level: i32, size: u64) {
+        if group == 0 || texture == 0 || level < 0 || size == 0 {
+            return;
+        }
+        let key = (group, target, texture, level);
+        let previous = self.images.insert(key, size).unwrap_or(0);
+        self.image_bytes = self.image_bytes.saturating_sub(previous).saturating_add(size);
+        self.update_live_allocations();
+    }
+
+    fn clear_texture_storage(&mut self, group: usize, texture: u32) {
+        let mut removed = 0u64;
+        self.images.retain(|(owner, _, name, _), size| {
+            if *owner == group && *name == texture {
+                removed = removed.saturating_add(*size);
+                false
+            } else {
+                true
+            }
+        });
+        self.image_bytes = self.image_bytes.saturating_sub(removed);
+        self.update_live_allocations();
+    }
+
+    fn delete_texture(&mut self, group: usize, texture: u32) {
+        self.clear_texture_storage(group, texture);
+    }
+
+    fn update_live_allocations(&mut self) {
+        self.live_allocations = self.buffers.len().saturating_add(self.images.len()) as u64;
+        self.peak_allocations = self.peak_allocations.max(self.live_allocations);
+    }
+
+    fn totals(&self) -> (u64, u64, u64, u64) {
+        (
+            self.buffer_bytes,
+            self.image_bytes,
+            self.live_allocations,
+            self.peak_allocations,
+        )
+    }
+}
+
 struct Stats {
     window_start: Instant,
     previous_cpu_seconds: Option<f64>,
+    previous_allocated_bytes: u64,
     logical_processors: usize,
+    allocated_mib_per_second: f64,
     fps: f64,
     present_fps: f64,
     draws_per_second: f64,
@@ -70,7 +173,9 @@ impl Stats {
         Self {
             window_start: Instant::now(),
             previous_cpu_seconds: process_cpu_seconds(),
+            previous_allocated_bytes: crate::allocated_bytes_total(),
             logical_processors: logical_processor_count(),
+            allocated_mib_per_second: 0.0,
             fps: 0.0,
             present_fps: 0.0,
             draws_per_second: 0.0,
@@ -80,11 +185,11 @@ impl Stats {
             elapsed: "00:00:00".to_string(),
             full_lines: [
                 "FPS 0.0 PRES 0.0 0.0 MS".to_string(),
-                "DRAWS 0/S 0/F Q N/A".to_string(),
-                "ALLOC N/A MB/S GC N/A".to_string(),
-                "MEM N/A BUF N/A IMG N/A".to_string(),
+                "DRAWS 0/S 0/F Q DIRECT".to_string(),
+                "ALLOC 0.0 MB/S GC 0/0/0".to_string(),
+                "MEM N/A BUF 0K IMG 0K".to_string(),
                 "CPU N/A GPU N/A".to_string(),
-                "TIME 00:00:00 VKALLOC N/A".to_string(),
+                "TIME 00:00:00 GLALLOC 0/0".to_string(),
             ],
             minimal_lines: [
                 "FPS 0.0 CPU N/A".to_string(),
@@ -92,6 +197,86 @@ impl Stats {
             ],
             title_summary: "FPS 0.0 | CPU N/A | GPU N/A | TIME 00:00:00".to_string(),
         }
+    }
+}
+
+fn guest_resources() -> &'static Mutex<GuestResourceTracker> {
+    GUEST_RESOURCES.get_or_init(|| Mutex::new(GuestResourceTracker::default()))
+}
+
+pub(crate) fn register_gl_resource_context(group: usize) {
+    if group != 0 {
+        guest_resources()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register_context(group);
+    }
+}
+
+pub(crate) fn unregister_gl_resource_context(group: usize) {
+    if group != 0 {
+        guest_resources()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unregister_context(group);
+    }
+}
+
+pub(crate) fn record_gl_buffer_allocation(group: usize, buffer: u32, size: u64) {
+    guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_buffer_size(group, buffer, size);
+}
+
+pub(crate) fn delete_gl_buffers(group: usize, buffers: &[u32]) {
+    let mut resources = guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for buffer in buffers {
+        resources.delete_buffer(group, *buffer);
+    }
+}
+
+pub(crate) fn record_gl_image_allocation(
+    group: usize,
+    target: u32,
+    texture: u32,
+    level: i32,
+    size: u64,
+) {
+    guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_image_size(group, target, texture, level, size);
+}
+
+pub(crate) fn delete_gl_texture(group: usize, texture: u32) {
+    guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .delete_texture(group, texture);
+}
+
+pub(crate) fn clear_gl_image_allocations(group: usize, texture: u32) {
+    guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear_texture_storage(group, texture);
+}
+
+fn guest_resource_stats() -> (u64, u64, u64, u64) {
+    guest_resources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .totals()
+}
+
+fn resource_memory_label(bytes: u64) -> String {
+    if bytes < 1024 * 1024 {
+        format!("{}K", bytes.div_ceil(1024))
+    } else {
+        format!("{}M", bytes / (1024 * 1024))
     }
 }
 
@@ -167,6 +352,7 @@ pub fn configure_from_options(options: &Options) {
 }
 
 pub fn configure(enabled: bool, mode: PerformanceOverlayMode, corner: PerformanceOverlayCorner) {
+    crate::set_allocation_meter_enabled(enabled && mode == PerformanceOverlayMode::Full);
     ENABLED.store(enabled, Ordering::Relaxed);
     MODE.store(mode_index(mode.for_current_platform()), Ordering::Relaxed);
     CORNER.store(corner_index(corner), Ordering::Relaxed);
@@ -178,6 +364,7 @@ pub fn enabled() -> bool {
 }
 
 pub fn set_enabled(enabled: bool) {
+    crate::set_allocation_meter_enabled(enabled && mode() == PerformanceOverlayMode::Full);
     if ENABLED.swap(enabled, Ordering::Relaxed) != enabled && enabled {
         reset_measurements();
     }
@@ -200,6 +387,68 @@ fn display_mode() -> PerformanceOverlayMode {
     } else {
         selected
     }
+}
+
+#[derive(Clone, Copy)]
+struct OverlayGeometry {
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    uv_width: f32,
+    uv_height: f32,
+}
+
+fn overlay_geometry(
+    viewport: (u32, u32, u32, u32),
+    mode: PerformanceOverlayMode,
+    corner: PerformanceOverlayCorner,
+) -> Option<OverlayGeometry> {
+    let (display_width, display_height) = if mode == PerformanceOverlayMode::Full {
+        (PANEL_WIDTH, PANEL_HEIGHT)
+    } else {
+        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+    };
+    let (_, _, viewport_width, viewport_height) = viewport;
+    let horizontal_margin = 12.min(viewport_width as usize / 2);
+    let vertical_margin = 12.min(viewport_height as usize / 2);
+    let available_width = (viewport_width as usize).saturating_sub(2 * horizontal_margin);
+    let available_height = (viewport_height as usize).saturating_sub(2 * vertical_margin);
+    let scale = (available_width as f64 / display_width as f64)
+        .min(available_height as f64 / display_height as f64)
+        .min(1.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let width = (display_width as f64 * scale).floor() as usize;
+    let height = (display_height as f64 * scale).floor() as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let left = if matches!(
+        corner,
+        PerformanceOverlayCorner::TopRight | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_width as usize - horizontal_margin - width
+    } else {
+        horizontal_margin
+    };
+    let top = if matches!(
+        corner,
+        PerformanceOverlayCorner::BottomLeft | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_height as usize - vertical_margin - height
+    } else {
+        vertical_margin
+    };
+    Some(OverlayGeometry {
+        left,
+        top,
+        width,
+        height,
+        uv_width: display_width as f32 / PANEL_WIDTH as f32,
+        uv_height: display_height as f32 / PANEL_HEIGHT as f32,
+    })
 }
 
 pub fn corner() -> PerformanceOverlayCorner {
@@ -287,6 +536,13 @@ fn refresh_stats(stats: &mut Stats) -> bool {
     stats.present_fps = HOST_PRESENTS.swap(0, Ordering::Relaxed) as f64 / elapsed;
     stats.draws_per_second = GUEST_DRAWS.swap(0, Ordering::Relaxed) as f64 / elapsed;
 
+    let allocated_now = crate::allocated_bytes_total();
+    stats.allocated_mib_per_second = allocated_now.saturating_sub(stats.previous_allocated_bytes)
+        as f64
+        / elapsed
+        / (1024.0 * 1024.0);
+    stats.previous_allocated_bytes = allocated_now;
+
     let cpu_now = process_cpu_seconds();
     stats.cpu_percent = match (cpu_now, stats.previous_cpu_seconds) {
         (Some(now), Some(previous)) => normalized_cpu_percent(
@@ -346,6 +602,9 @@ fn refresh_stats(stats: &mut Stats) -> bool {
     let memory = stats
         .resident_memory_mb
         .map_or_else(|| "N/A".to_string(), |value| format!("{value}M"));
+    let (buffer_bytes, image_bytes, live_allocations, peak_allocations) = guest_resource_stats();
+    let buffer_memory = resource_memory_label(buffer_bytes);
+    let image_memory = resource_memory_label(image_bytes);
     let draws_per_frame = if stats.fps > 0.0 {
         stats.draws_per_second / stats.fps
     } else {
@@ -357,13 +616,19 @@ fn refresh_stats(stats: &mut Stats) -> bool {
             stats.fps, stats.present_fps, stats.frame_label
         ),
         format!(
-            "DRAWS {:.0}/S  {:.0}/F  Q N/A",
+            "DRAWS {:.0}/S  {:.0}/F  Q DIRECT",
             stats.draws_per_second, draws_per_frame
         ),
-        "ALLOC N/A MB/S  GC N/A".to_string(),
-        format!("MEM {}  BUF N/A  IMG N/A", memory),
+        format!(
+            "ALLOC {:.1} MB/S  GC 0/0/0",
+            stats.allocated_mib_per_second
+        ),
+        format!("MEM {}  BUF {}  IMG {}", memory, buffer_memory, image_memory),
         format!("CPU {}  GPU {}", cpu, gpu),
-        format!("TIME {}  VKALLOC N/A", stats.elapsed),
+        format!(
+            "TIME {}  GLALLOC {}/{}",
+            stats.elapsed, live_allocations, peak_allocations
+        ),
     ];
     stats.minimal_lines = [
         format!("FPS {:.1}  CPU {}", stats.fps, cpu),
@@ -398,40 +663,24 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     if selected_mode == PerformanceOverlayMode::TitleBar {
         return;
     }
-    let (display_width, display_height) = if selected_mode == PerformanceOverlayMode::Full {
-        (PANEL_WIDTH, PANEL_HEIGHT)
+    let display_width = if selected_mode == PerformanceOverlayMode::Full {
+        PANEL_WIDTH
     } else {
-        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+        MINIMAL_WIDTH
     };
-    let (_, _, viewport_width, viewport_height) = viewport;
-    let horizontal_margin = 12.min(viewport_width as usize / 2);
-    let vertical_margin = 12.min(viewport_height as usize / 2);
-    let width = (viewport_width as usize)
-        .saturating_sub(2 * horizontal_margin)
-        .min(display_width);
-    let height = (viewport_height as usize)
-        .saturating_sub(2 * vertical_margin)
-        .min(display_height);
-    if width == 0 || height == 0 {
+    let Some(geometry) = overlay_geometry(viewport, selected_mode, corner()) else {
         return;
-    }
-    let selected_corner = corner();
-    let left = if matches!(
-        selected_corner,
-        PerformanceOverlayCorner::TopRight | PerformanceOverlayCorner::BottomRight
-    ) {
-        viewport_width as usize - horizontal_margin - width
-    } else {
-        horizontal_margin
     };
-    let top = if matches!(
-        selected_corner,
-        PerformanceOverlayCorner::BottomLeft | PerformanceOverlayCorner::BottomRight
-    ) {
-        viewport_height as usize - vertical_margin - height
-    } else {
-        vertical_margin
-    };
+    let OverlayGeometry {
+        left,
+        top,
+        width,
+        height,
+        uv_width,
+        uv_height,
+    } = geometry;
+
+    let (_, _, viewport_width, viewport_height) = viewport;
 
     let Ok(mut stats) = stats().lock() else {
         return;
@@ -621,10 +870,10 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     let y0 = top as f32;
     let x1 = x0 + width as f32;
     let y1 = y0 + height as f32;
-    let u1 = width as f32 / PANEL_WIDTH as f32;
-    let v1 = height as f32 / PANEL_HEIGHT as f32;
     let vertices = [x0, y0, x1, y0, x0, y1, x1, y1];
-    let texcoords = [0.0, 0.0, u1, 0.0, 0.0, v1, u1, v1];
+    let texcoords = [
+        0.0, 0.0, uv_width, 0.0, 0.0, uv_height, uv_width, uv_height,
+    ];
     gles.BindBuffer(gles11::ARRAY_BUFFER, 0);
 
     gles.VertexPointer(2, gles11::FLOAT, 0, vertices.as_ptr() as *const GLvoid);
@@ -701,40 +950,22 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
     if selected_mode == PerformanceOverlayMode::TitleBar {
         return;
     }
-    let (display_width, display_height) = if selected_mode == PerformanceOverlayMode::Full {
-        (PANEL_WIDTH, PANEL_HEIGHT)
+    let display_width = if selected_mode == PerformanceOverlayMode::Full {
+        PANEL_WIDTH
     } else {
-        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+        MINIMAL_WIDTH
     };
-    let (_, _, viewport_width, viewport_height) = viewport;
-    let horizontal_margin = 12.min(viewport_width as usize / 2);
-    let vertical_margin = 12.min(viewport_height as usize / 2);
-    let width = (viewport_width as usize)
-        .saturating_sub(2 * horizontal_margin)
-        .min(display_width);
-    let height = (viewport_height as usize)
-        .saturating_sub(2 * vertical_margin)
-        .min(display_height);
-    if width == 0 || height == 0 {
+    let Some(geometry) = overlay_geometry(viewport, selected_mode, corner()) else {
         return;
-    }
-    let selected_corner = corner();
-    let left = if matches!(
-        selected_corner,
-        PerformanceOverlayCorner::TopRight | PerformanceOverlayCorner::BottomRight
-    ) {
-        viewport_width as usize - horizontal_margin - width
-    } else {
-        horizontal_margin
     };
-    let top = if matches!(
-        selected_corner,
-        PerformanceOverlayCorner::BottomLeft | PerformanceOverlayCorner::BottomRight
-    ) {
-        viewport_height as usize - vertical_margin - height
-    } else {
-        vertical_margin
-    };
+    let OverlayGeometry {
+        left,
+        top,
+        width,
+        height,
+        uv_width,
+        uv_height,
+    } = geometry;
 
     let Ok(mut stats) = stats().lock() else {
         return;
@@ -831,10 +1062,7 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
         context_token,
         texture,
         (left as f32, top as f32, width as f32, height as f32),
-        (
-            width as f32 / PANEL_WIDTH as f32,
-            height as f32 / PANEL_HEIGHT as f32,
-        ),
+        (uv_width, uv_height),
     );
     gles.BindTexture(gles2::TEXTURE_2D, old_texture as _);
     gles.ActiveTexture(old_active_texture as _);
@@ -1182,12 +1410,31 @@ fn gpu_percent() -> Option<f64> {
 }
 
 #[cfg(target_os = "android")]
+fn read_gpu_percent_from_path(path: &std::path::Path) -> Option<f64> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = parse_gpu_percent(&contents)?;
+    static GPU_SOURCE_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !GPU_SOURCE_LOGGED.swap(true, Ordering::Relaxed) {
+        log!("GPU utilization is being read from {}.", path.display());
+    }
+    Some(value)
+}
+
+#[cfg(target_os = "android")]
 fn collect_gpu_sample() -> Option<f64> {
     const KNOWN_PATHS: &[&str] = &[
         "/sys/module/ged/parameters/gpu_loading",
+        "/sys/kernel/ged/gpu_loading",
+        "/sys/kernel/ged/gpu_busy",
         "/sys/kernel/ged/hal/gpu_utilization",
         "/sys/kernel/ged/hal/gpu_loading",
         "/sys/kernel/ged/hal/current/gpu_loading",
+        "/sys/kernel/ged/hal/current/gpu_utilization",
+        "/sys/kernel/debug/ged/hal/gpu_utilization",
+        "/d/ged/hal/gpu_utilization",
+        "/sys/kernel/gpu/gpu_loading",
+        "/sys/kernel/gpu/gpu_load",
+        "/sys/kernel/gpu/gpu_busy",
         "/sys/devices/platform/soc/13000000.mali/gpu_utilization",
         "/sys/devices/platform/soc/13000000.mali/devfreq/load",
         "/sys/class/misc/mali0/device/gpu_utilization",
@@ -1195,10 +1442,7 @@ fn collect_gpu_sample() -> Option<f64> {
         "/sys/class/misc/mali0/device/devfreq/load",
     ];
     for path in KNOWN_PATHS {
-        if let Some(value) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|contents| parse_gpu_percent(&contents))
-        {
+        if let Some(value) = read_gpu_percent_from_path(std::path::Path::new(path)) {
             return Some(value);
         }
     }
@@ -1235,14 +1479,15 @@ fn collect_gpu_sample() -> Option<f64> {
                 ]
             };
             for path in paths {
-                if let Some(value) = std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|contents| parse_gpu_percent(&contents))
-                {
+                if let Some(value) = read_gpu_percent_from_path(&path) {
                     return Some(value);
                 }
             }
         }
+    }
+    static GPU_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+    if !GPU_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+        log!("GPU utilization is N/A: Android did not expose a readable supported GPU-load counter.");
     }
     None
 }
@@ -1255,12 +1500,27 @@ fn gpu_percent() -> Option<f64> {
 #[cfg(any(target_os = "android", test))]
 fn parse_gpu_percent(contents: &str) -> Option<f64> {
     let contents = contents.trim();
-    let value = contents.strip_suffix('%').unwrap_or(contents).trim();
-    if value.split_whitespace().count() != 1 {
-        return None;
+    let value = match contents.split_once('@') {
+        Some((value, frequency)) if frequency.trim().parse::<u64>().is_ok() => value.trim(),
+        Some(_) => return None,
+        None => contents,
+    };
+    let parse_percent = |value: &str| {
+        let value = value.strip_suffix('%').unwrap_or(value);
+        let value = value.parse::<f64>().ok()?;
+        (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
+    };
+    let mut values = value.split_whitespace();
+    let load = parse_percent(values.next()?)?;
+    match (values.next(), values.next(), values.next()) {
+        (None, None, None) => Some(load),
+        (Some(blocking), Some(idle), None)
+            if parse_percent(blocking).is_some() && parse_percent(idle).is_some() =>
+        {
+            Some(load)
+        }
+        _ => None,
     }
-    let value = value.parse::<f64>().ok()?;
-    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
 }
 
 #[cfg(target_os = "windows")]
@@ -1401,15 +1661,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gpu_percent_parser_accepts_only_single_percent_values() {
+    fn gpu_percent_parser_accepts_scalar_and_mtk_ged_values() {
         assert_eq!(parse_gpu_percent("42\n"), Some(42.0));
         assert_eq!(parse_gpu_percent("42%\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("42@800000\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("42@unknown"), None);
+        assert_eq!(parse_gpu_percent("42 13 45\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("42% 13% 45%\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("42 13 45 1\n"), None);
         assert_eq!(parse_gpu_percent("0"), Some(0.0));
         assert_eq!(parse_gpu_percent("100"), Some(100.0));
         assert_eq!(parse_gpu_percent("42 800000"), None);
+        assert_eq!(parse_gpu_percent("42 13 101"), None);
         assert_eq!(parse_gpu_percent("101"), None);
         assert_eq!(parse_gpu_percent("-1"), None);
         assert_eq!(parse_gpu_percent("N/A"), None);
+    }
+
+    #[test]
+    fn resource_memory_labels_preserve_small_allocations() {
+        assert_eq!(resource_memory_label(0), "0K");
+        assert_eq!(resource_memory_label(1), "1K");
+        assert_eq!(resource_memory_label(512 * 1024), "512K");
+        assert_eq!(resource_memory_label(1024 * 1024), "1M");
+    }
+
+    #[test]
+    fn guest_resource_tracker_replaces_and_deletes_allocations() {
+        let mut tracker = GuestResourceTracker::default();
+        tracker.register_context(7);
+        tracker.set_buffer_size(7, 2, 4096);
+        tracker.set_buffer_size(7, 2, 1024);
+        tracker.set_image_size(7, gles11::TEXTURE_2D, 3, 0, 2048);
+        tracker.set_image_size(7, gles11::TEXTURE_2D, 3, 0, 512);
+        assert_eq!(tracker.totals(), (1024, 512, 2, 2));
+
+        tracker.delete_buffer(7, 2);
+        tracker.delete_texture(7, 3);
+        assert_eq!(tracker.totals(), (0, 0, 0, 2));
+    }
+
+    #[test]
+    fn shared_context_resources_are_removed_after_last_context() {
+        let mut tracker = GuestResourceTracker::default();
+        tracker.register_context(11);
+        tracker.register_context(11);
+        tracker.set_buffer_size(11, 5, 4096);
+        tracker.set_image_size(11, gles11::TEXTURE_2D, 9, 0, 8192);
+
+        tracker.unregister_context(11);
+        assert_eq!(tracker.totals(), (4096, 8192, 2, 2));
+
+        tracker.unregister_context(11);
+        assert_eq!(tracker.totals(), (0, 0, 0, 2));
+    }
+
+    #[test]
+    fn full_overlay_scales_to_fit_mobile_viewports_without_cropping() {
+        let geometry = overlay_geometry(
+            (0, 0, 320, 460),
+            PerformanceOverlayMode::Full,
+            PerformanceOverlayCorner::BottomRight,
+        )
+        .unwrap();
+        assert_eq!((geometry.width, geometry.height), (296, 147));
+        assert_eq!((geometry.uv_width, geometry.uv_height), (1.0, 1.0));
+        assert_eq!(geometry.left + geometry.width, 308);
+        assert_eq!(geometry.top + geometry.height, 448);
+    }
+
+    #[test]
+    fn minimal_overlay_scales_texture_crop_to_the_viewport() {
+        let geometry = overlay_geometry(
+            (0, 0, 320, 460),
+            PerformanceOverlayMode::Minimal,
+            PerformanceOverlayCorner::TopRight,
+        )
+        .unwrap();
+        assert_eq!(geometry.width, 296);
+        assert_eq!(geometry.uv_width, MINIMAL_WIDTH as f32 / PANEL_WIDTH as f32);
+        assert_eq!(geometry.uv_height, MINIMAL_HEIGHT as f32 / PANEL_HEIGHT as f32);
     }
 
     #[test]
@@ -1439,8 +1770,15 @@ mod tests {
     }
 
     #[test]
+    fn resource_memory_labels_do_not_hide_sub_megabyte_allocations() {
+        assert_eq!(resource_memory_label(0), "0K");
+        assert_eq!(resource_memory_label(512 * 1024), "512K");
+        assert_eq!(resource_memory_label(1024 * 1024), "1M");
+    }
+
+    #[test]
     fn text_font_covers_all_overlay_labels() {
-        let text = "FPS | PRES MS DRAWS S F Q N/A ALLOC MB GC MEM BUF IMG CPU GPU TIME VKALLOC STALL 0123456789";
+        let text = "FPS | PRES MS DRAWS S F Q DIRECT ALLOC MB GC MEM BUF IMG CPU GPU TIME GLALLOC STALL 0123456789";
         assert!(text
             .bytes()
             .all(|character| glyph_rows(character.to_ascii_uppercase())

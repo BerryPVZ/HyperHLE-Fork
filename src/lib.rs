@@ -67,18 +67,69 @@ mod window;
 pub use environment::GuestTermination;
 use environment::{Environment, MutexId, MutexType, ThreadId, PTHREAD_MUTEX_DEFAULT};
 
+use std::alloc::{GlobalAlloc, Layout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(target_os = "ios")]
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 
-// PERF: use mimalloc as the global allocator. The emulator performs a large
-// number of small, short-lived allocations per frame (autorelease pools,
-// string handling and various collections in the Foundation/UIKit HLE
-// implementations), a workload that mimalloc handles measurably faster than
-// the platform malloc — in particular on Android, where every allocation
-// additionally goes through Scudo hardening.
+static ALLOCATION_METER_ENABLED: AtomicBool = AtomicBool::new(false);
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+struct CountingMiMalloc;
+
+#[inline]
+fn record_allocation(bytes: usize) {
+    if ALLOCATION_METER_ENABLED.load(Ordering::Relaxed) {
+        ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+unsafe impl GlobalAlloc for CountingMiMalloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if !pointer.is_null() {
+            record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let pointer = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+        if !pointer.is_null() {
+            record_allocation(layout.size());
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        unsafe { mimalloc::MiMalloc.dealloc(pointer, layout) };
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new_pointer = unsafe { mimalloc::MiMalloc.realloc(pointer, layout, new_size) };
+        if !new_pointer.is_null() {
+            let allocated = if new_pointer == pointer {
+                new_size.saturating_sub(layout.size())
+            } else {
+                new_size
+            };
+            record_allocation(allocated);
+        }
+        new_pointer
+    }
+}
+
+pub(crate) fn set_allocation_meter_enabled(enabled: bool) {
+    ALLOCATION_METER_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub(crate) fn allocated_bytes_total() -> u64 {
+    ALLOCATED_BYTES.load(Ordering::Relaxed)
+}
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 
 pub use touchHLE_version::*;
 

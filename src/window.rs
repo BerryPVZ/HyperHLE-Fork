@@ -22,7 +22,7 @@ use crate::gles::{
 };
 use crate::image::Image;
 use crate::matrix::Matrix;
-use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
+use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode, VsyncMode};
 use crate::Environment;
 use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
@@ -46,6 +46,42 @@ pub fn angle_backend_available() -> bool {
 #[cfg(target_os = "android")]
 fn should_attempt_android_angle(gles_native: bool, angle_unavailable: bool) -> bool {
     !gles_native && !angle_unavailable
+}
+
+fn swap_interval_for_mode(mode: VsyncMode, is_android: bool) -> Option<sdl2::video::SwapInterval> {
+    match mode {
+        VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
+        VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
+        VsyncMode::Auto if is_android => Some(sdl2::video::SwapInterval::VSync),
+        VsyncMode::Auto => None,
+    }
+}
+
+#[cfg(test)]
+mod swap_interval_tests {
+    use super::{swap_interval_for_mode, VsyncMode};
+    use sdl2::video::SwapInterval;
+
+    #[test]
+    fn auto_uses_display_sync_on_android() {
+        assert!(matches!(
+            swap_interval_for_mode(VsyncMode::Auto, true),
+            Some(SwapInterval::VSync)
+        ));
+    }
+
+    #[test]
+    fn auto_keeps_driver_default_on_desktop() {
+        assert!(swap_interval_for_mode(VsyncMode::Auto, false).is_none());
+    }
+
+    #[test]
+    fn explicit_off_remains_available_on_android() {
+        assert!(matches!(
+            swap_interval_for_mode(VsyncMode::Off, true),
+            Some(SwapInterval::Immediate)
+        ));
+    }
 }
 
 #[cfg(any(target_os = "android", test))]
@@ -1427,29 +1463,10 @@ impl Window {
             ));
         }
 
-        // Swap interval. EGL's swap interval is a property of the window
-        // surface, which every context created for this window shares, so
-        // setting it once here (with the internal context current) covers the
-        // app's EAGL contexts too.
-        //
-        // On Android the default (1, i.e. vsync) is a poor fit: the emulator
-        // already paces frames itself (`--fps-limit`, on by default) and the
-        // Android compositor synchronises to the display regardless, so a
-        // blocking swap can't prevent tearing, it can only stall the emulator
-        // thread — and a stall on top of a frame that already took nearly a
-        // refresh interval turns "almost 60 FPS" into a hard 30 FPS. Desktop
-        // drivers are left at their default unless asked otherwise.
-        let swap_interval = match options.vsync {
-            crate::options::VsyncMode::On => Some(sdl2::video::SwapInterval::VSync),
-            crate::options::VsyncMode::Off => Some(sdl2::video::SwapInterval::Immediate),
-            crate::options::VsyncMode::Auto => {
-                if env::consts::OS == "android" {
-                    Some(sdl2::video::SwapInterval::Immediate)
-                } else {
-                    None
-                }
-            }
-        };
+        // The Android surface requests a 60 Hz mode, matching the default
+        // frame limit. Synchronize swaps to that display cadence; explicit
+        // --vsync=off remains available for drivers where interval 1 regresses.
+        let swap_interval = swap_interval_for_mode(options.vsync, env::consts::OS == "android");
         if let Some(swap_interval) = swap_interval {
             let vsync_on = matches!(swap_interval, sdl2::video::SwapInterval::VSync);
             match window.video_ctx.gl_set_swap_interval(swap_interval) {

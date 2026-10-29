@@ -158,6 +158,7 @@ fn effective_eagl_api(
 /// context (the presenter) always restores what it found, so the mirror stays
 /// valid across presents.
 pub(super) struct GLShadowState {
+    pub(super) resource_group_token: usize,
     /// `GL_ARRAY_BUFFER_BINDING`.
     pub(super) array_buffer: GLuint,
     /// `GL_ELEMENT_ARRAY_BUFFER_BINDING`. `None` means "unknown, ask the
@@ -195,6 +196,7 @@ pub(super) struct GLShadowState {
 impl Default for GLShadowState {
     fn default() -> Self {
         GLShadowState {
+            resource_group_token: 0,
             array_buffer: 0,
             element_array_buffer: Some(0),
             fog_enabled: false,
@@ -351,6 +353,7 @@ pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
     /// Guest object addresses can be reused when a game session restarts.
     present_token: usize,
+    resource_group_token: usize,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -414,6 +417,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
         present_token: crate::gles::perf_overlay::allocate_context_token(),
+        resource_group_token: 0,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -464,6 +468,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return msg![env; this initWithAPI:api];
     }
 
+    let resource_group_token = {
+        let group_context = env.objc.borrow::<EAGLContextHostObject>(group);
+        if group_context.resource_group_token != 0 {
+            group_context.resource_group_token
+        } else {
+            group_context.present_token
+        }
+    };
+
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let prev_context = env.objc.borrow_mut::<EAGLContextHostObject>(group).gles_ctx.as_mut().unwrap();
 
@@ -503,10 +516,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
@@ -525,6 +543,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         return nil;
     }
+
+    let resource_group_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
 
     let effective_api = effective_eagl_api(
         api,
@@ -553,10 +573,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     this
 }
@@ -572,16 +597,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    for &(guest_buf, _host_buf, _size) in host_obj.mapped_buffers.values() {
-        env.mem.free(guest_buf);
+    let (resource_group_token, drawables, mapped_guest_buffers) = {
+        let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let mapped_guest_buffers = host_obj
+            .mapped_buffers
+            .values()
+            .map(|&(guest_buf, _, _)| guest_buf)
+            .collect::<Vec<_>>();
+        let resource_group_token = host_obj.resource_group_token;
+        host_obj.resource_group_token = 0;
+        host_obj.shadow.resource_group_token = 0;
+        let drawables = if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
+            let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
+            bindings.take().into_values().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        (resource_group_token, drawables, mapped_guest_buffers)
+    };
+    for guest_buffer in mapped_guest_buffers {
+        env.mem.free(guest_buffer);
     }
-    if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
-        let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
-        for (_renderbuffer, drawable) in bindings.take() {
-            release(env, drawable);
-        }
+    for drawable in drawables {
+        release(env, drawable);
     }
+    crate::gles::perf_overlay::unregister_gl_resource_context(resource_group_token);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
