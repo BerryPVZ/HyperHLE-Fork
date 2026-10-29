@@ -85,6 +85,7 @@ pub unsafe fn present_frame(
     viewport: (u32, u32, u32, u32),
     rotation_matrix: Matrix<2>,
     virtual_cursor_visible_at: Option<(f32, f32, bool)>,
+    context_token: usize,
 ) {
     // While this is a generic utility, it is closely tied to
     // crate::frameworks::opengles::eagl::present_renderbuffer, which handles
@@ -204,7 +205,7 @@ pub unsafe fn present_frame(
     }
 
     if onscreen_fps_enabled() {
-        crate::gles::perf_overlay::draw(gles, viewport);
+        crate::gles::perf_overlay::draw(gles, viewport, context_token);
     }
 
     // Cheat Engine-style trainer overlay (floating button + panel). Drawn

@@ -1840,6 +1840,7 @@ unsafe fn ensure_overlay_white_tex(gles: &mut dyn GLES) -> GLuint {
 /// rest of the presenter state afterwards.
 unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads: &[Quad]) {
     use crate::gles::gles2_raw as gles2;
+    use gles2::types::*;
 
     if quads.is_empty() {
         return;
@@ -1850,10 +1851,6 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     if program.a_pos < 0 || program.a_uv < 0 || program.a_col < 0 {
         return;
     }
-    let vbo = ensure_overlay_vbo(gles);
-    let white = ensure_overlay_white_tex(gles);
-
-    // Save state we touch.
     let mut old_program: GLint = 0;
     gles.GetIntegerv(gles2::CURRENT_PROGRAM, &mut old_program);
     let mut old_array_buffer: GLint = 0;
@@ -1864,13 +1861,53 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut old_tex0: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
+    let mut old_blend_src_rgb: GLint = 0;
+    let mut old_blend_dst_rgb: GLint = 0;
+    let mut old_blend_src_alpha: GLint = 0;
+    let mut old_blend_dst_alpha: GLint = 0;
+    gles.GetIntegerv(0x80C9, &mut old_blend_src_rgb);
+    gles.GetIntegerv(0x80C8, &mut old_blend_dst_rgb);
+    gles.GetIntegerv(0x80CB, &mut old_blend_src_alpha);
+    gles.GetIntegerv(0x80CA, &mut old_blend_dst_alpha);
     let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
-    let mut attrib_states = [0u8; 3];
-    for (slot, &attrib) in attrib_states.iter_mut().zip(attribs.iter()) {
-        let mut v: GLint = 0;
-        gles.GetVertexAttribiv(attrib as GLuint, gles2::VERTEX_ATTRIB_ARRAY_ENABLED, &mut v);
-        *slot = v as u8;
+    const VERTEX_ATTRIB_ARRAY_ENABLED: GLenum = 0x8622;
+    const VERTEX_ATTRIB_ARRAY_SIZE: GLenum = 0x8623;
+    const VERTEX_ATTRIB_ARRAY_STRIDE: GLenum = 0x8624;
+    const VERTEX_ATTRIB_ARRAY_TYPE: GLenum = 0x8625;
+    const VERTEX_ATTRIB_ARRAY_POINTER: GLenum = 0x8645;
+    const VERTEX_ATTRIB_ARRAY_NORMALIZED: GLenum = 0x886A;
+    const VERTEX_ATTRIB_ARRAY_BUFFER_BINDING: GLenum = 0x889F;
+    struct SavedAttrib {
+        index: GLuint,
+        enabled: GLint,
+        buffer: GLint,
+        size: GLint,
+        stride: GLint,
+        type_: GLint,
+        normalized: GLint,
+        pointer: *mut GLvoid,
     }
+    let mut attrib_states = attribs.map(|index| SavedAttrib {
+        index,
+        enabled: 0,
+        buffer: 0,
+        size: 0,
+        stride: 0,
+        type_: 0,
+        normalized: 0,
+        pointer: std::ptr::null_mut(),
+    });
+    for state in &mut attrib_states {
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.enabled);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut state.buffer);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_SIZE, &mut state.size);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.stride);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_TYPE, &mut state.type_);
+        gles.GetVertexAttribiv(state.index, VERTEX_ATTRIB_ARRAY_NORMALIZED, &mut state.normalized);
+        gles.GetVertexAttribPointerv(state.index, VERTEX_ATTRIB_ARRAY_POINTER, &mut state.pointer);
+    }
+    let vbo = ensure_overlay_vbo(gles);
+    let white = ensure_overlay_white_tex(gles);
 
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
@@ -1939,14 +1976,31 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
         gles.DrawArrays(gles2::TRIANGLE_STRIP, 0, 4);
     }
 
-    for (&attr, &was) in attribs.iter().zip(attrib_states.iter()) {
-        if was != 0 {
-            gles.EnableVertexAttribArray(attr as _);
+    for state in &attrib_states {
+        gles.BindBuffer(gles2::ARRAY_BUFFER, state.buffer as _);
+        gles.VertexAttribPointer(
+            state.index,
+            state.size,
+            state.type_ as _,
+            state.normalized as _,
+            state.stride,
+            state.pointer as *const GLvoid,
+        );
+        if state.enabled != 0 {
+            gles.EnableVertexAttribArray(state.index);
         } else {
-            gles.DisableVertexAttribArray(attr as _);
+            gles.DisableVertexAttribArray(state.index);
         }
     }
-    if !blend_was_on {
+    gles.BlendFuncSeparate(
+        old_blend_src_rgb as _,
+        old_blend_dst_rgb as _,
+        old_blend_src_alpha as _,
+        old_blend_dst_alpha as _,
+    );
+    if blend_was_on {
+        gles.Enable(gles2::BLEND);
+    } else {
         gles.Disable(gles2::BLEND);
     }
     gles.BindTexture(gles2::TEXTURE_2D, old_tex0 as _);

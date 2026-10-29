@@ -58,6 +58,18 @@ impl PerformanceOverlayMode {
             Self::TitleBar => "titlebar",
         }
     }
+
+    pub fn for_current_platform(self) -> Self {
+        self.for_platform(!cfg!(any(target_os = "android", target_os = "ios")))
+    }
+
+    fn for_platform(self, title_bar_available: bool) -> Self {
+        if !title_bar_available && self == Self::TitleBar {
+            Self::Minimal
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -910,6 +922,22 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn title_bar_mode_falls_back_when_unavailable() {
+        assert_eq!(
+            PerformanceOverlayMode::TitleBar.for_platform(false),
+            PerformanceOverlayMode::Minimal
+        );
+        assert_eq!(
+            PerformanceOverlayMode::TitleBar.for_platform(true),
+            PerformanceOverlayMode::TitleBar
+        );
+        assert_eq!(
+            PerformanceOverlayMode::Full.for_platform(false),
+            PerformanceOverlayMode::Full
+        );
     }
 
     #[test]

@@ -33,7 +33,7 @@ static SESSION_START_NS: AtomicU64 = AtomicU64::new(0);
 static HISTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
 static FRAME_MILLISECONDS: [AtomicU32; HISTORY_SIZE] = [const { AtomicU32::new(0) }; HISTORY_SIZE];
 static PROCESS_ORIGIN: OnceLock<Instant> = OnceLock::new();
-static OVERLAY_TEXTURE: AtomicU32 = AtomicU32::new(0);
+static ES1_TEXTURE: Mutex<Option<(usize, u32)>> = Mutex::new(None);
 static ES2_TEXTURE: Mutex<Option<(usize, u32)>> = Mutex::new(None);
 static PIXELS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
@@ -147,7 +147,7 @@ pub fn configure_from_options(options: &Options) {
 
 pub fn configure(enabled: bool, mode: PerformanceOverlayMode, corner: PerformanceOverlayCorner) {
     ENABLED.store(enabled, Ordering::Relaxed);
-    MODE.store(mode_index(mode), Ordering::Relaxed);
+    MODE.store(mode_index(mode.for_current_platform()), Ordering::Relaxed);
     CORNER.store(corner_index(corner), Ordering::Relaxed);
     reset_session();
 }
@@ -167,6 +167,17 @@ pub fn mode() -> PerformanceOverlayMode {
         0 => PerformanceOverlayMode::Full,
         1 => PerformanceOverlayMode::Minimal,
         _ => PerformanceOverlayMode::TitleBar,
+    }
+}
+
+fn display_mode() -> PerformanceOverlayMode {
+    let selected = mode();
+    if cfg!(any(target_os = "android", target_os = "ios"))
+        && selected == PerformanceOverlayMode::TitleBar
+    {
+        PerformanceOverlayMode::Minimal
+    } else {
+        selected
     }
 }
 
@@ -261,6 +272,7 @@ fn refresh_stats(stats: &mut Stats) -> bool {
     };
     stats.previous_cpu_seconds = cpu_now;
     stats.resident_memory_mb = resident_memory_mb();
+    request_gpu_sample();
     let gpu = gpu_percent_label();
 
     let history_index = HISTORY_INDEX.load(Ordering::Relaxed);
@@ -339,20 +351,23 @@ fn refresh_stats(stats: &mut Stats) -> bool {
 }
 
 pub fn take_title_bar_summary() -> Option<String> {
-    if !enabled() || mode() != PerformanceOverlayMode::TitleBar {
+    if cfg!(any(target_os = "android", target_os = "ios"))
+        || !enabled()
+        || mode() != PerformanceOverlayMode::TitleBar
+    {
         return None;
     }
     let mut stats = stats().lock().ok()?;
     refresh_stats(&mut stats).then(|| stats.title_summary.clone())
 }
 
-pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
+pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_token: usize) {
     use gles11::types::*;
 
     if !enabled() {
         return;
     }
-    let selected_mode = mode();
+    let selected_mode = display_mode();
     if selected_mode == PerformanceOverlayMode::TitleBar {
         return;
     }
@@ -446,45 +461,51 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
         &mut old_texcoord_pointer,
     );
 
-    let mut texture = OVERLAY_TEXTURE.load(Ordering::Relaxed);
-    if texture == 0 {
-        gles.GenTextures(1, &mut texture);
-        OVERLAY_TEXTURE.store(texture, Ordering::Relaxed);
-        gles.BindTexture(gles11::TEXTURE_2D, texture);
-        gles.TexImage2D(
-            gles11::TEXTURE_2D,
-            0,
-            gles11::RGBA as _,
-            PANEL_WIDTH as _,
-            PANEL_HEIGHT as _,
-            0,
-            gles11::RGBA,
-            gles11::UNSIGNED_BYTE,
-            std::ptr::null(),
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_MIN_FILTER,
-            gles11::NEAREST as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_MAG_FILTER,
-            gles11::NEAREST as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_WRAP_S,
-            gles11::CLAMP_TO_EDGE as _,
-        );
-        gles.TexParameteri(
-            gles11::TEXTURE_2D,
-            gles11::TEXTURE_WRAP_T,
-            gles11::CLAMP_TO_EDGE as _,
-        );
-    } else {
-        gles.BindTexture(gles11::TEXTURE_2D, texture);
-    }
+    let texture = {
+        let mut texture_slot = ES1_TEXTURE.lock().unwrap();
+        match *texture_slot {
+            Some((old_context, texture)) if old_context == context_token => texture,
+            _ => {
+                let mut texture = 0;
+                gles.GenTextures(1, &mut texture);
+                *texture_slot = Some((context_token, texture));
+                gles.BindTexture(gles11::TEXTURE_2D, texture);
+                gles.TexImage2D(
+                    gles11::TEXTURE_2D,
+                    0,
+                    gles11::RGBA as _,
+                    PANEL_WIDTH as _,
+                    PANEL_HEIGHT as _,
+                    0,
+                    gles11::RGBA,
+                    gles11::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_MIN_FILTER,
+                    gles11::NEAREST as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_MAG_FILTER,
+                    gles11::NEAREST as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_S,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles11::TEXTURE_2D,
+                    gles11::TEXTURE_WRAP_T,
+                    gles11::CLAMP_TO_EDGE as _,
+                );
+                texture
+            }
+        }
+    };
+    gles.BindTexture(gles11::TEXTURE_2D, texture);
     gles.TexSubImage2D(
         gles11::TEXTURE_2D,
         0,
@@ -584,7 +605,7 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
     if !enabled() {
         return;
     }
-    let selected_mode = mode();
+    let selected_mode = display_mode();
     if selected_mode == PerformanceOverlayMode::TitleBar {
         return;
     }
@@ -975,9 +996,7 @@ fn resident_memory_mb() -> Option<u64> {
 }
 
 fn gpu_percent_label() -> String {
-    let value = gpu_percent();
-    request_gpu_sample();
-    value.map_or_else(|| "N/A".to_string(), |percent| format!("{percent:.0}%"))
+    gpu_percent().map_or_else(|| "N/A".to_string(), |percent| format!("{percent:.0}%"))
 }
 
 #[cfg(target_os = "windows")]

@@ -445,7 +445,7 @@ impl PickerSettings {
             gles_native,
             force_composition: options.force_composition,
             show_fps: options.performance_overlay_enabled,
-            overlay_mode: options.performance_overlay_mode,
+            overlay_mode: options.performance_overlay_mode.for_current_platform(),
             overlay_corner: options.performance_overlay_corner,
             trace_gl_errors: options.trace_gl_errors,
             cheat_engine: quick_options_trainer_enabled(options),
@@ -506,6 +506,7 @@ impl PickerSettings {
                 _ => (),
             }
         }
+        settings.overlay_mode = settings.overlay_mode.for_current_platform();
         settings
     }
 
@@ -4003,6 +4004,16 @@ fn setup_settings(
         ));
     }
     sections.push(("DISPLAY", display_rows));
+    let overlay_mode_options: &'static [(&'static str, &'static str)] =
+        if cfg!(any(target_os = "android", target_os = "ios")) {
+            &[("Full", "overlayModeFull"), ("Minimal", "overlayModeMinimal")]
+        } else {
+            &[
+                ("Full", "overlayModeFull"),
+                ("Minimal", "overlayModeMinimal"),
+                ("Title bar", "overlayModeTitleBar"),
+            ]
+        };
     let mut graphics_rows = vec![
             SettingsRow::Toggle(
                 "GLES Native",
@@ -4017,14 +4028,7 @@ fn setup_settings(
                 true,
             ),
         SettingsRow::Toggle("Performance display", "showFPS:", show_fps, true),
-        SettingsRow::Segmented(
-            "Display mode",
-            &[
-                ("Full", "overlayModeFull"),
-                ("Minimal", "overlayModeMinimal"),
-                ("Title bar", "overlayModeTitleBar"),
-            ],
-        ),
+        SettingsRow::Segmented("Display mode", overlay_mode_options),
         SettingsRow::Segmented(
             "Screen corner",
             &[

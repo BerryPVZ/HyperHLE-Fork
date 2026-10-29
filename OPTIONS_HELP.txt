@@ -326,8 +326,9 @@ Other options:
 
     --overlay-mode=full|minimal|titlebar
         Show all counters and the frame-time graph, only FPS/CPU/GPU/time, or
-        the minimal summary in the desktop window title bar. Unsupported values
-        show N/A; MEM is process resident memory.
+        the minimal summary in the desktop window title bar. On Android/iOS,
+        titlebar falls back to Minimal because the OS has no window title bar.
+        Unsupported values show N/A; MEM is process resident memory.
 
     --overlay-corner=topleft|topright|bottomright|bottomleft
         Choose the saved corner for the on-screen panel. F2 changes the corner

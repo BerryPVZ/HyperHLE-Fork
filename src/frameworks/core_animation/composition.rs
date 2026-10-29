@@ -611,6 +611,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.0,
             present_frame_args.1,
             present_frame_args.2,
+            0,
         );
         // Hand the context back to the guest with the buffer bindings it
         // left behind (see the save at the top of this function).

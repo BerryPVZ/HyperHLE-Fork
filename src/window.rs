@@ -947,6 +947,7 @@ pub struct Window {
     pub(super) on_main_stack: bool,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn base_window_title() -> String {
     if crate::branding().is_empty() {
         format!("{} {}", crate::DISPLAY_NAME, crate::VERSION)
@@ -2654,6 +2655,7 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
+                0,
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -2672,6 +2674,7 @@ impl Window {
         self.perf_hints.frame_presented();
         crate::gles::perf_overlay::record_host_present();
 
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if let Some(summary) = crate::gles::perf_overlay::take_title_bar_summary() {
             let title = format!("{} - {}", base_window_title(), summary);
             let _ = self.window.set_title(&title);
@@ -2988,6 +2991,7 @@ impl Window {
 
     pub fn set_show_fps_counter(&mut self, enabled: bool) {
         crate::gles::perf_overlay::set_enabled(enabled);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if !enabled || crate::gles::perf_overlay::mode() != crate::options::PerformanceOverlayMode::TitleBar {
             let _ = self.window.set_title(&base_window_title());
         }
@@ -3000,6 +3004,7 @@ impl Window {
         corner: PerformanceOverlayCorner,
     ) {
         crate::gles::perf_overlay::configure(enabled, mode, corner);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         if !enabled || mode != PerformanceOverlayMode::TitleBar {
             let _ = self.window.set_title(&base_window_title());
         }
