@@ -33,14 +33,26 @@ static SESSION_START_NS: AtomicU64 = AtomicU64::new(0);
 static HISTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
 static FRAME_MILLISECONDS: [AtomicU32; HISTORY_SIZE] = [const { AtomicU32::new(0) }; HISTORY_SIZE];
 static PROCESS_ORIGIN: OnceLock<Instant> = OnceLock::new();
-static ES1_TEXTURE: Mutex<Option<(usize, u32)>> = Mutex::new(None);
-static ES2_TEXTURE: Mutex<Option<(usize, u32)>> = Mutex::new(None);
+static NEXT_GL_CONTEXT_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static PIXEL_VERSION: AtomicU64 = AtomicU64::new(1);
+static PIXELS_VERSION: AtomicU64 = AtomicU64::new(0);
+static LAST_GRAPH_REFRESH_NS: AtomicU64 = AtomicU64::new(0);
+static ES1_TEXTURE: Mutex<Option<CachedTexture>> = Mutex::new(None);
+static ES2_TEXTURE: Mutex<Option<CachedTexture>> = Mutex::new(None);
 static PIXELS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct CachedTexture {
+    context_token: usize,
+    texture: u32,
+    pixel_version: u64,
+}
 
 struct Stats {
     window_start: Instant,
     previous_cpu_seconds: Option<f64>,
+    logical_processors: usize,
     fps: f64,
     present_fps: f64,
     draws_per_second: f64,
@@ -58,6 +70,7 @@ impl Stats {
         Self {
             window_start: Instant::now(),
             previous_cpu_seconds: process_cpu_seconds(),
+            logical_processors: logical_processor_count(),
             fps: 0.0,
             present_fps: 0.0,
             draws_per_second: 0.0,
@@ -85,6 +98,10 @@ impl Stats {
 fn origin() -> Instant {
     *PROCESS_ORIGIN.get_or_init(Instant::now)
 }
+pub fn allocate_context_token() -> usize {
+    NEXT_GL_CONTEXT_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
 
 fn process_elapsed_ns() -> u64 {
     origin().elapsed().as_nanos().min(u64::MAX as u128) as u64
@@ -99,6 +116,8 @@ fn stats() -> &'static Mutex<Stats> {
 }
 
 fn reset_session() {
+    PIXEL_VERSION.fetch_add(1, Ordering::Relaxed);
+    LAST_GRAPH_REFRESH_NS.store(0, Ordering::Relaxed);
     let now = process_elapsed_ns();
     SESSION_START_NS.store(now, Ordering::Relaxed);
     GUEST_FLIPS.store(0, Ordering::Relaxed);
@@ -115,6 +134,8 @@ fn reset_session() {
 }
 
 fn reset_measurements() {
+    PIXEL_VERSION.fetch_add(1, Ordering::Relaxed);
+    LAST_GRAPH_REFRESH_NS.store(0, Ordering::Relaxed);
     GUEST_FLIPS.store(0, Ordering::Relaxed);
     HOST_PRESENTS.store(0, Ordering::Relaxed);
     GUEST_DRAWS.store(0, Ordering::Relaxed);
@@ -233,6 +254,14 @@ pub fn record_guest_flip() {
         FRAME_MILLISECONDS[index].store(milliseconds.to_bits(), Ordering::Relaxed);
     }
     GUEST_FLIPS.fetch_add(1, Ordering::Relaxed);
+    let last_refresh = LAST_GRAPH_REFRESH_NS.load(Ordering::Relaxed);
+    if now.saturating_sub(last_refresh) >= 100_000_000
+        && LAST_GRAPH_REFRESH_NS
+            .compare_exchange(last_refresh, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        PIXEL_VERSION.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 pub fn record_host_present() {
@@ -260,13 +289,10 @@ fn refresh_stats(stats: &mut Stats) -> bool {
 
     let cpu_now = process_cpu_seconds();
     stats.cpu_percent = match (cpu_now, stats.previous_cpu_seconds) {
-        (Some(now), Some(previous)) => Some(
-            (((now - previous).max(0.0) / elapsed)
-                / std::thread::available_parallelism()
-                    .map(|count| count.get())
-                    .unwrap_or(1) as f64
-                * 100.0)
-                .clamp(0.0, 100.0),
+        (Some(now), Some(previous)) => normalized_cpu_percent(
+            now - previous,
+            elapsed,
+            stats.logical_processors,
         ),
         _ => None,
     };
@@ -347,6 +373,7 @@ fn refresh_stats(stats: &mut Stats) -> bool {
         "FPS {:.1} | CPU {} | GPU {} | TIME {}",
         stats.fps, cpu, gpu, stats.elapsed
     );
+    PIXEL_VERSION.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -416,7 +443,12 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     else {
         return;
     };
-    fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+    let requested_pixel_version = PIXEL_VERSION.load(Ordering::Relaxed);
+    if PIXELS_VERSION.load(Ordering::Relaxed) != requested_pixel_version {
+        fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+        PIXELS_VERSION.store(requested_pixel_version, Ordering::Relaxed);
+    }
+    let pixel_version = PIXELS_VERSION.load(Ordering::Relaxed);
 
     let mut old_active_texture: GLint = 0;
     gles.GetIntegerv(gles11::ACTIVE_TEXTURE, &mut old_active_texture);
@@ -425,22 +457,46 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     gles.GetIntegerv(gles11::TEXTURE_BINDING_2D, &mut old_texture);
     let mut old_matrix_mode: GLint = 0;
     gles.GetIntegerv(gles11::MATRIX_MODE, &mut old_matrix_mode);
+    let mut old_client_active_texture = 0;
+    gles.GetIntegerv(gles11::CLIENT_ACTIVE_TEXTURE, &mut old_client_active_texture);
+    gles.ClientActiveTexture(gles11::TEXTURE0);
     let mut old_vertex_array: GLboolean = gles11::FALSE;
     let mut old_texture_array: GLboolean = gles11::FALSE;
     gles.GetBooleanv(gles11::VERTEX_ARRAY, &mut old_vertex_array);
     gles.GetBooleanv(gles11::TEXTURE_COORD_ARRAY, &mut old_texture_array);
     let old_blend = gles.IsEnabled(gles11::BLEND);
     let old_texture_2d = gles.IsEnabled(gles11::TEXTURE_2D);
+    let mut old_color_mask = [gles11::TRUE; 4];
+    gles.GetBooleanv(gles11::COLOR_WRITEMASK, old_color_mask.as_mut_ptr());
+    let mut old_texture_env_mode = gles11::MODULATE as GLint;
+    gles.GetTexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        &mut old_texture_env_mode,
+    );
     let old_overlay_caps = [
         (gles11::SCISSOR_TEST, gles.IsEnabled(gles11::SCISSOR_TEST)),
         (gles11::DEPTH_TEST, gles.IsEnabled(gles11::DEPTH_TEST)),
         (gles11::CULL_FACE, gles.IsEnabled(gles11::CULL_FACE)),
         (gles11::STENCIL_TEST, gles.IsEnabled(gles11::STENCIL_TEST)),
+        (gles11::ALPHA_TEST, gles.IsEnabled(gles11::ALPHA_TEST)),
+        (gles11::LIGHTING, gles.IsEnabled(gles11::LIGHTING)),
+        (gles11::FOG, gles.IsEnabled(gles11::FOG)),
     ];
     let mut old_color = [0.0; 4];
     gles.GetFloatv(gles11::CURRENT_COLOR, old_color.as_mut_ptr());
     let mut old_array_buffer: GLint = 0;
+    let mut old_vertex_array_buffer: GLint = 0;
+    let mut old_texcoord_array_buffer: GLint = 0;
     gles.GetIntegerv(gles11::ARRAY_BUFFER_BINDING, &mut old_array_buffer);
+    gles.GetIntegerv(
+        gles11::VERTEX_ARRAY_BUFFER_BINDING,
+        &mut old_vertex_array_buffer,
+    );
+    gles.GetIntegerv(
+        gles11::TEXTURE_COORD_ARRAY_BUFFER_BINDING,
+        &mut old_texcoord_array_buffer,
+    );
     let mut old_vertex_size: GLint = 0;
     let mut old_vertex_type: GLint = 0;
     let mut old_vertex_stride: GLint = 0;
@@ -460,15 +516,23 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
         gles11::TEXTURE_COORD_ARRAY_POINTER,
         &mut old_texcoord_pointer,
     );
+    let mut old_projection_matrix = [0.0; 16];
+    let mut old_modelview_matrix = [0.0; 16];
+    gles.MatrixMode(gles11::PROJECTION);
+    gles.GetFloatv(gles11::PROJECTION_MATRIX, old_projection_matrix.as_mut_ptr());
+    gles.MatrixMode(gles11::MODELVIEW);
+    gles.GetFloatv(gles11::MODELVIEW_MATRIX, old_modelview_matrix.as_mut_ptr());
+    gles.MatrixMode(old_matrix_mode as _);
 
-    let texture = {
-        let mut texture_slot = ES1_TEXTURE.lock().unwrap();
-        match *texture_slot {
-            Some((old_context, texture)) if old_context == context_token => texture,
+    {
+        let mut texture_slot = ES1_TEXTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cached = match *texture_slot {
+            Some(cached) if cached.context_token == context_token => cached,
             _ => {
                 let mut texture = 0;
                 gles.GenTextures(1, &mut texture);
-                *texture_slot = Some((context_token, texture));
                 gles.BindTexture(gles11::TEXTURE_2D, texture);
                 gles.TexImage2D(
                     gles11::TEXTURE_2D,
@@ -501,25 +565,33 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
                     gles11::TEXTURE_WRAP_T,
                     gles11::CLAMP_TO_EDGE as _,
                 );
-                texture
+                CachedTexture {
+                    context_token,
+                    texture,
+                    pixel_version: 0,
+                }
             }
+        };
+        gles.BindTexture(gles11::TEXTURE_2D, cached.texture);
+        if cached.pixel_version != pixel_version {
+            gles.TexSubImage2D(
+                gles11::TEXTURE_2D,
+                0,
+                0,
+                0,
+                PANEL_WIDTH as _,
+                PANEL_HEIGHT as _,
+                gles11::RGBA,
+                gles11::UNSIGNED_BYTE,
+                pixels.as_ptr() as *const GLvoid,
+            );
+            cached.pixel_version = pixel_version;
         }
+        *texture_slot = Some(cached);
+        cached.texture
     };
-    gles.BindTexture(gles11::TEXTURE_2D, texture);
-    gles.TexSubImage2D(
-        gles11::TEXTURE_2D,
-        0,
-        0,
-        0,
-        PANEL_WIDTH as _,
-        PANEL_HEIGHT as _,
-        gles11::RGBA,
-        gles11::UNSIGNED_BYTE,
-        pixels.as_ptr() as *const GLvoid,
-    );
 
     gles.MatrixMode(gles11::PROJECTION);
-    gles.PushMatrix();
     gles.LoadIdentity();
     gles.Orthof(
         0.0,
@@ -530,13 +602,18 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
         1.0,
     );
     gles.MatrixMode(gles11::MODELVIEW);
-    gles.PushMatrix();
     gles.LoadIdentity();
     gles.EnableClientState(gles11::VERTEX_ARRAY);
     gles.EnableClientState(gles11::TEXTURE_COORD_ARRAY);
     gles.Enable(gles11::TEXTURE_2D);
     gles.Disable(gles11::BLEND);
     gles.Color4f(1.0, 1.0, 1.0, 1.0);
+    gles.ColorMask(gles11::TRUE, gles11::TRUE, gles11::TRUE, gles11::TRUE);
+    gles.TexEnvi(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        gles11::REPLACE as GLint,
+    );
     for (capability, _) in &old_overlay_caps {
         gles.Disable(*capability);
     }
@@ -554,19 +631,21 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     gles.TexCoordPointer(2, gles11::FLOAT, 0, texcoords.as_ptr() as *const GLvoid);
     gles.DrawArrays(gles11::TRIANGLE_STRIP, 0, 4);
 
-    gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer as _);
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_vertex_array_buffer as _);
     gles.VertexPointer(
         old_vertex_size,
         old_vertex_type as _,
         old_vertex_stride,
         old_vertex_pointer,
     );
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_texcoord_array_buffer as _);
     gles.TexCoordPointer(
         old_texcoord_size,
         old_texcoord_type as _,
         old_texcoord_stride,
         old_texcoord_pointer,
     );
+    gles.BindBuffer(gles11::ARRAY_BUFFER, old_array_buffer as _);
     gles.Color4f(old_color[0], old_color[1], old_color[2], old_color[3]);
 
     for (capability, was_enabled) in old_overlay_caps {
@@ -590,10 +669,23 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_
     if old_texture_array != gles11::TRUE {
         gles.DisableClientState(gles11::TEXTURE_COORD_ARRAY);
     }
+    gles.ClientActiveTexture(old_client_active_texture as _);
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
+    let old_texture_env_mode = [old_texture_env_mode];
+    gles.TexEnviv(
+        gles11::TEXTURE_ENV,
+        gles11::TEXTURE_ENV_MODE,
+        old_texture_env_mode.as_ptr(),
+    );
     gles.MatrixMode(gles11::MODELVIEW);
-    gles.PopMatrix();
+    gles.LoadMatrixf(old_modelview_matrix.as_ptr());
     gles.MatrixMode(gles11::PROJECTION);
-    gles.PopMatrix();
+    gles.LoadMatrixf(old_projection_matrix.as_ptr());
     gles.MatrixMode(old_matrix_mode as _);
     gles.ActiveTexture(old_active_texture as _);
 }
@@ -654,7 +746,12 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
     else {
         return;
     };
-    fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+    let requested_pixel_version = PIXEL_VERSION.load(Ordering::Relaxed);
+    if PIXELS_VERSION.load(Ordering::Relaxed) != requested_pixel_version {
+        fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+        PIXELS_VERSION.store(requested_pixel_version, Ordering::Relaxed);
+    }
+    let pixel_version = PIXELS_VERSION.load(Ordering::Relaxed);
 
     let mut old_active_texture: GLint = 0;
     gles.GetIntegerv(gles2::ACTIVE_TEXTURE, &mut old_active_texture);
@@ -662,9 +759,11 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
     let mut old_texture: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture);
     let texture = {
-        let mut texture_slot = ES2_TEXTURE.lock().unwrap();
-        match *texture_slot {
-            Some((old_context, texture)) if old_context == context_token => texture,
+        let mut texture_slot = ES2_TEXTURE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cached = match *texture_slot {
+            Some(cached) if cached.context_token == context_token => cached,
             _ => {
                 let mut texture = 0;
                 gles.GenTextures(1, &mut texture);
@@ -700,23 +799,31 @@ pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), cont
                     gles2::UNSIGNED_BYTE,
                     std::ptr::null(),
                 );
-                *texture_slot = Some((context_token, texture));
-                texture
+                CachedTexture {
+                    context_token,
+                    texture,
+                    pixel_version: 0,
+                }
             }
+        };
+        gles.BindTexture(gles2::TEXTURE_2D, cached.texture);
+        if cached.pixel_version != pixel_version {
+            gles.TexSubImage2D(
+                gles2::TEXTURE_2D,
+                0,
+                0,
+                0,
+                PANEL_WIDTH as _,
+                PANEL_HEIGHT as _,
+                gles2::RGBA,
+                gles2::UNSIGNED_BYTE,
+                pixels.as_ptr() as *const GLvoid,
+            );
+            cached.pixel_version = pixel_version;
         }
+        *texture_slot = Some(cached);
+        cached.texture
     };
-    gles.BindTexture(gles2::TEXTURE_2D, texture);
-    gles.TexSubImage2D(
-        gles2::TEXTURE_2D,
-        0,
-        0,
-        0,
-        PANEL_WIDTH as _,
-        PANEL_HEIGHT as _,
-        gles2::RGBA,
-        gles2::UNSIGNED_BYTE,
-        pixels.as_ptr() as *const GLvoid,
-    );
 
     crate::trainer_ui::draw_texture_es2(
         gles,
@@ -924,6 +1031,60 @@ fn set_pixel(buffer: &mut [u8], x: usize, y: usize, color: [u8; 3]) {
     buffer[offset + 3] = 0xFF;
 }
 
+fn logical_processor_count() -> usize {
+    #[cfg(target_os = "android")]
+    if let Some(count) = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|online| parse_cpu_list(&online))
+    {
+        return count;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if count > 0 {
+            return count as usize;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
+#[cfg(any(target_os = "android", test))]
+fn parse_cpu_list(contents: &str) -> Option<usize> {
+    let mut count = 0usize;
+    for range in contents.trim().split(',') {
+        if range.is_empty() {
+            return None;
+        }
+        let (first, last) = match range.split_once('-') {
+            Some((first, last)) => (first.parse::<usize>().ok()?, last.parse::<usize>().ok()?),
+            None => {
+                let cpu = range.parse::<usize>().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if last < first {
+            return None;
+        }
+        count = count.checked_add(last.checked_sub(first)?.checked_add(1)?)?;
+    }
+    (count > 0).then_some(count)
+}
+
+fn normalized_cpu_percent(cpu_seconds: f64, wall_seconds: f64, processors: usize) -> Option<f64> {
+    if !cpu_seconds.is_finite()
+        || !wall_seconds.is_finite()
+        || wall_seconds <= 0.0
+        || processors == 0
+    {
+        return None;
+    }
+    Some((cpu_seconds.max(0.0) / wall_seconds / processors as f64 * 100.0).clamp(0.0, 100.0))
+}
+
 #[cfg(unix)]
 fn process_cpu_seconds() -> Option<f64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
@@ -999,9 +1160,9 @@ fn gpu_percent_label() -> String {
     gpu_percent().map_or_else(|| "N/A".to_string(), |percent| format!("{percent:.0}%"))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 static GPU_PERCENT_BITS: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "android"))]
 static GPU_SAMPLE_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "windows")]
 static GPU_QUERY: AtomicUsize = AtomicUsize::new(0);
@@ -1014,9 +1175,92 @@ fn gpu_percent() -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "android")]
+fn gpu_percent() -> Option<f64> {
+    let value = f64::from_bits(GPU_PERCENT_BITS.load(Ordering::Relaxed));
+    value.is_finite().then_some(value)
+}
+
+#[cfg(target_os = "android")]
+fn collect_gpu_sample() -> Option<f64> {
+    const KNOWN_PATHS: &[&str] = &[
+        "/sys/module/ged/parameters/gpu_loading",
+        "/sys/kernel/ged/hal/gpu_utilization",
+        "/sys/kernel/ged/hal/gpu_loading",
+        "/sys/kernel/ged/hal/current/gpu_loading",
+        "/sys/devices/platform/soc/13000000.mali/gpu_utilization",
+        "/sys/devices/platform/soc/13000000.mali/devfreq/load",
+        "/sys/class/misc/mali0/device/gpu_utilization",
+        "/sys/class/misc/mali0/device/utilization",
+        "/sys/class/misc/mali0/device/devfreq/load",
+    ];
+    for path in KNOWN_PATHS {
+        if let Some(value) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| parse_gpu_percent(&contents))
+        {
+            return Some(value);
+        }
+    }
+    for root in ["/sys/class/devfreq", "/sys/class/misc", "/sys/devices/platform/soc"] {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if !name.contains("gpu") && !name.contains("mali") {
+                continue;
+            }
+            let base = entry.path();
+            let paths = if root == "/sys/class/devfreq" {
+                vec![
+                    base.join("gpu_loading"),
+                    base.join("gpu_utilization"),
+                    base.join("utilization"),
+                    base.join("load"),
+                ]
+            } else if root == "/sys/class/misc" {
+                vec![
+                    base.join("device/gpu_utilization"),
+                    base.join("device/gpu_loading"),
+                    base.join("device/utilization"),
+                    base.join("device/devfreq/load"),
+                ]
+            } else {
+                vec![
+                    base.join("gpu_utilization"),
+                    base.join("gpu_loading"),
+                    base.join("utilization"),
+                    base.join("devfreq/load"),
+                ]
+            };
+            for path in paths {
+                if let Some(value) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|contents| parse_gpu_percent(&contents))
+                {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn gpu_percent() -> Option<f64> {
     None
+}
+
+#[cfg(any(target_os = "android", test))]
+fn parse_gpu_percent(contents: &str) -> Option<f64> {
+    let contents = contents.trim();
+    let value = contents.strip_suffix('%').unwrap_or(contents).trim();
+    if value.split_whitespace().count() != 1 {
+        return None;
+    }
+    let value = value.parse::<f64>().ok()?;
+    (value.is_finite() && (0.0..=100.0).contains(&value)).then_some(value)
 }
 
 #[cfg(target_os = "windows")]
@@ -1040,7 +1284,28 @@ fn request_gpu_sample() {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "android")]
+fn request_gpu_sample() {
+    if GPU_SAMPLE_PENDING
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("touchHLE-GPU-meter".to_string())
+        .spawn(|| {
+            let value = collect_gpu_sample().unwrap_or(f64::NAN);
+            GPU_PERCENT_BITS.store(value.to_bits(), Ordering::Relaxed);
+            GPU_SAMPLE_PENDING.store(false, Ordering::Relaxed);
+        })
+        .is_err()
+    {
+        GPU_SAMPLE_PENDING.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn request_gpu_sample() {}
 
 #[cfg(target_os = "windows")]
@@ -1136,6 +1401,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gpu_percent_parser_accepts_only_single_percent_values() {
+        assert_eq!(parse_gpu_percent("42\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("42%\n"), Some(42.0));
+        assert_eq!(parse_gpu_percent("0"), Some(0.0));
+        assert_eq!(parse_gpu_percent("100"), Some(100.0));
+        assert_eq!(parse_gpu_percent("42 800000"), None);
+        assert_eq!(parse_gpu_percent("101"), None);
+        assert_eq!(parse_gpu_percent("-1"), None);
+        assert_eq!(parse_gpu_percent("N/A"), None);
+    }
+
+    #[test]
     fn corner_cycle_matches_sharpemu_clockwise_order() {
         let saved = CORNER.swap(0, Ordering::Relaxed);
         assert_eq!(cycle_corner(), "top-right");
@@ -1143,6 +1420,22 @@ mod tests {
         assert_eq!(cycle_corner(), "bottom-left");
         assert_eq!(cycle_corner(), "top-left");
         CORNER.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn cpu_list_parser_counts_online_cpus() {
+        assert_eq!(parse_cpu_list("0-7\n"), Some(8));
+        assert_eq!(parse_cpu_list("0-3,5,7-8"), Some(7));
+        assert_eq!(parse_cpu_list(""), None);
+        assert_eq!(parse_cpu_list("3-1"), None);
+        assert_eq!(parse_cpu_list("0,broken"), None);
+    }
+
+    #[test]
+    fn cpu_usage_is_normalized_against_all_logical_processors() {
+        assert_eq!(normalized_cpu_percent(1.0, 1.0, 8), Some(12.5));
+        assert_eq!(normalized_cpu_percent(8.0, 1.0, 8), Some(100.0));
+        assert_eq!(normalized_cpu_percent(1.0, 0.0, 8), None);
     }
 
     #[test]

@@ -915,6 +915,7 @@ pub struct Window {
     scale_hack: NonZeroU32,
     host_screen_size: Option<(u32, u32)>,
     internal_gl_ins: Option<Box<dyn GLESContext>>,
+    perf_context_token: usize,
     /// Cached `GL_VERSION / GL_VENDOR / GL_RENDERER` string of the internal
     /// OpenGL ES context, captured at window creation. Used to detect the host
     /// GLES driver (e.g. whether we are running through ANGLE or on a vendor's
@@ -1335,6 +1336,7 @@ impl Window {
             scale_hack,
             host_screen_size,
             internal_gl_ins: None,
+            perf_context_token: crate::gles::perf_overlay::allocate_context_token(),
             gl_driver_description: String::new(),
             host_framebuffer: 0,
             splash_image,
@@ -2655,7 +2657,7 @@ impl Window {
                 viewport,
                 matrix,
                 /* virtual_cursor_visible_at: */ None,
-                0,
+                self.perf_context_token,
             );
 
             gl_ctx.DeleteTextures(1, &texture);
@@ -2906,6 +2908,10 @@ impl Window {
 
     pub fn host_framebuffer(&self) -> u32 {
         self.host_framebuffer
+    }
+
+    pub(crate) fn perf_context_token(&self) -> usize {
+        self.perf_context_token
     }
 
     /// Special offset to add to y co-ordinates, only when drawing to screen.

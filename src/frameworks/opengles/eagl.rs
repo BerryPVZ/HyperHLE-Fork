@@ -30,7 +30,7 @@ use crate::Environment;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Copy, Clone)]
@@ -371,7 +371,6 @@ pub(super) struct EAGLContextHostObject {
 }
 impl HostObject for EAGLContextHostObject {}
 
-static NEXT_PRESENT_TOKEN: AtomicUsize = AtomicUsize::new(1);
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -414,7 +413,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)alloc {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
-        present_token: NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        present_token: crate::gles::perf_overlay::allocate_context_token(),
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -2198,8 +2197,8 @@ fn invalidate_present_cache_for_context(context_token: usize) {
 #[cfg(test)]
 #[test]
 fn presenter_cache_is_invalidated_across_recreated_contexts() {
-    let first = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let second = NEXT_PRESENT_TOKEN.fetch_add(1, Ordering::Relaxed);
+    let first = crate::gles::perf_overlay::allocate_context_token();
+    let second = crate::gles::perf_overlay::allocate_context_token();
     assert_ne!(first, second);
 
     invalidate_present_cache_for_context(first);

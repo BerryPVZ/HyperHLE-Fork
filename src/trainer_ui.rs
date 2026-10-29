@@ -1861,6 +1861,16 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut old_tex0: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
+    let mut old_color_mask = [gles2::TRUE; 4];
+    gles.GetBooleanv(gles2::COLOR_WRITEMASK, old_color_mask.as_mut_ptr());
+    let overlay_caps = [
+        gles2::SCISSOR_TEST,
+        gles2::DEPTH_TEST,
+        gles2::CULL_FACE,
+        gles2::STENCIL_TEST,
+        gles2::SAMPLE_ALPHA_TO_COVERAGE,
+    ];
+    let old_overlay_caps = overlay_caps.map(|cap| (cap, gles.IsEnabled(cap) != 0));
     let mut old_blend_src_rgb: GLint = 0;
     let mut old_blend_dst_rgb: GLint = 0;
     let mut old_blend_src_alpha: GLint = 0;
@@ -1909,6 +1919,10 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let vbo = ensure_overlay_vbo(gles);
     let white = ensure_overlay_white_tex(gles);
 
+    gles.ColorMask(gles2::TRUE, gles2::TRUE, gles2::TRUE, gles2::TRUE);
+    for (cap, _) in old_overlay_caps {
+        gles.Disable(cap);
+    }
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
     gles.Uniform1i(program.u_tex, 0);
@@ -2003,6 +2017,17 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     } else {
         gles.Disable(gles2::BLEND);
     }
+    for (cap, was_enabled) in old_overlay_caps {
+        if was_enabled {
+            gles.Enable(cap);
+        }
+    }
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
     gles.BindTexture(gles2::TEXTURE_2D, old_tex0 as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as _);
