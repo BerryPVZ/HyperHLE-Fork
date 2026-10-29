@@ -1203,31 +1203,52 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
 
 /// Entry point for native OpenGL ES 2.0 present paths (see
 /// present_renderbuffer_es2), which lack the fixed-function pipeline.
+fn prepare_es2_overlay_context(context_token: usize) {
+    let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
+    if *stored != Some(context_token) {
+        *stored = Some(context_token);
+        drop(stored);
+        *OVERLAY_PROGRAM.lock().unwrap() = None;
+        *OVERLAY_VBO.lock().unwrap() = None;
+        *OVERLAY_WHITE_TEX.lock().unwrap() = None;
+        invalidate_atlas();
+    }
+}
+
 pub unsafe fn draw_es2(
     gles: &mut dyn GLES,
     viewport: (u32, u32, u32, u32),
     context_token: usize,
 ) {
-    // When the game switches EAGL contexts (e.g. between apps or between
-    // context instances), all our cached GL objects (program, VBO, atlas
-    // texture) belong to a dead context. Drop them so they get rebuilt.
-    {
-        let mut stored = OVERLAY_CONTEXT_TOKEN.lock().unwrap();
-        if *stored != Some(context_token) {
-            *stored = Some(context_token);
-            drop(stored);
-            *OVERLAY_PROGRAM.lock().unwrap() = None;
-            *OVERLAY_VBO.lock().unwrap() = None;
-            // The solid-quad texture is context-owned too. Reusing its old
-            // name can sample an unrelated texture in the new context.
-            *OVERLAY_WHITE_TEX.lock().unwrap() = None;
-            invalidate_atlas();
-        }
-    }
+    prepare_es2_overlay_context(context_token);
     let Some(quads) = build_scene(gles, viewport) else {
         return;
     };
     render_es2(gles, viewport, &quads);
+}
+
+pub unsafe fn draw_texture_es2(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    context_token: usize,
+    texture: GLuint,
+    rect: (f32, f32, f32, f32),
+    uv: (f32, f32),
+) {
+    prepare_es2_overlay_context(context_token);
+    let quad = Quad {
+        tex: texture,
+        x: rect.0,
+        y: rect.1,
+        w: rect.2,
+        h: rect.3,
+        u0: 0.0,
+        v0: 0.0,
+        u1: uv.0,
+        v1: uv.1,
+        col: (1.0, 1.0, 1.0, 1.0),
+    };
+    render_es2(gles, viewport, &[quad]);
 }
 
 /// Build the overlay scene (shared by both renderers). Returns None when the

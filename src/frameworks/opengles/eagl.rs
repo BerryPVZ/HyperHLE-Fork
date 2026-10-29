@@ -2023,6 +2023,7 @@ unsafe fn present_renderbuffer_es2(
     // Cheat Engine-style trainer overlay (floating button + panel), drawn
     // with a dedicated ES 2.0 shader so it also works on native ES 2.0
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
+    crate::gles::perf_overlay::draw_es2(gles, viewport, context_token);
     crate::trainer_ui::draw_es2(gles, viewport, context_token);
 
     // Optional: virtual cursor.

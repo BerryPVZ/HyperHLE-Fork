@@ -34,6 +34,7 @@ static HISTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
 static FRAME_MILLISECONDS: [AtomicU32; HISTORY_SIZE] = [const { AtomicU32::new(0) }; HISTORY_SIZE];
 static PROCESS_ORIGIN: OnceLock<Instant> = OnceLock::new();
 static OVERLAY_TEXTURE: AtomicU32 = AtomicU32::new(0);
+static ES2_TEXTURE: Mutex<Option<(usize, u32)>> = Mutex::new(None);
 static PIXELS: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
 static STATS: OnceLock<Mutex<Stats>> = OnceLock::new();
 
@@ -348,10 +349,13 @@ pub fn take_title_bar_summary() -> Option<String> {
 pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
     use gles11::types::*;
 
-    if !enabled() || mode() == PerformanceOverlayMode::TitleBar {
+    if !enabled() {
         return;
     }
     let selected_mode = mode();
+    if selected_mode == PerformanceOverlayMode::TitleBar {
+        return;
+    }
     let (display_width, display_height) = if selected_mode == PerformanceOverlayMode::Full {
         (PANEL_WIDTH, PANEL_HEIGHT)
     } else {
@@ -570,6 +574,141 @@ pub unsafe fn draw(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32)) {
     gles.MatrixMode(gles11::PROJECTION);
     gles.PopMatrix();
     gles.MatrixMode(old_matrix_mode as _);
+    gles.ActiveTexture(old_active_texture as _);
+}
+
+pub unsafe fn draw_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), context_token: usize) {
+    use super::gles2_raw as gles2;
+    use gles2::types::*;
+
+    if !enabled() {
+        return;
+    }
+    let selected_mode = mode();
+    if selected_mode == PerformanceOverlayMode::TitleBar {
+        return;
+    }
+    let (display_width, display_height) = if selected_mode == PerformanceOverlayMode::Full {
+        (PANEL_WIDTH, PANEL_HEIGHT)
+    } else {
+        (MINIMAL_WIDTH, MINIMAL_HEIGHT)
+    };
+    let (_, _, viewport_width, viewport_height) = viewport;
+    let horizontal_margin = 12.min(viewport_width as usize / 2);
+    let vertical_margin = 12.min(viewport_height as usize / 2);
+    let width = (viewport_width as usize)
+        .saturating_sub(2 * horizontal_margin)
+        .min(display_width);
+    let height = (viewport_height as usize)
+        .saturating_sub(2 * vertical_margin)
+        .min(display_height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let selected_corner = corner();
+    let left = if matches!(
+        selected_corner,
+        PerformanceOverlayCorner::TopRight | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_width as usize - horizontal_margin - width
+    } else {
+        horizontal_margin
+    };
+    let top = if matches!(
+        selected_corner,
+        PerformanceOverlayCorner::BottomLeft | PerformanceOverlayCorner::BottomRight
+    ) {
+        viewport_height as usize - vertical_margin - height
+    } else {
+        vertical_margin
+    };
+
+    let Ok(mut stats) = stats().lock() else {
+        return;
+    };
+    refresh_stats(&mut stats);
+    let Ok(mut pixels) = PIXELS
+        .get_or_init(|| Mutex::new(vec![0; PIXEL_BYTES]))
+        .lock()
+    else {
+        return;
+    };
+    fill_pixels(&mut pixels, &stats, selected_mode, display_width);
+
+    let mut old_active_texture: GLint = 0;
+    gles.GetIntegerv(gles2::ACTIVE_TEXTURE, &mut old_active_texture);
+    gles.ActiveTexture(gles2::TEXTURE0);
+    let mut old_texture: GLint = 0;
+    gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_texture);
+    let texture = {
+        let mut texture_slot = ES2_TEXTURE.lock().unwrap();
+        match *texture_slot {
+            Some((old_context, texture)) if old_context == context_token => texture,
+            _ => {
+                let mut texture = 0;
+                gles.GenTextures(1, &mut texture);
+                gles.BindTexture(gles2::TEXTURE_2D, texture);
+                gles.TexParameteri(
+                    gles2::TEXTURE_2D,
+                    gles2::TEXTURE_MIN_FILTER,
+                    gles2::NEAREST as _,
+                );
+                gles.TexParameteri(
+                    gles2::TEXTURE_2D,
+                    gles2::TEXTURE_MAG_FILTER,
+                    gles2::NEAREST as _,
+                );
+                gles.TexParameteri(
+                    gles2::TEXTURE_2D,
+                    gles2::TEXTURE_WRAP_S,
+                    gles2::CLAMP_TO_EDGE as _,
+                );
+                gles.TexParameteri(
+                    gles2::TEXTURE_2D,
+                    gles2::TEXTURE_WRAP_T,
+                    gles2::CLAMP_TO_EDGE as _,
+                );
+                gles.TexImage2D(
+                    gles2::TEXTURE_2D,
+                    0,
+                    gles2::RGBA as _,
+                    PANEL_WIDTH as _,
+                    PANEL_HEIGHT as _,
+                    0,
+                    gles2::RGBA,
+                    gles2::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                *texture_slot = Some((context_token, texture));
+                texture
+            }
+        }
+    };
+    gles.BindTexture(gles2::TEXTURE_2D, texture);
+    gles.TexSubImage2D(
+        gles2::TEXTURE_2D,
+        0,
+        0,
+        0,
+        PANEL_WIDTH as _,
+        PANEL_HEIGHT as _,
+        gles2::RGBA,
+        gles2::UNSIGNED_BYTE,
+        pixels.as_ptr() as *const GLvoid,
+    );
+
+    crate::trainer_ui::draw_texture_es2(
+        gles,
+        viewport,
+        context_token,
+        texture,
+        (left as f32, top as f32, width as f32, height as f32),
+        (
+            width as f32 / PANEL_WIDTH as f32,
+            height as f32 / PANEL_HEIGHT as f32,
+        ),
+    );
+    gles.BindTexture(gles2::TEXTURE_2D, old_texture as _);
     gles.ActiveTexture(old_active_texture as _);
 }
 
