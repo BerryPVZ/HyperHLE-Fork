@@ -7,7 +7,7 @@
 
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::mach::init::MACH_TASK_SELF;
-use crate::libc::mach::port::mach_port_t;
+use crate::libc::mach::port::{mach_port_t, MACH_PORT_NULL};
 use crate::libc::mach::thread_info::{
     kern_return_t, KERN_INVALID_ADDRESS, KERN_INVALID_ARGUMENT, KERN_INVALID_TASK, KERN_SUCCESS,
 };
@@ -27,6 +27,34 @@ type vm_inherit_t = u32;
 const VM_PROT_READ: vm_prot_t = 1;
 const VM_PROT_WRITE: vm_prot_t = 2;
 const VM_PROT_EXECUTE: vm_prot_t = 4;
+
+/// `VM_FLAGS_ANYWHERE` — let the kernel choose the address.
+const VM_FLAGS_ANYWHERE: i32 = 1;
+const KERN_NO_SPACE: kern_return_t = 3;
+const KERN_INVALID_RIGHT: kern_return_t = 17;
+
+/// `memory_object_size_t` and `memory_object_offset_t` are 64-bit even on
+/// 32-bit iOS, so the memory-entry API takes and returns `u64` sizes.
+type memory_object_size_t = u64;
+type memory_object_offset_t = u64;
+
+/// What a port created by `mach_make_memory_entry_64` names: a guest range.
+///
+/// A real memory entry owns the physical pages behind a range, so mappings
+/// created from it share those pages and see each other's writes. The guest
+/// here has one flat address space and pages that cannot be aliased, so
+/// `vm_map` copies the bytes instead: the new mapping reads back the same
+/// contents, but writes to it do not reach the source. Callers that map a
+/// memory entry read-only (the usual reason to create one) are unaffected.
+#[derive(Clone, Copy)]
+pub(super) struct MemoryEntry {
+    /// Guest address of the first byte the entry names.
+    address: mach_vm_address_t,
+    /// Page-rounded length of the named range.
+    size: mach_vm_size_t,
+    /// Protection the entry was created with, in `vm_prot_t` bits.
+    permission: vm_prot_t,
+}
 
 #[derive(Default)]
 pub struct State {
@@ -396,6 +424,265 @@ fn vm_remap(
     KERN_SUCCESS
 }
 
+/// `kern_return_t mach_make_memory_entry_64(vm_map_t target_task,
+/// memory_object_size_t *size, memory_object_offset_t offset,
+/// vm_prot_t permission, mach_port_t *object_handle,
+/// mem_entry_name_port_t parent_entry)`
+///
+/// Hands out a port naming the pages at `offset` in this task; `vm_map` turns
+/// it back into a mapping. `size` is in/out: the caller's length is rounded up
+/// to whole pages, as the kernel does, and the rounded length is written back.
+fn mach_make_memory_entry_64(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    size_ptr: MutPtr<memory_object_size_t>,
+    offset: memory_object_offset_t,
+    permission: vm_prot_t,
+    object_handle: MutPtr<mach_port_t>,
+    parent_entry: mach_port_t,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF {
+        log!(
+            "Warning: mach_make_memory_entry_64: unsupported task port {:#x}; \
+             returning KERN_INVALID_TASK.",
+            target_task
+        );
+        return KERN_INVALID_TASK;
+    }
+    if size_ptr.is_null() || object_handle.is_null() {
+        log!(
+            "Warning: mach_make_memory_entry_64: null size/port pointer; \
+             returning KERN_INVALID_ARGUMENT."
+        );
+        return KERN_INVALID_ARGUMENT;
+    }
+
+    let requested = env.mem.read(size_ptr);
+    if requested == 0 || requested > u64::from(u32::MAX) {
+        log!(
+            "Warning: mach_make_memory_entry_64: unreasonable size {:#x}; \
+             returning KERN_INVALID_ARGUMENT.",
+            requested
+        );
+        return KERN_INVALID_ARGUMENT;
+    }
+    if offset > u64::from(u32::MAX) {
+        log!(
+            "Warning: mach_make_memory_entry_64: offset {:#x} is outside the \
+             guest address space; returning KERN_INVALID_ADDRESS.",
+            offset
+        );
+        return KERN_INVALID_ADDRESS;
+    }
+
+    let size = round_up_to_page(requested as mach_vm_size_t);
+    let address = offset as mach_vm_address_t;
+    if !guest_range_is_valid(&env.mem, address, size) {
+        log!(
+            "Warning: mach_make_memory_entry_64: invalid range {:#x}+{:#x}; \
+             returning KERN_INVALID_ADDRESS.",
+            address,
+            size
+        );
+        return KERN_INVALID_ADDRESS;
+    }
+    if parent_entry != MACH_PORT_NULL {
+        log_dbg!(
+            "mach_make_memory_entry_64: parent entry {:#x} ignored",
+            parent_entry
+        );
+    }
+
+    let Some(name) = env.libc_state.mach_ports.allocate() else {
+        return KERN_NO_SPACE;
+    };
+    let port = env.libc_state.mach_ports.ports.get_mut(&name).unwrap();
+    // The caller gets a send right to the entry. A real `vm_map` would consume
+    // it; here the handle stays usable so apps that map the same entry twice
+    // keep working, and dropping the last reference in `mach_port_mod_refs`
+    // still releases the record.
+    port.send_refs = 1;
+    port.memory_entry = Some(MemoryEntry {
+        address,
+        size,
+        permission,
+    });
+
+    env.mem.write(size_ptr, u64::from(size));
+    env.mem.write(object_handle, name);
+    log_dbg!(
+        "mach_make_memory_entry_64({:#x}, {:#x}, prot {:#x}) -> port {:#x}",
+        address,
+        size,
+        permission,
+        name
+    );
+    KERN_SUCCESS
+}
+
+/// Shared by `vm_map` and its unit tests: allocate a page-aligned region, copy
+/// `size` bytes from `offset` bytes into the entry's range, and return the new
+/// address.
+fn map_memory_entry_in_memory(
+    mem: &mut Mem,
+    entry: MemoryEntry,
+    offset: mach_vm_address_t,
+    size: mach_vm_size_t,
+) -> Result<mach_vm_address_t, kern_return_t> {
+    if size == 0 {
+        log!("Warning: vm_map: zero size; returning KERN_INVALID_ARGUMENT.");
+        return Err(KERN_INVALID_ARGUMENT);
+    }
+    if u64::from(offset) + u64::from(size) > u64::from(entry.size) {
+        log!(
+            "Warning: vm_map: {:#x}+{:#x} runs past the memory entry ({:#x} \
+             bytes); returning KERN_INVALID_ADDRESS.",
+            offset,
+            size,
+            entry.size
+        );
+        return Err(KERN_INVALID_ADDRESS);
+    }
+
+    // `size` is always rounded up to an integral number of pages.
+    let new_size = round_up_to_page(size);
+    let source: ConstPtr<u8> = Ptr::from_bits(entry.address.saturating_add(offset));
+    let destination: MutPtr<u8> = mem.alloc(new_size).cast();
+    assert!(destination.to_bits() & PAGE_SIZE_ALIGN_MASK == 0);
+    mem.memmove(destination.cast_void(), source.cast_void(), size);
+    Ok(destination.to_bits())
+}
+
+/// Shared by `vm_map` and its unit tests: back a mapping of a null memory
+/// object with fresh zero-filled pages and return their address.
+fn map_anonymous_in_memory(mem: &mut Mem, size: mach_vm_size_t) -> Option<mach_vm_address_t> {
+    if size == 0 {
+        return None;
+    }
+    let new_size = round_up_to_page(size);
+    let destination: MutPtr<u8> = mem.calloc(new_size).cast();
+    assert!(destination.to_bits() & PAGE_SIZE_ALIGN_MASK == 0);
+    Some(destination.to_bits())
+}
+
+/// `kern_return_t vm_map(vm_map_t target_task, vm_address_t *address,
+/// vm_size_t size, vm_address_t mask, int flags, mem_entry_name_port_t object,
+/// vm_offset_t offset, boolean_t copy, vm_prot_t cur_protection,
+/// vm_prot_t max_protection, vm_inherit_t inheritance)`
+///
+/// Maps `size` bytes of the memory entry `object`, starting `offset` bytes into
+/// it. The kernel would alias the entry's pages; this maps a copy instead (see
+/// `MemoryEntry`). A fixed address (no `VM_FLAGS_ANYWHERE`) is a hint here, so
+/// the address actually used is always written back. A `MACH_PORT_NULL` object
+/// asks for anonymous zero-filled pages, as on a real kernel. Note that unlike
+/// `vm_remap`, `cur_protection` and `max_protection` are passed by value here.
+#[allow(clippy::too_many_arguments)]
+fn vm_map(
+    env: &mut Environment,
+    target_task: vm_map_t,
+    address: MutPtr<mach_vm_address_t>,
+    size: mach_vm_size_t,
+    mask: mach_vm_address_t,
+    flags: i32,
+    object: mach_port_t,
+    offset: u32,
+    copy: i32,
+    cur_protection: vm_prot_t,
+    max_protection: vm_prot_t,
+    inheritance: vm_inherit_t,
+) -> kern_return_t {
+    if target_task != MACH_TASK_SELF {
+        log!(
+            "Warning: vm_map: unsupported task port {:#x}; returning \
+             KERN_INVALID_TASK.",
+            target_task
+        );
+        return KERN_INVALID_TASK;
+    }
+    if address.is_null() {
+        log!("Warning: vm_map: null address pointer; returning KERN_INVALID_ARGUMENT.");
+        return KERN_INVALID_ARGUMENT;
+    }
+
+    let hint = env.mem.read(address);
+    if hint != 0 && flags & VM_FLAGS_ANYWHERE == 0 {
+        log_dbg!(
+            "vm_map: requested fixed address {:#x} is a hint here; mapping elsewhere",
+            hint
+        );
+    }
+    let (mapped, entry_permission) = if object == MACH_PORT_NULL {
+        // A null memory-object port asks the kernel to create a fresh
+        // zero-filled object for the mapping, which is how anonymous shared
+        // memory is set up.
+        match map_anonymous_in_memory(&mut env.mem, size) {
+            Some(mapped) => (mapped, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE),
+            None => {
+                log!(
+                    "Warning: vm_map: zero size; \
+                     returning KERN_INVALID_ARGUMENT."
+                );
+                return KERN_INVALID_ARGUMENT;
+            }
+        }
+    } else {
+        // A name that is not a memory entry (a stray, already-released or
+        // bogus port) is a right error rather than an address error, as in
+        // the kernel.
+        let entry = env
+            .libc_state
+            .mach_ports
+            .ports
+            .get(&object)
+            .and_then(|port| port.memory_entry);
+        let Some(entry) = entry else {
+            log!(
+                "Warning: vm_map: port {:#x} does not name a memory entry; \
+                 returning KERN_INVALID_RIGHT.",
+                object
+            );
+            return KERN_INVALID_RIGHT;
+        };
+        match map_memory_entry_in_memory(&mut env.mem, entry, offset, size) {
+            Ok(mapped) => (mapped, entry.permission),
+            Err(err) => return err,
+        }
+    };
+
+    env.mem.write(address, mapped);
+    // Guest memory has no per-page protections, so the requested ones are
+    // only checked against the entry: a caller asking for more than the entry
+    // allows (a writable mapping of a read-only entry) still gets its copy,
+    // with a note in the log.
+    if cur_protection & !entry_permission != 0 {
+        log_dbg!(
+            "vm_map: requested protection {:#x} exceeds the entry's {:#x}; \
+             mapping anyway",
+            cur_protection,
+            entry_permission
+        );
+    }
+    let _ = (max_protection, mask, copy, inheritance);
+
+    assert!(!env.libc_state.mach_vm.allocations.contains_key(&mapped));
+    env.libc_state.mach_vm.allocations.insert(
+        mapped,
+        VmRegion {
+            size,
+            rounded_size: round_up_to_page(size),
+            released: Vec::new(),
+        },
+    );
+    log_dbg!(
+        "vm_map(port {:#x}, offset {:#x}, size {:#x}) mapped at {:#x}",
+        object,
+        offset,
+        size,
+        mapped
+    );
+    KERN_SUCCESS
+}
+
 fn vm_purgable_control(
     _env: &mut Environment,
     target_task: vm_map_t,
@@ -445,7 +732,6 @@ struct vm_region_basic_info_data_t {
     offset: u32,
 }
 unsafe impl SafeRead for vm_region_basic_info_data_t {}
-
 
 /// `kern_return_t vm_region_recurse(vm_map_t target_task,
 /// vm_address_t *address, vm_size_t *size, uint32_t *nesting_depth,
@@ -499,7 +785,9 @@ fn vm_region_recurse(
 }
 
 pub const FUNCTIONS: FunctionExports = &[
+    export_c_func!(mach_make_memory_entry_64(_, _, _, _, _, _)),
     export_c_func!(vm_allocate(_, _, _, _)),
+    export_c_func!(vm_map(_, _, _, _, _, _, _, _, _, _, _)),
     export_c_func!(vm_deallocate(_, _, _)),
     export_c_func!(vm_read_overwrite(_, _, _, _, _)),
     export_c_func!(vm_remap(_, _, _, _, _, _, _, _, _, _, _)),
@@ -612,5 +900,100 @@ mod vm_read_overwrite_tests {
             KERN_SUCCESS
         );
         assert_eq!(mem.read(outsize), 0);
+    }
+}
+
+#[cfg(test)]
+mod vm_map_tests {
+    use super::*;
+
+    fn new_test_mem() -> Mem {
+        let mut mem = Mem::new();
+        mem.set_null_segment_size(PAGE_SIZE);
+        mem
+    }
+
+    /// A two-page source range holding `len` bytes of a recognisable pattern.
+    fn source_with_pattern(mem: &mut Mem, len: mach_vm_size_t) -> (mach_vm_address_t, Vec<u8>) {
+        let source: MutPtr<u8> = mem.alloc(round_up_to_page(len)).cast();
+        let pattern: Vec<u8> = (0..len).map(|byte| (byte as u8) ^ 0x5A).collect();
+        mem.bytes_at_mut(source, len).copy_from_slice(&pattern);
+        (source.to_bits(), pattern)
+    }
+
+    fn entry_for(address: mach_vm_address_t, size: mach_vm_size_t) -> MemoryEntry {
+        MemoryEntry {
+            address,
+            size: round_up_to_page(size),
+            permission: VM_PROT_READ,
+        }
+    }
+
+    #[test]
+    fn mapping_an_entry_copies_its_bytes_into_a_fresh_region() {
+        let mut mem = new_test_mem();
+        let (source, pattern) = source_with_pattern(&mut mem, 64);
+
+        let mapped = map_memory_entry_in_memory(&mut mem, entry_for(source, 64), 0, 64).unwrap();
+
+        assert_ne!(mapped, source);
+        assert_eq!(mapped & PAGE_SIZE_ALIGN_MASK, 0);
+        let destination: ConstPtr<u8> = Ptr::from_bits(mapped);
+        assert_eq!(mem.bytes_at(destination, 64), pattern.as_slice());
+        // The source is untouched: a mapped entry is a copy, not an alias.
+        let origin: ConstPtr<u8> = Ptr::from_bits(source);
+        assert_eq!(mem.bytes_at(origin, 64), pattern.as_slice());
+    }
+
+    #[test]
+    fn mapping_a_subrange_starts_at_the_entry_offset() {
+        let mut mem = new_test_mem();
+        let (source, pattern) = source_with_pattern(&mut mem, 32);
+
+        let mapped = map_memory_entry_in_memory(&mut mem, entry_for(source, 32), 8, 16).unwrap();
+
+        let destination: ConstPtr<u8> = Ptr::from_bits(mapped);
+        assert_eq!(mem.bytes_at(destination, 16), &pattern[8..24]);
+    }
+
+    #[test]
+    fn mapping_past_the_end_of_the_entry_is_rejected() {
+        let mut mem = new_test_mem();
+        let (source, _) = source_with_pattern(&mut mem, 32);
+        // The entry is page-rounded, so anything inside its one page maps.
+        let entry = entry_for(source, 32);
+
+        assert_eq!(
+            map_memory_entry_in_memory(&mut mem, entry, PAGE_SIZE, 16),
+            Err(KERN_INVALID_ADDRESS)
+        );
+        // The last bytes of the page are still inside the entry.
+        assert!(map_memory_entry_in_memory(&mut mem, entry, PAGE_SIZE - 16, 16).is_ok());
+    }
+
+    #[test]
+    fn mapping_a_null_object_hands_out_zero_filled_pages() {
+        let mut mem = new_test_mem();
+        // Dirty the heap so the mapping cannot be "zero by accident".
+        let dirt: MutPtr<u8> = mem.alloc(PAGE_SIZE).cast();
+        mem.bytes_at_mut(dirt, PAGE_SIZE).fill(0xFF);
+
+        let mapped = map_anonymous_in_memory(&mut mem, 64).unwrap();
+
+        assert_eq!(mapped & PAGE_SIZE_ALIGN_MASK, 0);
+        let bytes: ConstPtr<u8> = Ptr::from_bits(mapped);
+        assert_eq!(mem.bytes_at(bytes, 64), &[0u8; 64]);
+        assert_eq!(map_anonymous_in_memory(&mut mem, 0), None);
+    }
+
+    #[test]
+    fn mapping_zero_bytes_is_rejected() {
+        let mut mem = new_test_mem();
+        let (source, _) = source_with_pattern(&mut mem, 32);
+
+        assert_eq!(
+            map_memory_entry_in_memory(&mut mem, entry_for(source, 32), 0, 0),
+            Err(KERN_INVALID_ARGUMENT)
+        );
     }
 }

@@ -11,6 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::mach::init::MACH_TASK_SELF;
 use crate::libc::mach::thread_info::{kern_return_t, KERN_INVALID_ARGUMENT, KERN_SUCCESS};
+use crate::libc::mach::vm_map::MemoryEntry;
 use crate::mem::MutPtr;
 use crate::Environment;
 
@@ -22,6 +23,9 @@ const KERN_UREFS_OVERFLOW: i32 = 19;
 pub(super) struct Port {
     pub send_refs: u32,
     pub messages: VecDeque<Vec<u8>>,
+    /// Set for ports handed out by `mach_make_memory_entry_64`: the guest range
+    /// the port names. `vm_map` maps a copy of those bytes.
+    pub(super) memory_entry: Option<MemoryEntry>,
 }
 
 pub(crate) struct State {
@@ -39,7 +43,7 @@ impl Default for State {
 }
 
 impl State {
-    fn allocate(&mut self) -> Option<u32> {
+    pub(super) fn allocate(&mut self) -> Option<u32> {
         let name = self.next_name;
         self.next_name = name.checked_add(4)?;
         self.ports.insert(name, Port::default());
@@ -82,8 +86,8 @@ fn mach_port_insert_right(
         return KERN_INVALID_NAME;
     };
     match disposition {
-        20 => (), // MAKE_SEND from the receive right
-        19 if port.send_refs != 0 => (), // COPY_SEND
+        20 => (),                                         // MAKE_SEND from the receive right
+        19 if port.send_refs != 0 => (),                  // COPY_SEND
         17 if port.send_refs != 0 => return KERN_SUCCESS, // MOVE_SEND to the same name
         _ => return KERN_INVALID_RIGHT,
     }
@@ -107,6 +111,7 @@ fn mach_port_mod_refs(
     let Some(port) = env.libc_state.mach_ports.ports.get_mut(&name) else {
         return KERN_INVALID_NAME;
     };
+    let mut dropped_last_send_ref = false;
     match right {
         0 if port.send_refs != 0 => {
             let refs = i64::from(port.send_refs) + i64::from(delta);
@@ -117,6 +122,7 @@ fn mach_port_mod_refs(
                 return KERN_UREFS_OVERFLOW;
             }
             port.send_refs = refs as u32;
+            dropped_last_send_ref = port.send_refs == 0;
         }
         1 if delta == 0 => (),
         1 if delta == -1 => {
@@ -125,6 +131,23 @@ fn mach_port_mod_refs(
         1 => return KERN_INVALID_ARGUMENT,
         _ => return KERN_INVALID_RIGHT,
     }
+
+    // A memory-entry port holds no receive right in the app's namespace (the
+    // kernel owns the memory object), so losing the last send reference ends
+    // its life. Dropping the record here keeps the port table from growing
+    // with every make-memory-entry/vm_map pair.
+    if dropped_last_send_ref {
+        let is_memory_entry = env
+            .libc_state
+            .mach_ports
+            .ports
+            .get(&name)
+            .is_some_and(|port| port.memory_entry.is_some());
+        if is_memory_entry {
+            env.libc_state.mach_ports.ports.remove(&name);
+        }
+    }
+
     KERN_SUCCESS
 }
 
