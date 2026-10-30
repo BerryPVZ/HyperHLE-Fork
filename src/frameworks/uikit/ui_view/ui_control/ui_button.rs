@@ -13,7 +13,7 @@ use crate::frameworks::foundation::{NSInteger, NSUInteger};
 use crate::frameworks::uikit::ui_font::{
     UITextAlignmentCenter, UITextAlignmentLeft, UITextAlignmentRight,
 };
-use crate::mem::SafeRead;
+use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
 use crate::objc::{
     autorelease, id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes,
     release, retain, ClassExports, HostObject, NSZonePtr,
@@ -42,18 +42,6 @@ const UIControlContentVerticalAlignmentCenter: UIControlContentVerticalAlignment
 const UIControlContentVerticalAlignmentTop: UIControlContentVerticalAlignment = 1;
 const UIControlContentVerticalAlignmentBottom: UIControlContentVerticalAlignment = 2;
 const UIControlContentVerticalAlignmentFill: UIControlContentVerticalAlignment = 3;
-
-// MARK: - Edge insets
-
-#[derive(Copy, Clone, Debug, Default)]
-#[repr(C, packed)]
-pub struct UIEdgeInsets {
-    pub top: CGFloat,
-    pub left: CGFloat,
-    pub bottom: CGFloat,
-    pub right: CGFloat,
-}
-unsafe impl SafeRead for UIEdgeInsets {}
 
 // MARK: - Host objects
 
