@@ -2,10 +2,11 @@
 //!
 //! See also [crate::frameworks::core_graphics::cg_geometry].
 
+use crate::abi::{GuestArg, GuestRet};
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
-use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
+use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::ns_string;
-use crate::mem::{ConstVoidPtr, MutVoidPtr, Ptr};
+use crate::mem::{ConstVoidPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::objc::{autorelease, id};
 use crate::Environment;
 
@@ -20,6 +21,37 @@ fn ui_edge_insets_zero(env: &mut Environment) -> ConstVoidPtr {
         env.mem.write(ptr.cast::<u8>() + i, 0u8);
     }
     Ptr::from_bits(ptr.to_bits())
+}
+
+/// `UIEdgeInsets` — `{ top, left, bottom, right }`, four CGFloats passed by
+/// value. See [ui_edge_insets_zero] for the layout Apple exposes as
+/// `UIEdgeInsetsZero`.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C, packed)]
+pub struct UIEdgeInsets {
+    pub top: CGFloat,
+    pub left: CGFloat,
+    pub bottom: CGFloat,
+    pub right: CGFloat,
+}
+unsafe impl SafeRead for UIEdgeInsets {}
+impl GuestRet for UIEdgeInsets {}
+impl GuestArg for UIEdgeInsets {
+    const REG_COUNT: usize = 4;
+    fn from_regs(regs: &[u32]) -> Self {
+        UIEdgeInsets {
+            top: GuestArg::from_regs(&regs[0..1]),
+            left: GuestArg::from_regs(&regs[1..2]),
+            bottom: GuestArg::from_regs(&regs[2..3]),
+            right: GuestArg::from_regs(&regs[3..4]),
+        }
+    }
+    fn to_regs(self, regs: &mut [u32]) {
+        GuestArg::to_regs(self.top, &mut regs[0..1]);
+        GuestArg::to_regs(self.left, &mut regs[1..2]);
+        GuestArg::to_regs(self.bottom, &mut regs[2..3]);
+        GuestArg::to_regs(self.right, &mut regs[3..4]);
+    }
 }
 
 #[derive(Default)]

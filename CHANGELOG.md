@@ -130,6 +130,8 @@ Compatibility:
 
 - Plants vs. Zombies 2 now uses an iPhone 4 profile because its bundle requires a front-facing camera; this change reaches the title/loading screen, but menu/gameplay support remains incomplete. (@j92580498-max)
 
+- `CGImageMaskCreate` now creates a real image mask instead of returning `NULL`, and `UIScreen`'s overscan properties exist. A mask is an inverse-alpha stencil, so it is decoded from the 1/2/4/8-bit samples the app supplies (most-significant-bit first, honouring `bytesPerRow` padding and the optional decode array) into the premultiplied coverage our drawing code already uses: `CGImageIsMask` reports true, `CGImageGetColorSpace` returns `NULL`, and `CGImageGetDataProvider`/`CGImageGetBytesPerRow`/`CGImageCreateWithImageInRect` keep speaking the app's own sample layout, so a mask can be round-tripped. `CGImageCreateWithMask` now applies the mask instead of returning the source image unchanged. `-[UIScreen setOverscanCompensation:]`/`-overscanCompensation` are stored (the emulated built-in display never overscans) and `-overscanCompensationInsets` returns a real `UIEdgeInsetsZero` instead of a single `float` in a struct-return register. `CGContextClipToMask` is still a stub. (@KlugKlugTG)
+
 - New working apps:
   - Devil May Cry 4 Refrain (@hikari-no-yume)
   - Amerzone Pt1 (@ciciplusplus)

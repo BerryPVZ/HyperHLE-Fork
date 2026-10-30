@@ -19,7 +19,7 @@ use crate::frameworks::foundation::ns_string::to_rust_string;
 use crate::frameworks::foundation::NSUInteger;
 use crate::fs::GuestPath;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutVoidPtr};
-use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, HostObject};
+use crate::objc::{id, msg, msg_class, nil, objc_classes, ClassExports, HostObject, ObjC};
 use crate::Environment;
 
 pub type CGDataProviderRef = CFTypeRef;
@@ -163,6 +163,15 @@ pub(super) fn from_cg_image(env: &mut Environment, cg_image: CGImageRef) -> CGDa
     )
 }
 
+/// The bytes a `CGImage`-backed provider hands out: an image mask's packed
+/// samples if it is one, otherwise the RGBA pixels.
+fn cg_image_bytes(objc: &ObjC, cg_image: CGImageRef) -> &[u8] {
+    match cg_image::borrow_mask_samples(objc, cg_image) {
+        Some(samples) => samples,
+        None => cg_image::borrow_image(objc, cg_image).pixels(),
+    }
+}
+
 /// Generic interface for host code.
 pub(super) fn borrow_bytes(env: &mut Environment, provider: CGDataProviderRef) -> &[u8] {
     match *env.objc.borrow(provider) {
@@ -170,9 +179,7 @@ pub(super) fn borrow_bytes(env: &mut Environment, provider: CGDataProviderRef) -
             env.mem.bytes_at(data.cast(), size)
         }
         CGDataProviderHostObject::Direct { data, size, .. } => env.mem.bytes_at(data.cast(), size),
-        CGDataProviderHostObject::CGImage(cg_image) => {
-            cg_image::borrow_image(&env.objc, cg_image).pixels()
-        }
+        CGDataProviderHostObject::CGImage(cg_image) => cg_image_bytes(&env.objc, cg_image),
         CGDataProviderHostObject::CFData(cf_data) => {
             let data = CFDataGetBytePtr(env, cf_data);
             let size = CFDataGetLength(env, cf_data);
@@ -196,7 +203,7 @@ fn CGDataProviderCopyData(env: &mut Environment, provider: CGDataProviderRef) ->
             size.try_into().unwrap(),
         ),
         CGDataProviderHostObject::CGImage(cg_image) => {
-            let bytes = cg_image::borrow_image(&env.objc, cg_image).pixels();
+            let bytes = cg_image_bytes(&env.objc, cg_image);
 
             let len: NSUInteger = bytes.len().try_into().unwrap();
             let alloc = env.mem.alloc(len);
