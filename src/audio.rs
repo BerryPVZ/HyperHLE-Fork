@@ -7,6 +7,7 @@
 
 //! Audio file decoding and OpenAL bindings.
 
+mod aifc_decoder;
 mod caf_decoder;
 mod ima4;
 pub mod mic;
@@ -318,6 +319,19 @@ impl AudioFile {
                 return Ok(AudioFileInner::Aac(aac));
             }
             if let Ok(pcm) = caf_decoder::decode_caf_to_pcm(Cursor::new(bytes.clone())) {
+                return Ok(AudioFileInner::Symphonia(pcm));
+            }
+        }
+
+        // AIFF/AIFC (Apple/SGI) files. Symphonia's RIFF demuxer only supports
+        // a handful of AIFC compression types and rejects the rest outright
+        // ("aifc: compression type not supported"), which is what leaves e.g.
+        // RedBall 4's `menu.aifc` silent. Our own decoder handles every
+        // compression type the plain-AIFF, uncompressed-AIFC and IMA4 paths
+        // can express, plus the companded formats (µ-law, A-law, and
+        // IMA4-in-AIFC) that Symphonia's AIFC reader refuses.
+        if is_aiff_aifc(&bytes) {
+            if let Ok(pcm) = aifc_decoder::decode_aifc_to_pcm(&bytes) {
                 return Ok(AudioFileInner::Symphonia(pcm));
             }
         }
@@ -672,6 +686,14 @@ fn caf_read_format_id(bytes: &[u8]) -> Option<[u8; 4]> {
         pos = pos.checked_add(chunk_size.try_into().ok()?)?;
     }
     None
+}
+
+/// Whether `bytes` starts with an AIFF/AIFC `FORM` chunk whose form type is
+/// `AIFF` or `AIFC` (Apple/SGI audio, big-endian).
+fn is_aiff_aifc(bytes: &[u8]) -> bool {
+    bytes.len() >= 12
+        && &bytes[0..4] == b"FORM"
+        && (&bytes[8..12] == b"AIFF" || &bytes[8..12] == b"AIFC")
 }
 
 fn is_adts_aac(bytes: &[u8]) -> bool {
