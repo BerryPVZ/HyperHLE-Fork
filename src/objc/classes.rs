@@ -434,7 +434,14 @@ fn substitute_classes(
         name.starts_with("AdMob")
         || name.starts_with("AltAds")
         || name.starts_with("Mobclix")
-        || name.starts_with("FB") // Facebook
+        // Note: the Facebook SDK namespace ("FB…") is deliberately *not*
+        // substituted here. Classes handled by this function come from the
+        // app's own binary, so a bundled Facebook SDK (e.g. the 3.x SDK inside
+        // Subway Surfers 1.11.0) has real, working code. Faking it turns
+        // `+[FBSession activeSession]` into nil, the app's `FacebookSession`
+        // wrapper then dereferences it, Unity throws, and mono ends up in its
+        // internal `g_assert_not_reached` trap. Classes that are only *looked
+        // up* and never shipped with the app are still faked by `link_class`.
         || name.starts_with("Flurry")
         || name.starts_with("OpenFeint")
         || name.starts_with("Tapjoy")
