@@ -101,6 +101,61 @@ pub fn install_panic_hook() {
     });
 }
 
+/// Symbol and argument registers of the most recent guest-to-host function
+/// dispatch, as a one-line summary for native crash reports.
+///
+/// dyld records these just before every host call (see
+/// `environment::LAST_HOST_CALL_*`), so when the process dies inside a host
+/// function this names that function and the guest-supplied arguments, even
+/// though the crash handler cannot unwind the guest's stack. Returns [None] if
+/// no host function has been dispatched yet.
+#[cfg(unix)]
+pub(crate) fn last_host_call_summary() -> Option<String> {
+    use std::sync::atomic::Ordering;
+    // The name is stored as a (pointer, length) pair by two separate relaxed
+    // stores, so the length is clamped and the bytes are UTF-8 validated. The
+    // bytes come from dyld's static symbol table (or a name dyld deliberately
+    // leaks), so they stay mapped for the whole process lifetime and a
+    // concurrent dispatch cannot free them.
+    const MAX_SYMBOL_LEN: usize = 512;
+    let ptr = crate::environment::LAST_HOST_CALL_SYMBOL_PTR.load(Ordering::Relaxed);
+    let len = crate::environment::LAST_HOST_CALL_SYMBOL_LEN.load(Ordering::Relaxed);
+    if ptr == 0 || len == 0 {
+        return None;
+    }
+    let symbol = if len > MAX_SYMBOL_LEN {
+        "<over-long symbol>"
+    } else {
+        // SAFETY: see the comment above.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        std::str::from_utf8(bytes).unwrap_or("<unparsable symbol>")
+    };
+    let mut regs = String::new();
+    for (i, reg) in crate::environment::LAST_HOST_CALL_REGS.iter().enumerate() {
+        regs.push_str(&format!(" r{}={:#x}", i, reg.load(Ordering::Relaxed)));
+    }
+    Some(format!(
+        "last host call: {} (guest thread {}):{}\n",
+        symbol,
+        crate::environment::LAST_HOST_CALL_THREAD.load(Ordering::Relaxed),
+        regs
+    ))
+}
+
+/// Whether an `(PC, SP)` pair from the interrupted signal frame can be a real
+/// AArch64 user-mode register state.
+///
+/// `interrupted_frame` decodes the signal handler's `ucontext_t` by field name,
+/// and the layout of that structure differs between C libraries and versions;
+/// when the read is wrong it produces values that cannot be registers at all
+/// (a stack pointer of zero, or one that is not 16-byte aligned, which the
+/// AAPCS forbids). Reporting those values as if they identified the crash site
+/// sends readers chasing garbage, so they are called out instead.
+#[cfg(unix)]
+fn frame_is_plausible(pc: usize, sp: usize) -> bool {
+    pc != 0 && sp != 0 && sp.is_multiple_of(16)
+}
+
 #[cfg(unix)]
 mod imp {
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -144,6 +199,14 @@ mod imp {
                         "(PC is 0: control was transferred through a NULL \
                          function pointer, e.g. a bogus vtable/`extern` slot \
                          — this is not a data access)\n",
+                    );
+                }
+                if !super::frame_is_plausible(pc, sp) {
+                    s.push_str(
+                        "(this register state cannot be real: a user-mode SP \
+                         is never zero and always 16-byte aligned, so the \
+                         signal frame was not decoded correctly on this build \
+                         — treat PC and LR above as garbage)\n",
                     );
                 }
                 s.push_str(
@@ -372,6 +435,14 @@ mod imp {
             // libc::gettid is Linux-only; pthread_self works everywhere.
             unsafe { libc::pthread_self() as u64 }
         );
+        // Name the host function the guest was inside. The values are
+        // snapshotted before the host call runs, so if this crash is inside a
+        // host stub (very common: a wild pointer built from guest-supplied
+        // arguments) this identifies it without symbolizing the library.
+        let msg = match super::last_host_call_summary() {
+            Some(summary) => format!("{}{}", msg, summary),
+            None => msg,
+        };
         let msg = format!(
             "{}{}",
             msg,
@@ -598,3 +669,50 @@ mod win_imp {
 
 #[cfg(windows)]
 pub use win_imp::install;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn implausible_frames_are_rejected() {
+        // A user-mode AArch64 stack pointer is never zero and always 16-byte
+        // aligned, so a frame that fails either test cannot be a real register
+        // state (see the Republique crash report, which had SP = 0).
+        assert!(frame_is_plausible(0x74b3_0000, 0x7fff_1230));
+        assert!(!frame_is_plausible(0x74b3_0000, 0));
+        assert!(!frame_is_plausible(0x74b3_0000, 0x7fff_1238));
+        assert!(!frame_is_plausible(0, 0x7fff_1230));
+    }
+
+    // Both cases share the global LAST_HOST_CALL_* state, so they run in one
+    // test: separate tests could interleave and read each other's values.
+    #[test]
+    fn last_host_call_summary_reports_symbol_and_registers() {
+        static NAME: &str = "glDrawElements";
+        crate::environment::LAST_HOST_CALL_SYMBOL_PTR
+            .store(NAME.as_ptr() as usize, Ordering::Relaxed);
+        crate::environment::LAST_HOST_CALL_SYMBOL_LEN.store(NAME.len(), Ordering::Relaxed);
+        crate::environment::LAST_HOST_CALL_THREAD.store(7, Ordering::Relaxed);
+        for (i, reg) in crate::environment::LAST_HOST_CALL_REGS.iter().enumerate() {
+            reg.store(0x1000 + i as u32, Ordering::Relaxed);
+        }
+
+        let summary = last_host_call_summary().expect("a summary after a recorded call");
+        assert!(summary.contains("glDrawElements"), "{}", summary);
+        assert!(summary.contains("guest thread 7"), "{}", summary);
+        assert!(summary.contains("r0=0x1000"), "{}", summary);
+        assert!(summary.contains("r7=0x1007"), "{}", summary);
+
+        // The pointer and length are stored separately, so a stale length can
+        // point into bytes that are not a UTF-8 string (or past the end of the
+        // name). The summary must stay printable instead of panicking.
+        static NOT_UTF8: &[u8] = b"not\xffutf8";
+        crate::environment::LAST_HOST_CALL_SYMBOL_PTR
+            .store(NOT_UTF8.as_ptr() as usize, Ordering::Relaxed);
+        crate::environment::LAST_HOST_CALL_SYMBOL_LEN.store(NOT_UTF8.len(), Ordering::Relaxed);
+        let summary = last_host_call_summary().expect("a summary after a recorded call");
+        assert!(summary.contains("<unparsable symbol>"), "{}", summary);
+    }
+}

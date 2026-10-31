@@ -121,47 +121,18 @@ fn reachable_route_is_wifi_without_connection_or_intervention_requirements() {
     }
 }
 
-// SCNetworkReachabilityScheduleWithRunLoop only queues the callout; the run
-// loop delivers it later. Calling it inline recursed in Where's My Perry,
-// whose callout schedules another target.
-// https://developer.apple.com/documentation/systemconfiguration/scnetworkreachabilityschedulewithrunloop(_:_:_:)
-#[test]
-fn scheduling_queues_one_initial_notification_for_the_run_loop() {
-    let callback = GuestFunction::from_addr_with_thumb_bit(0x1001);
-    let mut host = SCNetworkReachabilityHostObject::default();
-    host.replace_callback(
-        Some(callback),
-        Some(SCNetworkReachabilityContext {
-            info: MutVoidPtr::from_bits(0x30000),
-            ..Default::default()
-        }),
-    );
-    assert!(host.schedule());
-    // Scheduling again (another mode) before delivery adds no second callout.
-    assert!(!host.schedule());
-    assert_eq!(host.active_callbacks, 0);
-    let (delivered, info) = host.begin_scheduled_callback().unwrap();
-    assert_eq!(delivered.addr_with_thumb_bit(), 0x1001);
-    assert_eq!(info.to_bits(), 0x30000);
-    // A callout that schedules again queues a new notification instead of
-    // recursing.
-    assert!(host.schedule());
-    assert!(host.finish_callback().is_empty());
-    assert_eq!(host.active_callbacks, 0);
-}
-
-#[test]
-fn queued_notification_is_dropped_after_unschedule_or_unregister() {
-    let callback = Some(GuestFunction::from_addr_with_thumb_bit(0x1001));
-    let mut host = SCNetworkReachabilityHostObject::default();
-    host.replace_callback(callback, None);
-    assert!(host.schedule());
-    host.scheduled = false;
-    assert!(host.begin_scheduled_callback().is_none());
-    assert!(!host.notification_pending);
-
-    assert!(host.schedule());
-    host.replace_callback(None, None);
-    assert!(host.begin_scheduled_callback().is_none());
-    assert_eq!(host.active_callbacks, 0);
-}
+// The two tests that used to live here (`scheduling_queues_one_initial_
+// notification_for_the_run_loop` and `queued_notification_is_dropped_after_
+// unschedule_or_unregister`) were written for 2636d89, which queued the
+// initial callout through `ns_run_loop`. That machinery came from PR #259 and
+// was reverted in 24a2107; 5984633 then restored the synchronous delivery
+// `SCNetworkReachabilityScheduleWithRunLoop` does today. The host object no
+// longer has `schedule()`, `begin_scheduled_callback()`, `scheduled` or
+// `notification_pending`, so those tests could not be kept, and they cannot be
+// re-expressed as unit tests either: delivering the callout needs a live
+// `Environment` and a guest function, which the `test_app` integration test
+// covers on macOS.
+//
+// What is testable without an `Environment` — context lifetime, replacement and
+// the nested-callback release queue — is covered above by
+// `replace_unregister_and_nested_callbacks_release_each_old_context_once`.

@@ -6533,9 +6533,6 @@ struct {
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
-    FUNC_DEF(test_dispatch_async_global_queue),
-    FUNC_DEF(test_dispatch_async_f_global_queue),
-    FUNC_DEF(test_dispatch_get_current_queue),
     FUNC_DEF(test_dladdr),
     FUNC_DEF(test_AVAsset_assetWithURL),
     FUNC_DEF(test_CFRunLoopTimerCreate_callout),
@@ -6544,28 +6541,14 @@ struct {
     FUNC_DEF(test_stat_inode_identifies_file),
 };
 
-int test_dispatch_async_global_queue(void) {
-  return check_dispatch_async_global_queue(NO);
-}
-
-int test_dispatch_async_f_global_queue(void) {
-  return check_dispatch_async_global_queue(YES);
-}
-
-int test_dispatch_get_current_queue(void) {
-  if (dispatch_get_current_queue() != dispatch_get_main_queue())
-    return -1;
-  dispatch_queue_t worker_queue = NULL;
-  pthread_t thread;
-  if (pthread_create(&thread, NULL, current_queue_worker, &worker_queue))
-    return -2;
-  pthread_join(thread, NULL);
-  if (worker_queue == dispatch_get_main_queue())
-    return -3;
-  if (worker_queue != dispatch_get_global_queue(0, 0))
-    return -4;
-  return 0;
-}
+// The dispatch tests that used to live here are gone with the revert of
+// PR #259 (24a2107), and they cannot be restored on their own: they were left
+// behind calling helpers (`check_dispatch_async_global_queue`,
+// `current_queue_worker`) and using a `dispatch_queue_t` typedef that the same
+// revert deleted, so clang failed to compile TestApp at all. They also assert
+// the queue-aware `dispatch_after` that the revert removed, so they would fail
+// at runtime even if the declarations came back. Restore them together with
+// that machinery, not before it.
 
 extern int dladdr(const void *addr, TestAppDlInfo *info);
 int test_dladdr(void) {
