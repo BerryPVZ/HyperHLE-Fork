@@ -6418,6 +6418,47 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 }
 
 // clang-format off
+// The tests re-ported from the post-merge commits of PR #259 sit after the
+// FUNC_DEF table, so the type, the externs and the helpers they use have to be
+// declared before it, like they were before the revert.
+
+// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
+// the image path and base, and the nearest lower symbol, for an address in
+// a loaded image, and returns 0 otherwise. Symbol names have no leading
+// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
+// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
+typedef struct {
+  const char *dli_fname;
+  void *dli_fbase;
+  const char *dli_sname;
+  void *dli_saddr;
+} TestAppDlInfo;
+extern int dladdr(const void *addr, TestAppDlInfo *info);
+
+// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
+// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
+// to load its animations (HyperHLE-Reborn issue 303).
+// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
+@interface AVAsset : NSObject
++ (id)assetWithURL:(NSURL *)url;
+@end
+@interface AVURLAsset : AVAsset
+- (NSURL *)URL;
+@end
+@interface NSObject (AVAssetTest)
+- (BOOL)isKindOfClass:(Class)cls;
+- (BOOL)isEqual:(id)object;
+@end
+
+int test_dladdr(void);
+int test_AVAsset_assetWithURL(void);
+int test_CFRunLoopTimerCreate_callout(void);
+int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
+int test_CFURLCreatePropertyFromResource(void);
+int test_stat_inode_identifies_file(void);
+// clang-format on
+
+// clang-format off
 #define FUNC_DEF(func)                                                         \
   { &func, #func }
 struct {
@@ -6589,6 +6630,17 @@ int test_AVAsset_assetWithURL(void) {
   return result;
 }
 
+
+// CFRunLoopTimerCreate returns a timer that calls its callout with the
+// context's info, first at fireDate, then every interval (never if 0).
+// https://developer.apple.com/documentation/corefoundation/1542501-cfrunlooptimercreate
+// Heavy Gunner and Illusia drive their game loops with such timers.
+static int cf_timer_calls;
+static CFRunLoopTimerRef cf_timer_last_timer;
+static void cf_timer_callout(CFRunLoopTimerRef timer, void *info) {
+  cf_timer_calls += (int)(intptr_t)info;
+  cf_timer_last_timer = timer;
+}
 
 int test_CFRunLoopTimerCreate_callout(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
