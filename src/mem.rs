@@ -915,17 +915,49 @@ impl Mem {
     /// This exists solely to deal with OpenGL `glGetPointerv`.
     /// You should never have another reason to use this.
     ///
-    /// Panics if the host pointer is not addressing a location in guest memory.
+    /// A host pointer that does not address guest memory returns a null
+    /// pointer, after logging a rate-limited warning. It used to panic, but
+    /// this conversion runs on paths where the pointer comes from the app
+    /// (`gl*Pointer`, `glGetPointerv`), and a panic there either unwinds
+    /// through C frames (undefined behaviour) or aborts the emulator on the
+    /// app's behalf. Callers must treat null as "no array".
     pub fn host_ptr_to_guest_ptr(&self, host_ptr: *const std::ffi::c_void) -> ConstVoidPtr {
         let host_ptr = host_ptr as usize;
         let guest_mem_start = self.bytes.cast::<u8>() as usize;
         let guest_mem_end = guest_mem_start + GUEST_MEMORY_SIZE;
-        assert!((guest_mem_start..guest_mem_end).contains(&host_ptr));
+        if !(guest_mem_start..guest_mem_end).contains(&host_ptr) {
+            Self::warn_wild_host_ptr(host_ptr, guest_mem_start, guest_mem_end);
+            return ConstVoidPtr::null();
+        }
         let guest_addr = host_ptr - guest_mem_start;
         // XaView BypassGuestAddrOverflow: the extended address space (see
         // `Bytes`) can legitimately produce addresses past 32 bits; truncate
         // instead of panicking.
         Ptr::from_bits(guest_addr as u32)
+    }
+
+    /// Report a wild host pointer given to [Self::host_ptr_to_guest_ptr].
+    ///
+    /// A caller that presents the same bad pointer on every frame (a game with
+    /// a broken vertex array setup does) would otherwise flood the log, so only
+    /// the first few occurrences are reported.
+    #[cold]
+    fn warn_wild_host_ptr(host_ptr: usize, guest_mem_start: usize, guest_mem_end: usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        const MAX_LOGS: usize = 8;
+        static LOGGED: AtomicUsize = AtomicUsize::new(0);
+        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+        if n < MAX_LOGS {
+            log!(
+                "touchHLE::mem: ignoring wild host pointer {:#x} handed to a GL array \
+                 binding (guest memory is {:#x}..{:#x}); using NULL instead",
+                host_ptr,
+                guest_mem_start,
+                guest_mem_end
+            );
+        } else if n == MAX_LOGS {
+            log!("touchHLE::mem: further wild host pointer warnings silenced");
+        }
     }
 
     /// Returns whether a host pointer addresses a location inside the guest's
@@ -1404,6 +1436,27 @@ mod mem_tests {
             mem.write(p, 0xAB);
             assert_eq!(mem.read(p.cast_const()), 0xAB);
         }
+    }
+
+    #[test]
+    fn wild_host_pointer_becomes_null_instead_of_panicking() {
+        let mut mem = Mem::new();
+
+        // A host pointer into the guest memory array converts back to the
+        // matching guest address.
+        let inside = unsafe { mem.direct_memory_access_ptr() }.cast::<u8>();
+        let guest = mem.host_ptr_to_guest_ptr(inside as *const std::ffi::c_void);
+        assert_eq!(guest.to_bits(), 0);
+
+        // A plain stack variable is not guest memory. A guest that hands the
+        // host GL a pointer like this (a broken vertex array setup, or a
+        // pointer that only ever existed in host memory) used to make this
+        // conversion panic; it must now report NULL so the GL call is skipped
+        // instead of dereferencing garbage.
+        let local: u64 = 0;
+        let wild = &local as *const u64 as *const std::ffi::c_void;
+        assert!(!mem.is_host_ptr_in_guest_mem(wild));
+        assert_eq!(mem.host_ptr_to_guest_ptr(wild).to_bits(), 0);
     }
 
     #[test]
