@@ -6,19 +6,18 @@
 //! `stdio.h`
 
 use super::posix_io::{
-    self, off_t, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, STDERR_FILENO,
+    self, off_t, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY, STDERR_FILENO,
     STDIN_FILENO, STDOUT_FILENO,
 };
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::fs::{FsError, GuestPath};
 use crate::libc::errno::{
-    get_errno, set_errno, EACCES, EBADF, EEXIST, EINVAL, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EOVERFLOW,
+    set_errno, EACCES, EBADF, EINVAL, EIO, ENOENT, ENOTDIR, ENOTEMPTY, EOVERFLOW,
 };
 use crate::libc::string::strlen;
 use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, Mem, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
 
-use crate::environment::{ThreadBlock, ThreadId};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -33,16 +32,12 @@ struct FILEHostObject {
     pushbacks: Vec<u8>,
     /// `ferror()` implementation
     error: bool,
-    /// `flockfile()` implementation: how many times the owning thread has
-    /// locked the stream.
-    lock_count: u32,
-    owning_thread: Option<ThreadId>,
 }
 
 #[allow(clippy::upper_case_acronyms)]
 /// C `FILE` struct. This is an opaque type in C, so the definition here is our
 /// own.
-pub(crate) struct FILE {
+struct FILE {
     fd: posix_io::FileDescriptor,
 }
 unsafe impl SafeRead for FILE {}
@@ -50,10 +45,6 @@ unsafe impl SafeRead for FILE {}
 #[derive(Default)]
 pub struct State {
     file_streams: HashMap<MutPtr<FILE>, FILEHostObject>,
-    /// Guest `FILE`s for stdin, stdout and stderr, by file descriptor. On
-    /// Apple `___stdoutp` points to `___sF[1]`; here they are separate
-    /// objects, so they share the lock of the first one.
-    std_streams: [Vec<MutPtr<FILE>>; 3],
     next_temporary_file_id: u64,
 }
 impl State {
@@ -99,86 +90,9 @@ impl State {
             FILEHostObject {
                 pushbacks: Vec::new(),
                 error: false,
-                lock_count: 0,
-                owning_thread: None,
             }
         });
         self.file_streams.get_mut(&file_ptr).unwrap()
-    }
-    /// The `FILE` whose lock `file_ptr` uses.
-    fn lock_owner(&self, file_ptr: MutPtr<FILE>) -> MutPtr<FILE> {
-        self.std_streams
-            .iter()
-            .find(|streams| streams.contains(&file_ptr))
-            .map_or(file_ptr, |streams| streams[0])
-    }
-    pub(crate) fn try_acquire_file_object_lock(
-        &mut self,
-        mem: &mut Mem,
-        file_ptr: MutPtr<FILE>,
-        thread_id: ThreadId,
-    ) -> bool {
-        let FILEHostObject {
-            lock_count,
-            owning_thread,
-            ..
-        } = self.get_file_host_obj_mut(mem, file_ptr);
-        if *lock_count == 0 {
-            *lock_count = 1;
-            *owning_thread = Some(thread_id);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-/// Apple's stdio functions take the same lock as `flockfile()` for the
-/// duration of the call, so a thread using a stream that another thread has
-/// locked waits until it is unlocked. This waits for the lock and releases it
-/// right away, for calls that can't hold the lock or don't need to: `fclose()`
-/// frees the stream, while `freopen()` and writing to the host's stdout don't
-/// yield to other threads afterwards. Other functions use [with_file_lock].
-fn wait_for_file_object_lock(env: &mut Environment, file_ptr: MutPtr<FILE>) {
-    let file_ptr = env.libc_state.stdio.lock_owner(file_ptr);
-    let locked_by_other_thread = env
-        .libc_state
-        .stdio
-        .file_streams
-        .get(&file_ptr)
-        .and_then(|host_obj| host_obj.owning_thread)
-        .is_some_and(|owner| owner != env.current_thread);
-    if !locked_by_other_thread {
-        return;
-    }
-    // Once this returns, the scheduler has given the lock to this thread.
-    env.yield_thread(ThreadBlock::FileObjectLock(file_ptr));
-    let host_obj = env
-        .libc_state
-        .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    host_obj.lock_count = 0;
-    host_obj.owning_thread = None;
-}
-
-/// Runs `f` with `file_ptr` locked, as Apple's stdio functions do: reading
-/// or writing a socket can yield to other threads in the middle of the call.
-fn with_file_lock<R>(
-    env: &mut Environment,
-    file_ptr: MutPtr<FILE>,
-    f: impl FnOnce(&mut Environment) -> R,
-) -> R {
-    flockfile(env, file_ptr);
-    let res = f(env);
-    funlockfile(env, file_ptr);
-    res
-}
-
-/// Like [wait_for_file_object_lock], for functions that write to stdout
-/// without a `FILE*`, such as `printf()`.
-fn wait_for_stdout_lock(env: &mut Environment) {
-    if let Some(&file_ptr) = env.libc_state.stdio.std_streams[1].first() {
-        wait_for_file_object_lock(env, file_ptr);
     }
 }
 
@@ -263,8 +177,6 @@ fn fopen(env: &mut Environment, filename: ConstPtr<u8>, mode: ConstPtr<u8>) -> M
                 FILEHostObject {
                     pushbacks: Vec::new(),
                     error: false,
-                    lock_count: 0,
-                    owning_thread: None,
                 },
             );
             if let Some(name) = music_track {
@@ -286,8 +198,6 @@ fn freopen(
     if stream.is_null() {
         return Ptr::null();
     }
-
-    wait_for_file_object_lock(env, stream);
 
     // 1. Сбрасываем буфер и закрываем старый дескриптор
     let FILE { fd: old_fd } = env.mem.read(stream);
@@ -377,96 +287,94 @@ fn fread(
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        crate::audio::music_bypass::note_stdio_activity(file_ptr.to_bits());
+    crate::audio::music_bypass::note_stdio_activity(file_ptr.to_bits());
 
-        if item_size == 0 {
+    if item_size == 0 {
+        return 0;
+    }
+
+    // Yes, the item_size/n_items split doesn't mean anything. The C standard
+    // really does expect you to just multiply and divide like this, with no
+    // attempt being made to ensure a whole number are read or written!
+    let mut total_size = match item_size.checked_mul(n_items) {
+        Some(total_size) => total_size,
+        None => {
+            // item_size * n_items overflows 32 bits; report an error
+            // instead of wrapping (or panicking) and reading garbage.
+            log!("Warning: fread(): item_size * n_items overflows; returning 0.",);
+            set_errno(env, EOVERFLOW);
             return 0;
         }
+    };
+    let FILEHostObject {
+        ref mut pushbacks, ..
+    } = env
+        .libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr);
+    let already_read = if !pushbacks.is_empty() {
+        let to_copy = pushbacks.len().min(total_size as usize);
+        let offset = pushbacks.len() - to_copy;
 
-        // Yes, the item_size/n_items split doesn't mean anything. The C standard
-        // really does expect you to just multiply and divide like this, with no
-        // attempt being made to ensure a whole number are read or written!
-        let mut total_size = match item_size.checked_mul(n_items) {
-            Some(total_size) => total_size,
-            None => {
-                // item_size * n_items overflows 32 bits; report an error
-                // instead of wrapping (or panicking) and reading garbage.
-                log!("Warning: fread(): item_size * n_items overflows; returning 0.",);
-                set_errno(env, EOVERFLOW);
-                return 0;
-            }
+        _ = &pushbacks[offset..].reverse();
+        let to_copy: GuestUSize = to_copy.try_into().unwrap();
+        env.mem
+            .bytes_at_mut(buffer.cast(), to_copy)
+            .copy_from_slice(&pushbacks[offset..]);
+        pushbacks.truncate(offset);
+
+        if total_size == to_copy {
+            return total_size;
+        }
+        total_size -= to_copy;
+        let ptr: MutPtr<u8> = buffer.cast();
+        buffer = (ptr + to_copy).cast();
+        to_copy
+    } else {
+        0
+    };
+    let FILE { fd } = env.mem.read(file_ptr);
+    // Real stdio `fread` keeps issuing read(2) calls until it has satisfied the
+    // full request, hit end-of-file, or hit an error, and it sets the stream's
+    // EOF indicator when a read returns 0 before the request is filled. A
+    // single short read is therefore NOT reported as an error: the caller is
+    // expected to check feof()/ferror() to tell EOF from a real failure.
+    //
+    // We previously did just one posix_io::read(). For a regular file that
+    // returns fewer bytes than requested (the normal case near EOF), that left
+    // the stream's EOF indicator unset, because posix_io::read only marks EOF
+    // on a zero-length read. LevelDB's fread-based SequentialFile::Read relies
+    // on `if (bytes < wanted && !feof(f)) return IOError;`, so the unset EOF
+    // flag turned a perfectly good short read of a small file (e.g. a freshly
+    // written LevelDB `CURRENT`, 16 bytes) into an I/O error. That made
+    // Minecraft PE's `DB::Open` fail and fall back to repairing a doubled
+    // `db/db` path, so a newly created world could never be entered. Looping
+    // here — exactly like a real libc — issues the follow-up read that returns
+    // 0, sets the EOF indicator, and lets feof() report the truth.
+    let mut total_read: GuestUSize = 0;
+    let mut had_error = false;
+    while total_read < total_size {
+        let want = total_size - total_read;
+        let dst: MutVoidPtr = {
+            let base: MutPtr<u8> = buffer.cast();
+            (base + total_read).cast()
         };
-        let FILEHostObject {
-            ref mut pushbacks, ..
-        } = env
-            .libc_state
+        match posix_io::read(env, fd, dst, want) {
+            -1 => {
+                had_error = true;
+                break;
+            }
+            0 => break, // EOF; posix_io::read has set the fd's EOF indicator
+            n => total_read += n as GuestUSize,
+        }
+    }
+    if had_error {
+        env.libc_state
             .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr);
-        let already_read = if !pushbacks.is_empty() {
-            let to_copy = pushbacks.len().min(total_size as usize);
-            let offset = pushbacks.len() - to_copy;
-
-            _ = &pushbacks[offset..].reverse();
-            let to_copy: GuestUSize = to_copy.try_into().unwrap();
-            env.mem
-                .bytes_at_mut(buffer.cast(), to_copy)
-                .copy_from_slice(&pushbacks[offset..]);
-            pushbacks.truncate(offset);
-
-            if total_size == to_copy {
-                return total_size;
-            }
-            total_size -= to_copy;
-            let ptr: MutPtr<u8> = buffer.cast();
-            buffer = (ptr + to_copy).cast();
-            to_copy
-        } else {
-            0
-        };
-        let FILE { fd } = env.mem.read(file_ptr);
-        // Real stdio `fread` keeps issuing read(2) calls until it has satisfied the
-        // full request, hit end-of-file, or hit an error, and it sets the stream's
-        // EOF indicator when a read returns 0 before the request is filled. A
-        // single short read is therefore NOT reported as an error: the caller is
-        // expected to check feof()/ferror() to tell EOF from a real failure.
-        //
-        // We previously did just one posix_io::read(). For a regular file that
-        // returns fewer bytes than requested (the normal case near EOF), that left
-        // the stream's EOF indicator unset, because posix_io::read only marks EOF
-        // on a zero-length read. LevelDB's fread-based SequentialFile::Read relies
-        // on `if (bytes < wanted && !feof(f)) return IOError;`, so the unset EOF
-        // flag turned a perfectly good short read of a small file (e.g. a freshly
-        // written LevelDB `CURRENT`, 16 bytes) into an I/O error. That made
-        // Minecraft PE's `DB::Open` fail and fall back to repairing a doubled
-        // `db/db` path, so a newly created world could never be entered. Looping
-        // here — exactly like a real libc — issues the follow-up read that returns
-        // 0, sets the EOF indicator, and lets feof() report the truth.
-        let mut total_read: GuestUSize = 0;
-        let mut had_error = false;
-        while total_read < total_size {
-            let want = total_size - total_read;
-            let dst: MutVoidPtr = {
-                let base: MutPtr<u8> = buffer.cast();
-                (base + total_read).cast()
-            };
-            match posix_io::read(env, fd, dst, want) {
-                -1 => {
-                    had_error = true;
-                    break;
-                }
-                0 => break, // EOF; posix_io::read has set the fd's EOF indicator
-                n => total_read += n as GuestUSize,
-            }
-        }
-        if had_error {
-            env.libc_state
-                .stdio
-                .get_file_host_obj_mut(&mut env.mem, file_ptr)
-                .error = true;
-        }
-        (total_read + already_read) / item_size
-    })
+            .get_file_host_obj_mut(&mut env.mem, file_ptr)
+            .error = true;
+    }
+    (total_read + already_read) / item_size
 }
 
 fn fgetc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -474,50 +382,48 @@ fn fgetc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
-        let FILEHostObject {
-            ref mut pushbacks, ..
-        } = env
-            .libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr);
-        if let Some(pushback) = pushbacks.pop() {
-            let new_offset = posix_io::lseek(env, fd, 1, SEEK_CUR);
-            if new_offset < 0 {
-                // The stream is unseekable (e.g. a pipe); the pushback character
-                // cannot be consumed positionally. Return it anyway, matching
-                // the observable behaviour on streams where seeking works.
-                log_dbg!("fgetc: pushback seek failed on fd {:?}", fd);
-            }
-            return pushback.into();
+    let FILE { fd } = env.mem.read(file_ptr);
+    let FILEHostObject {
+        ref mut pushbacks, ..
+    } = env
+        .libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr);
+    if let Some(pushback) = pushbacks.pop() {
+        let new_offset = posix_io::lseek(env, fd, 1, SEEK_CUR);
+        if new_offset < 0 {
+            // The stream is unseekable (e.g. a pipe); the pushback character
+            // cannot be consumed positionally. Return it anyway, matching
+            // the observable behaviour on streams where seeking works.
+            log_dbg!("fgetc: pushback seek failed on fd {:?}", fd);
         }
+        return pushback.into();
+    }
 
-        let buffer = env.mem.alloc(1);
+    let buffer = env.mem.alloc(1);
 
-        let res = match posix_io::read(env, fd, buffer, 1) {
-            -1 => {
-                env.libc_state
-                    .stdio
-                    .get_file_host_obj_mut(&mut env.mem, file_ptr)
-                    .error = true;
+    let res = match posix_io::read(env, fd, buffer, 1) {
+        -1 => {
+            env.libc_state
+                .stdio
+                .get_file_host_obj_mut(&mut env.mem, file_ptr)
+                .error = true;
+            EOF
+        }
+        bytes_read => {
+            let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
+            if bytes_read < 1 {
                 EOF
+            } else {
+                let buf: MutPtr<u8> = buffer.cast();
+                env.mem.read(buf) as i32
             }
-            bytes_read => {
-                let bytes_read: GuestUSize = bytes_read.try_into().unwrap();
-                if bytes_read < 1 {
-                    EOF
-                } else {
-                    let buf: MutPtr<u8> = buffer.cast();
-                    env.mem.read(buf) as i32
-                }
-            }
-        };
-        // Free the temporary buffer on every path; it used to leak one
-        // allocation per fgetc()/getc() call.
-        env.mem.free(buffer);
-        res
-    })
+        }
+    };
+    // Free the temporary buffer on every path; it used to leak one
+    // allocation per fgetc()/getc() call.
+    env.mem.free(buffer);
+    res
 }
 
 fn getc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -526,32 +432,30 @@ fn getc(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
 }
 
 fn ungetc(env: &mut Environment, c: i32, file_ptr: MutPtr<FILE>) -> i32 {
-    with_file_lock(env, file_ptr, |env| {
-        // POSIX: ungetc(EOF) is a no-op returning EOF; failed seeks leave the
-        // stream unchanged and return EOF rather than aborting.
-        if c == EOF {
-            return EOF;
-        }
-        let FILE { fd } = env.mem.read(file_ptr);
-        if posix_io::lseek(env, fd, 0, SEEK_CUR) < 0 {
-            return EOF;
-        }
-        // Note: successful seeking clears EOF indicator
-        if posix_io::lseek(env, fd, -1, SEEK_CUR) < 0 {
-            return EOF;
-        }
-        let FILEHostObject {
-            ref mut pushbacks, ..
-        } = env
-            .libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr);
-        // C converts the int argument to unsigned char; a value outside
-        // 0..=255 must not panic the host.
-        pushbacks.push(c as u8);
-        log_dbg!("ungetc pushbacks: {:?}", pushbacks);
-        c
-    })
+    // POSIX: ungetc(EOF) is a no-op returning EOF; failed seeks leave the
+    // stream unchanged and return EOF rather than aborting.
+    if c == EOF {
+        return EOF;
+    }
+    let FILE { fd } = env.mem.read(file_ptr);
+    if posix_io::lseek(env, fd, 0, SEEK_CUR) < 0 {
+        return EOF;
+    }
+    // Note: successful seeking clears EOF indicator
+    if posix_io::lseek(env, fd, -1, SEEK_CUR) < 0 {
+        return EOF;
+    }
+    let FILEHostObject {
+        ref mut pushbacks, ..
+    } = env
+        .libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr);
+    // C converts the int argument to unsigned char; a value outside
+    // 0..=255 must not panic the host.
+    pushbacks.push(c as u8);
+    log_dbg!("ungetc pushbacks: {:?}", pushbacks);
+    c
 }
 
 fn fgets(
@@ -567,24 +471,22 @@ fn fgets(
     if size == 0 {
         return Ptr::null();
     }
-    with_file_lock(env, stream, |env| {
-        let mut read = 0;
-        let mut tmp = str;
-        while read < size - 1 && fread(env, tmp.cast(), 1, 1, stream) != 0 {
-            tmp += 1;
-            read += 1;
-            if env.mem.read(tmp - 1) == b'\n' {
-                break;
-            }
+    let mut read = 0;
+    let mut tmp = str;
+    while read < size - 1 && fread(env, tmp.cast(), 1, 1, stream) != 0 {
+        tmp += 1;
+        read += 1;
+        if env.mem.read(tmp - 1) == b'\n' {
+            break;
         }
+    }
 
-        if read == 0 {
-            return Ptr::null();
-        } else {
-            env.mem.write(tmp, b'\0');
-        }
-        str
-    })
+    if read == 0 {
+        return Ptr::null();
+    } else {
+        env.mem.write(tmp, b'\0');
+    }
+    str
 }
 
 fn fputs(env: &mut Environment, str: ConstPtr<u8>, stream: MutPtr<FILE>) -> i32 {
@@ -636,73 +538,71 @@ fn fwrite(
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        if item_size == 0 || buffer.is_null() {
+    if item_size == 0 || buffer.is_null() {
+        return 0;
+    }
+
+    let FILE { fd } = env.mem.read(file_ptr);
+
+    let total_size = match item_size.checked_mul(n_items) {
+        Some(total_size) => total_size,
+        None => {
+            // item_size * n_items overflows 32 bits; report an error
+            // instead of wrapping (or panicking) and writing garbage.
+            log!("Warning: fwrite(): item_size * n_items overflows; returning 0.",);
+            set_errno(env, EOVERFLOW);
             return 0;
         }
+    };
 
-        let FILE { fd } = env.mem.read(file_ptr);
-
-        let total_size = match item_size.checked_mul(n_items) {
-            Some(total_size) => total_size,
-            None => {
-                // item_size * n_items overflows 32 bits; report an error
-                // instead of wrapping (or panicking) and writing garbage.
-                log!("Warning: fwrite(): item_size * n_items overflows; returning 0.",);
-                set_errno(env, EOVERFLOW);
-                return 0;
-            }
-        };
-
-        // TODO: Refactor, use traits instead of this hack
-        match fd {
-            STDOUT_FILENO => {
-                let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
-                match std::io::stdout().write(buffer_slice) {
-                    Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
-                    Err(_err) => {
-                        // The host write failed; report a plausible errno
-                        // (the guest fd itself is valid, so EIO fits best).
-                        set_errno(env, EIO);
-                        env.libc_state
-                            .stdio
-                            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-                            .error = true;
-                        0
-                    }
-                }
-            }
-            STDERR_FILENO => {
-                let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
-                match std::io::stderr().write(buffer_slice) {
-                    Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
-                    Err(_err) => {
-                        // The host write failed; report a plausible errno
-                        // (the guest fd itself is valid, so EIO fits best).
-                        set_errno(env, EIO);
-                        env.libc_state
-                            .stdio
-                            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-                            .error = true;
-                        0
-                    }
-                }
-            }
-            _ => match posix_io::write(env, fd, buffer, total_size) {
-                -1 => {
+    // TODO: Refactor, use traits instead of this hack
+    match fd {
+        STDOUT_FILENO => {
+            let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
+            match std::io::stdout().write(buffer_slice) {
+                Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
+                Err(_err) => {
+                    // The host write failed; report a plausible errno
+                    // (the guest fd itself is valid, so EIO fits best).
+                    set_errno(env, EIO);
                     env.libc_state
                         .stdio
                         .get_file_host_obj_mut(&mut env.mem, file_ptr)
                         .error = true;
                     0
                 }
-                bytes_written => {
-                    let bytes_written: GuestUSize = bytes_written.try_into().unwrap();
-                    bytes_written / item_size
-                }
-            },
+            }
         }
-    })
+        STDERR_FILENO => {
+            let buffer_slice = env.mem.bytes_at(buffer.cast(), total_size);
+            match std::io::stderr().write(buffer_slice) {
+                Ok(bytes_written) => (bytes_written / (item_size as usize)) as GuestUSize,
+                Err(_err) => {
+                    // The host write failed; report a plausible errno
+                    // (the guest fd itself is valid, so EIO fits best).
+                    set_errno(env, EIO);
+                    env.libc_state
+                        .stdio
+                        .get_file_host_obj_mut(&mut env.mem, file_ptr)
+                        .error = true;
+                    0
+                }
+            }
+        }
+        _ => match posix_io::write(env, fd, buffer, total_size) {
+            -1 => {
+                env.libc_state
+                    .stdio
+                    .get_file_host_obj_mut(&mut env.mem, file_ptr)
+                    .error = true;
+                0
+            }
+            bytes_written => {
+                let bytes_written: GuestUSize = bytes_written.try_into().unwrap();
+                bytes_written / item_size
+            }
+        },
+    }
 }
 
 const SEEK_SET: i32 = posix_io::SEEK_SET;
@@ -716,33 +616,31 @@ fn fseeko(env: &mut Environment, file_ptr: MutPtr<FILE>, offset: off_t, whence: 
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd } = env.mem.read(file_ptr);
 
-        if ![SEEK_SET, SEEK_CUR, SEEK_END].contains(&whence) {
-            log!("fseeko: invalid whence {}, returning -1", whence);
-            set_errno(env, EINVAL);
-            return -1;
+    if ![SEEK_SET, SEEK_CUR, SEEK_END].contains(&whence) {
+        log!("fseeko: invalid whence {}, returning -1", whence);
+        set_errno(env, EINVAL);
+        return -1;
+    }
+    if offset == 0 && whence == SEEK_SET {
+        // A music stream rewound to the start: GD restarted the track
+        // (death + respawn, level retry).
+        crate::audio::music_bypass::note_stdio_rewind(file_ptr.to_bits());
+    }
+    match posix_io::lseek(env, fd, offset, whence) {
+        -1 => -1,
+        _cur_pos => {
+            let FILEHostObject {
+                ref mut pushbacks, ..
+            } = env
+                .libc_state
+                .stdio
+                .get_file_host_obj_mut(&mut env.mem, file_ptr);
+            pushbacks.clear();
+            0
         }
-        if offset == 0 && whence == SEEK_SET {
-            // A music stream rewound to the start: GD restarted the track
-            // (death + respawn, level retry).
-            crate::audio::music_bypass::note_stdio_rewind(file_ptr.to_bits());
-        }
-        match posix_io::lseek(env, fd, offset, whence) {
-            -1 => -1,
-            _cur_pos => {
-                let FILEHostObject {
-                    ref mut pushbacks, ..
-                } = env
-                    .libc_state
-                    .stdio
-                    .get_file_host_obj_mut(&mut env.mem, file_ptr);
-                pushbacks.clear();
-                0
-            }
-        }
-    })
+    }
 }
 
 fn ftell(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -755,10 +653,8 @@ fn ftello(env: &mut Environment, file_ptr: MutPtr<FILE>) -> off_t {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
-        posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR)
-    })
+    let FILE { fd } = env.mem.read(file_ptr);
+    posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR)
 }
 
 fn rewind(env: &mut Environment, file_ptr: MutPtr<FILE>) {
@@ -766,15 +662,13 @@ fn rewind(env: &mut Environment, file_ptr: MutPtr<FILE>) {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        env.libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-            .error = false;
+    env.libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr)
+        .error = false;
 
-        // Note: this call will clean pushbacks as well
-        fseek(env, file_ptr, 0, SEEK_SET);
-    })
+    // Note: this call will clean pushbacks as well
+    fseek(env, file_ptr, 0, SEEK_SET);
 }
 
 fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -786,8 +680,6 @@ fn fclose(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
         log!("fclose(NULL) => EOF");
         return EOF;
     }
-
-    wait_for_file_object_lock(env, file_ptr);
 
     // This is needed in order to force lazy instantiation
     // of stdin-like host object.
@@ -844,19 +736,17 @@ fn ferror(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let error = env
-            .libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-            .error;
+    let error = env
+        .libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr)
+        .error;
 
-        if error {
-            1
-        } else {
-            0
-        }
-    })
+    if error {
+        1
+    } else {
+        0
+    }
 }
 
 fn fsetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: ConstPtr<fpos_t>) -> i32 {
@@ -864,23 +754,21 @@ fn fsetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: ConstPtr<fpos_t>)
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd } = env.mem.read(file_ptr);
 
-        let res = posix_io::lseek(env, fd, env.mem.read(pos), SEEK_SET);
-        if res == -1 {
-            -1
-        } else {
-            let FILEHostObject {
-                ref mut pushbacks, ..
-            } = env
-                .libc_state
-                .stdio
-                .get_file_host_obj_mut(&mut env.mem, file_ptr);
-            pushbacks.clear();
-            0
-        }
-    })
+    let res = posix_io::lseek(env, fd, env.mem.read(pos), SEEK_SET);
+    if res == -1 {
+        -1
+    } else {
+        let FILEHostObject {
+            ref mut pushbacks, ..
+        } = env
+            .libc_state
+            .stdio
+            .get_file_host_obj_mut(&mut env.mem, file_ptr);
+        pushbacks.clear();
+        0
+    }
 }
 
 fn fgetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: MutPtr<fpos_t>) -> i32 {
@@ -888,16 +776,14 @@ fn fgetpos(env: &mut Environment, file_ptr: MutPtr<FILE>, pos: MutPtr<fpos_t>) -
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
+    let FILE { fd } = env.mem.read(file_ptr);
 
-        let res = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
-        if res == -1 {
-            return -1;
-        }
-        env.mem.write(pos, res);
-        0
-    })
+    let res = posix_io::lseek(env, fd, 0, posix_io::SEEK_CUR);
+    if res == -1 {
+        return -1;
+    }
+    env.mem.write(pos, res);
+    0
 }
 
 fn feof(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -905,10 +791,8 @@ fn feof(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
-        posix_io::eof(env, fd)
-    })
+    let FILE { fd } = env.mem.read(file_ptr);
+    posix_io::eof(env, fd)
 }
 
 fn clearerr(env: &mut Environment, file_ptr: MutPtr<FILE>) {
@@ -916,15 +800,13 @@ fn clearerr(env: &mut Environment, file_ptr: MutPtr<FILE>) {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        env.libc_state
-            .stdio
-            .get_file_host_obj_mut(&mut env.mem, file_ptr)
-            .error = false;
+    env.libc_state
+        .stdio
+        .get_file_host_obj_mut(&mut env.mem, file_ptr)
+        .error = false;
 
-        let FILE { fd } = env.mem.read(file_ptr);
-        posix_io::clearerr(env, fd)
-    })
+    let FILE { fd } = env.mem.read(file_ptr);
+    posix_io::clearerr(env, fd)
 }
 
 fn fflush(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
@@ -932,10 +814,8 @@ fn fflush(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
-        posix_io::fflush(env, fd)
-    })
+    let FILE { fd } = env.mem.read(file_ptr);
+    posix_io::fflush(env, fd)
 }
 
 fn puts(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
@@ -943,7 +823,6 @@ fn puts(env: &mut Environment, s: ConstPtr<u8>) -> i32 {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    wait_for_stdout_lock(env);
     let ok = std::io::stdout().write_all(env.mem.cstr_at(s)).is_ok()
         && std::io::stdout().write_all(b"\n").is_ok();
     if !ok {
@@ -963,8 +842,7 @@ fn putchar(env: &mut Environment, c: u8) -> i32 {
 
     // putchar() returns the written character (as unsigned char cast to
     // int) on success, or EOF when the write fails.
-    wait_for_stdout_lock(env);
-    match std::io::stdout().write_all(std::slice::from_ref(&c)) {
+    match std::io::stdout().write(std::slice::from_ref(&c)) {
         Ok(_) => c as i32,
         Err(_) => {
             log!("Warning: putchar() failed to write to stdout; returning EOF.");
@@ -1026,44 +904,48 @@ fn tmpfile(env: &mut Environment) -> MutPtr<FILE> {
     // set the real errno when an operation fails.
     set_errno(env, 0);
 
-    // The guest file system has no `/tmp`, so the file goes to the app's
-    // `tmp` directory, as in touchHLE. O_EXCL makes sure an existing file is
-    // never reused; on a name clash, try the next name.
-    let tmp_dir = env.fs.home_directory().join("tmp");
-    let (file, fd) = loop {
-        let id = State::get_mut(env).next_temporary_file_id;
-        State::get_mut(env).next_temporary_file_id += 1;
-        let file = tmp_dir.join(format!("tmpfile.{}", id));
-        let tmp_filename = env.mem.alloc_and_write_cstr(file.as_str().as_bytes());
-        let fd = posix_io::open_direct(env, tmp_filename.cast_const(), O_RDWR | O_CREAT | O_EXCL);
-        env.mem.free(tmp_filename.cast());
-        match fd {
-            -1 if get_errno(env) == EEXIST => continue,
-            -1 => {
-                log!("Warning: tmpfile() could not create {:?}", file);
-                return Ptr::null();
-            }
-            fd => break (file, fd),
-        }
-    };
+    // Generate a unique path under /tmp using a process-wide counter and the
+    // host PID, making collisions extremely unlikely.
+    static TMPFILE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let count = TMPFILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = format!("/tmp/touchHLE_tmp_{}_{}\0", std::process::id(), count);
 
-    let res = env.mem.alloc_and_write(FILE { fd });
-    State::get_mut(env).file_streams.insert(
-        res,
-        FILEHostObject {
-            pushbacks: Vec::new(),
-            error: false,
-            lock_count: 0,
-            owning_thread: None,
-        },
-    );
-    // Remove the file right away: the open stream keeps working, and nothing
-    // is left behind once it is closed (POSIX semantics).
-    if let Err(err) = env.fs.remove(&file) {
-        log!("Warning: tmpfile() could not remove {:?}: {:?}", file, err);
+    // Write the path string into guest memory so fopen/remove can use it.
+    let path_len = tmp_path.len() as GuestUSize;
+    let path_ptr: MutPtr<u8> = env.mem.alloc(path_len).cast();
+    env.mem
+        .bytes_at_mut(path_ptr.cast(), path_len)
+        .copy_from_slice(tmp_path.as_bytes());
+
+    // "w+b": read/write, create, truncate — matches the C standard requirement
+    // for tmpfile().
+    let mode = b"w+b\0";
+    let mode_ptr: MutPtr<u8> = env.mem.alloc(mode.len() as GuestUSize).cast();
+    env.mem
+        .bytes_at_mut(mode_ptr.cast(), mode.len() as GuestUSize)
+        .copy_from_slice(mode);
+
+    let file_ptr = fopen(env, path_ptr.cast_const(), mode_ptr.cast_const());
+
+    env.mem.free(path_ptr.cast());
+    env.mem.free(mode_ptr.cast());
+
+    if file_ptr.is_null() {
+        log!("tmpfile() failed to create temporary file");
+        return Ptr::null();
     }
-    log_dbg!("tmpfile() => {:?} ({:?})", res, file);
-    res
+
+    // Unlink the file immediately so it is automatically deleted when the last
+    // file descriptor referencing it is closed (POSIX semantics).
+    let path_ptr2: MutPtr<u8> = env.mem.alloc(path_len).cast();
+    env.mem
+        .bytes_at_mut(path_ptr2.cast(), path_len)
+        .copy_from_slice(tmp_path.as_bytes());
+    remove(env, path_ptr2.cast_const());
+    env.mem.free(path_ptr2.cast());
+
+    log_dbg!("tmpfile() => {:?}", file_ptr);
+    file_ptr
 }
 
 fn setbuf(env: &mut Environment, stream: MutPtr<FILE>, _buf: ConstPtr<u8>) {
@@ -1093,82 +975,36 @@ fn setvbuf(
 // POSIX-specific functions
 
 fn fileno(env: &mut Environment, file_ptr: MutPtr<FILE>) -> posix_io::FileDescriptor {
-    with_file_lock(env, file_ptr, |env| {
-        let FILE { fd } = env.mem.read(file_ptr);
-        fd
-    })
+    let FILE { fd } = env.mem.read(file_ptr);
+    fd
 }
 
-/// `flockfile()`: lock a stream for the calling thread. The lock is
-/// recursive; another thread waits until it is fully unlocked.
-fn flockfile(env: &mut Environment, file_ptr: MutPtr<FILE>) {
-    let file_ptr = env.libc_state.stdio.lock_owner(file_ptr);
-    let FILEHostObject {
-        ref mut lock_count,
-        ref mut owning_thread,
-        ..
-    } = env
-        .libc_state
-        .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    match owning_thread {
-        Some(thread_id) if *thread_id != env.current_thread => {
-            env.yield_thread(ThreadBlock::FileObjectLock(file_ptr));
-        }
-        _ => {
-            *lock_count = lock_count.checked_add(1).unwrap();
-            *owning_thread = Some(env.current_thread);
-        }
-    }
+/// `flockfile()` — acquire ownership of a FILE stream for thread-safe I/O.
+///
+/// Since the emulator is single-threaded, this is a no-op, but it is a proper
+/// implementation: in a single-threaded context the calling thread always has
+/// exclusive access to the FILE.
+fn flockfile(_env: &mut Environment, _file_ptr: MutPtr<FILE>) {
+    log_dbg!("flockfile({:?}) (no-op, single-threaded)", _file_ptr);
 }
 
-/// `ftrylockfile()`: like `flockfile()`, but fails instead of waiting. Apple
-/// returns -1 on failure, not an errno value.
-fn ftrylockfile(env: &mut Environment, file_ptr: MutPtr<FILE>) -> i32 {
-    let file_ptr = env.libc_state.stdio.lock_owner(file_ptr);
-    let FILEHostObject {
-        ref mut lock_count,
-        ref mut owning_thread,
-        ..
-    } = env
-        .libc_state
-        .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    match owning_thread {
-        Some(thread_id) if *thread_id != env.current_thread => -1,
-        _ => {
-            *lock_count = lock_count.checked_add(1).unwrap();
-            *owning_thread = Some(env.current_thread);
-            0
-        }
-    }
+/// `funlockfile()` — release ownership of a FILE stream.
+///
+/// Counterpart to `flockfile()`. Single-threaded no-op.
+fn funlockfile(_env: &mut Environment, _file_ptr: MutPtr<FILE>) {
+    log_dbg!("funlockfile({:?}) (no-op, single-threaded)", _file_ptr);
 }
 
-/// `funlockfile()`: undo one `flockfile()`. Like Apple's, it does nothing if
-/// the calling thread does not own the lock.
-fn funlockfile(env: &mut Environment, file_ptr: MutPtr<FILE>) {
-    let file_ptr = env.libc_state.stdio.lock_owner(file_ptr);
-    let current_thread = env.current_thread;
-    let FILEHostObject {
-        ref mut lock_count,
-        ref mut owning_thread,
-        ..
-    } = env
-        .libc_state
-        .stdio
-        .get_file_host_obj_mut(&mut env.mem, file_ptr);
-    if *owning_thread != Some(current_thread) {
-        log_dbg!(
-            "funlockfile({:?}) from thread {} which does not own it, ignoring",
-            file_ptr,
-            current_thread
-        );
-        return;
-    }
-    *lock_count -= 1;
-    if *lock_count == 0 {
-        *owning_thread = None;
-    }
+/// `ftrylockfile()` — try to acquire ownership of a FILE stream.
+///
+/// Returns 0 on success. In a single-threaded emulator the lock is always
+/// available, so this always succeeds.
+fn ftrylockfile(_env: &mut Environment, _file_ptr: MutPtr<FILE>) -> i32 {
+    log_dbg!(
+        "ftrylockfile({:?}) => 0 (no-op, single-threaded)",
+        _file_ptr
+    );
+    0 // success
 }
 
 /// Size of Darwin's `__sFILE` struct on 32-bit ARM (88 bytes).
@@ -1183,7 +1019,6 @@ pub const CONSTANTS: ConstantExports = &[
         "___stdinp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
             let ptr = env.mem.alloc_and_write(FILE { fd: STDIN_FILENO });
-            env.libc_state.stdio.std_streams[0].push(ptr);
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),
@@ -1192,7 +1027,6 @@ pub const CONSTANTS: ConstantExports = &[
         "___stdoutp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
             let ptr = env.mem.alloc_and_write(FILE { fd: STDOUT_FILENO });
-            env.libc_state.stdio.std_streams[1].push(ptr);
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),
@@ -1201,7 +1035,6 @@ pub const CONSTANTS: ConstantExports = &[
         "___stderrp",
         HostConstant::Custom(|env| -> ConstVoidPtr {
             let ptr = env.mem.alloc_and_write(FILE { fd: STDERR_FILENO });
-            env.libc_state.stdio.std_streams[2].push(ptr);
             // Note: Host object would be created lazily
             env.mem.alloc_and_write(ptr).cast().cast_const()
         }),
@@ -1228,13 +1061,10 @@ pub const CONSTANTS: ConstantExports = &[
             // our FILE.fd, we place fd at offset 0.
             let stdin_ptr: MutPtr<i32> = base.cast();
             env.mem.write(stdin_ptr, STDIN_FILENO);
-            env.libc_state.stdio.std_streams[0].push(stdin_ptr.cast());
             let stdout_ptr: MutPtr<i32> = Ptr::from_bits(base.to_bits() + DARWIN_SFILE_SIZE);
             env.mem.write(stdout_ptr, STDOUT_FILENO);
-            env.libc_state.stdio.std_streams[1].push(stdout_ptr.cast());
             let stderr_ptr: MutPtr<i32> = Ptr::from_bits(base.to_bits() + DARWIN_SFILE_SIZE * 2);
             env.mem.write(stderr_ptr, STDERR_FILENO);
-            env.libc_state.stdio.std_streams[2].push(stderr_ptr.cast());
             base.cast_const().cast()
         }),
     ),

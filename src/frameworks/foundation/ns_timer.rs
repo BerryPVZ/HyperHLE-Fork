@@ -5,7 +5,6 @@
  */
 //! `NSTimer`.
 
-use super::ns_run_loop::NSDefaultRunLoopMode;
 use super::ns_time_interval_to_duration_or_zero;
 use super::NSTimeInterval;
 use crate::objc::{
@@ -110,7 +109,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
 
     // Получаем реальный гостевой NSString из системного пула эмулятора
-    let mode_str = crate::frameworks::foundation::ns_string::get_static_str(env, NSDefaultRunLoopMode);
+    let mode_str = crate::frameworks::foundation::ns_string::get_static_str(env, "NSDefaultRunLoopMode");
     let _: () = msg![env; run_loop addTimer:timer forMode:mode_str];
 
     autorelease(env, timer)
@@ -165,7 +164,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     let timer: id = msg_class![env; NSTimer timerWithTimeInterval:ti invocation:invocation repeats:rep];
 
     let run_loop: id = msg_class![env; NSRunLoop currentRunLoop];
-    let mode_str = crate::frameworks::foundation::ns_string::get_static_str(env, NSDefaultRunLoopMode);
+    let mode_str = crate::frameworks::foundation::ns_string::get_static_str(env, "NSDefaultRunLoopMode");
     let _: () = msg![env; run_loop addTimer:timer forMode:mode_str];
 
     timer

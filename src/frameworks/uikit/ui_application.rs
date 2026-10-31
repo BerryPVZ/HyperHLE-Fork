@@ -168,10 +168,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)init {
     assert!(env.framework_state.uikit.ui_application.shared_application.is_none());
     env.framework_state.uikit.ui_application.shared_application = Some(this);
-    // UIKit tracking must keep common-mode timers and thread requests alive.
-    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    let tracking = get_static_str(env, "UITrackingRunLoopMode");
-    crate::frameworks::foundation::ns_run_loop::add_common_mode(env, run_loop, tracking);
     this
 }
 
@@ -1117,7 +1113,7 @@ pub(super) fn UIApplicationMain(
     }
 
     let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    crate::frameworks::foundation::ns_run_loop::run_application_main_loop(env, run_loop);
+    let _: () = msg![env; run_loop run];
 }
 
 /// Dispatches `applicationWillResignActive:` and posts

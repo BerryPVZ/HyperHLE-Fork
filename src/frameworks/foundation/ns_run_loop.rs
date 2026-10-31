@@ -9,7 +9,6 @@
 //! - Apple's [Threading Programming Guide](https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/Introduction/Introduction.html)
 
 use super::{ns_port, ns_string, ns_timer, NSTimeInterval};
-use crate::abi::CallFromHost;
 use crate::dyld::{ConstantExports, HostConstant};
 use crate::environment::ThreadId;
 use crate::frameworks::audio_toolbox::audio_queue::{handle_audio_queue, AudioQueueRef};
@@ -20,12 +19,8 @@ use crate::frameworks::core_foundation::cf_run_loop::{
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode, CFRunLoopRef,
 };
 use crate::frameworks::{core_animation, media_player, uikit};
-use crate::libc::semaphore::{host_create_semaphore, sem_post, sem_t};
-use crate::mem::MutPtr;
 use crate::objc::{id, msg, nil, objc_classes, release, retain, Class, ClassExports, HostObject};
-use crate::objc::{msg_send, SEL};
 use crate::Environment;
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// `NSString*`
@@ -52,16 +47,10 @@ pub struct ThreadLocalState {
 
 #[derive(Default)]
 pub(crate) struct NSRunLoopHostObject {
-    selector_objects: VecDeque<ObjectSelectorSource>,
-    next_perform_sequence: u64,
     audio_units: Vec<AudioUnit>,
     /// Weak reference. Audio queue must remove itself when destroyed (TODO).
     /// They are in no particular order.
     audio_queues: Vec<AudioQueueRef>,
-    /// NULL callback run loops use internal audio threads on iOS. Until those
-    /// are modeled, poll these on the main thread in every active mode.
-    /// They are not input sources and must not keep a mode alive.
-    independent_audio_queues: Vec<AudioQueueRef>,
     /// Strong references to `NSTimer*` in no particular order. Timers are owned
     /// by the run loop. The timer must remove itself when invalidated.
     timers: Vec<id>,
@@ -76,225 +65,10 @@ pub(crate) struct NSRunLoopHostObject {
     /// input, but tracking them keeps ownership correct and lets apps that
     /// attach a port purely to keep `-[NSRunLoop run]` alive work.
     ports: Vec<id>,
-    registrations: HashMap<id, HashSet<String>>,
-    common_modes: HashSet<String>,
-    activations: Vec<Activation>,
+    /// Set by CFRunLoopStop; cleared at the start of the next run.
+    pub(crate) stopped: bool,
 }
 impl HostObject for NSRunLoopHostObject {}
-
-/// CFRunLoopRunResult, shared with the NSRunLoop entry points.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub(crate) enum RunResult {
-    Finished = 1,
-    Stopped = 2,
-    TimedOut = 3,
-    HandledSource = 4,
-}
-
-struct Activation {
-    mode: String,
-    stopped: bool,
-}
-
-pub(crate) fn register_mode(env: &mut Environment, run_loop: id, object: id, mode: id) -> bool {
-    let mode = ns_string::to_rust_string(env, mode).to_string();
-    env.objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .registrations
-        .entry(object)
-        .or_default()
-        .insert(mode)
-}
-
-pub(crate) fn unregister_mode(env: &mut Environment, run_loop: id, object: id, mode: id) -> bool {
-    let mode = ns_string::to_rust_string(env, mode).to_string();
-    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
-    if let Some(modes) = state.registrations.get_mut(&object) {
-        modes.remove(&mode);
-        if !modes.is_empty() {
-            return false;
-        }
-    }
-    state.registrations.remove(&object);
-    true
-}
-
-fn matches_mode(state: &NSRunLoopHostObject, object: id, mode: &str) -> bool {
-    state.registrations.get(&object).is_some_and(|modes| {
-        modes.contains(mode)
-            || (modes.contains(NSRunLoopCommonModes)
-                && (mode == NSDefaultRunLoopMode || state.common_modes.contains(mode)))
-    })
-}
-
-pub(crate) fn contains_in_mode(env: &Environment, run_loop: id, object: id, mode: &str) -> bool {
-    matches_mode(env.objc.borrow(run_loop), object, mode)
-}
-
-pub(crate) fn registered_in_mode(env: &Environment, run_loop: id, object: id, mode: &str) -> bool {
-    env.objc
-        .borrow::<NSRunLoopHostObject>(run_loop)
-        .registrations
-        .get(&object)
-        .is_some_and(|modes| modes.contains(mode))
-}
-
-fn is_common_mode(state: &NSRunLoopHostObject, mode: &str) -> bool {
-    mode == NSDefaultRunLoopMode || state.common_modes.contains(mode)
-}
-
-fn mode_has_work(env: &Environment, run_loop: id, mode: &str) -> bool {
-    let ui_source = env.current_thread == 0
-        && env.window.is_some()
-        && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode");
-    let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-    ui_source || (is_common_mode(state, mode)
-                && !state.audio_queues.is_empty())
-                || state.selector_objects.iter().any(|request| request_matches_mode(state, request, mode))
-                || state.timers.iter().any(|object| matches_mode(state, *object, mode))
-                || state.ports.iter().any(|object| matches_mode(state, *object, mode))
-                || state.sources.iter().any(|object| matches_mode(state, *object, mode)
-                    && env.objc.borrow::<crate::frameworks::core_foundation::cf_run_loop::CFRunLoopSourceHostObject>(*object).valid)
-}
-
-pub(crate) fn stop(env: &mut Environment, run_loop: id) {
-    if let Some(activation) = env
-        .objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .activations
-        .last_mut()
-    {
-        activation.stopped = true;
-    }
-}
-
-pub(crate) fn current_mode(env: &Environment, run_loop: id) -> Option<String> {
-    env.objc
-        .borrow::<NSRunLoopHostObject>(run_loop)
-        .activations
-        .last()
-        .map(|a| a.mode.clone())
-}
-
-pub(crate) fn add_common_mode(env: &mut Environment, run_loop: id, mode: id) {
-    let mode = ns_string::to_rust_string(env, mode).to_string();
-    env.objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .common_modes
-        .insert(mode);
-}
-
-// Adapted from touchHLE 94dab1c2: requests are input sources, not timers.
-struct ObjectSelectorSource {
-    target: id,
-    selector: SEL,
-    argument: id,
-    semaphore: MutPtr<sem_t>,
-    sequence: u64,
-    modes: Vec<String>,
-}
-
-pub(crate) fn add_perform_request(
-    env: &mut Environment,
-    run_loop: id,
-    target: id,
-    selector: SEL,
-    argument: id,
-    should_sync: bool,
-    modes: id,
-) -> MutPtr<sem_t> {
-    let semaphore = if should_sync {
-        host_create_semaphore(env, 0)
-    } else {
-        MutPtr::null()
-    };
-    let modes = if modes == nil {
-        vec![NSRunLoopCommonModes.to_string()]
-    } else {
-        let count: super::NSUInteger = msg![env; modes count];
-        (0..count)
-            .map(|i| {
-                let mode: id = msg![env; modes objectAtIndex:i];
-                ns_string::to_rust_string(env, mode).to_string()
-            })
-            .collect()
-    };
-    retain(env, target);
-    retain(env, argument);
-    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
-    let sequence = state.next_perform_sequence;
-    state.next_perform_sequence = sequence.checked_add(1).expect("perform sequence exhausted");
-    state.selector_objects.push_back(ObjectSelectorSource {
-        target,
-        selector,
-        argument,
-        semaphore,
-        sequence,
-        modes,
-    });
-    semaphore
-}
-
-fn request_matches_mode(
-    state: &NSRunLoopHostObject,
-    request: &ObjectSelectorSource,
-    mode: &str,
-) -> bool {
-    request.modes.iter().any(|m| {
-        m == mode
-            || (m == NSRunLoopCommonModes
-                && (mode == NSDefaultRunLoopMode || state.common_modes.contains(mode)))
-    })
-}
-
-fn handle_perform_requests(env: &mut Environment, run_loop: id, mode: &str) -> bool {
-    // Remove before calling guest code: callbacks may enqueue or run a nested
-    // loop, and must not hold a host-object borrow across either operation.
-    // A callback's newly queued requests belong to the next pass. Keep them
-    // in the shared queue so a nested activation can still deliver them.
-    let cutoff = env
-        .objc
-        .borrow::<NSRunLoopHostObject>(run_loop)
-        .next_perform_sequence;
-    let mut handled = false;
-    loop {
-        let index = {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            state.selector_objects.iter().position(|request| {
-                request.sequence < cutoff && request_matches_mode(state, request, mode)
-            })
-        };
-        let request = index.and_then(|i| {
-            env.objc
-                .borrow_mut::<NSRunLoopHostObject>(run_loop)
-                .selector_objects
-                .remove(i)
-        });
-        let Some(ObjectSelectorSource {
-            target,
-            selector,
-            argument,
-            semaphore,
-            ..
-        }) = request
-        else {
-            break;
-        };
-        handled = true;
-        if selector.as_str(&env.mem).ends_with(':') {
-            () = msg_send(env, (target, selector, argument));
-        } else {
-            () = msg_send(env, (target, selector));
-        }
-        release(env, target);
-        release(env, argument);
-        if !semaphore.is_null() {
-            sem_post(env, semaphore);
-        }
-    }
-    handled
-}
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -316,16 +90,35 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (()) release {}
 - (id) autorelease { this }
 
-- (bool)runMode:(id)mode beforeDate:(id)limit_date {
-    // Messaging nil returns zero: a missing date polls rather than waits.
-    let time_limit = Some(msg![env; limit_date timeIntervalSince1970]);
-    let mode_name = ns_string::to_rust_string(env, mode).to_string();
-    if mode_name == NSRunLoopCommonModes || !mode_has_work(env, this, &mode_name) {
-        return false;
-    }
-    // Once entered, returning because the last timer/source was removed is
-    // still a successful run. NO means the mode could not start at all.
-    run_in_mode(env, this, mode, time_limit, true);
+- (bool)runMode:(id)_mode beforeDate:(id)limit_date {
+    // Run the run loop for one iteration, honouring the caller's time limit.
+    // Apps frequently call this in a synchronous spin like:
+    //
+    //     while (!flag) {
+    //         [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+    //                                  beforeDate:[NSDate distantFuture]];
+    //     }
+    //
+    // expecting each pass to drain timers/sources (in particular the
+    // `performSelectorOnMainThread:withObject:waitUntilDone:` timers we
+    // queue with `afterDelay:0.0`). A no-op stub here causes any such app
+    // to spin forever in the guest, never letting the scheduled selectors
+    // fire (e.g. Angry Birds 1.0 hangs after preloading INGAME_*.pvr
+    // because the asset-load completion handler never gets a chance to
+    // run). Returning `true` matches the docs ("the input source was
+    // processed").
+    let time_limit: Option<NSTimeInterval> = if limit_date == nil {
+        None
+    } else {
+        Some(msg![env; limit_date timeIntervalSince1970])
+    };
+    log_dbg!(
+        "[(NSRunLoop*){:?} runMode:_ beforeDate:{:?}] limit={:?}",
+        this,
+        limit_date,
+        time_limit
+    );
+    run_run_loop(env, this, /* single_iteration: */ true, time_limit);
     true
 }
 
@@ -353,7 +146,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         port,
         mode,
     );
-    register_mode(env, this, port, mode);
     // Avoid double-retaining the same port for the same run loop.
     if env.objc.borrow::<NSRunLoopHostObject>(this).ports.contains(&port) {
         return;
@@ -375,7 +167,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         port,
         mode,
     );
-    if !unregister_mode(env, this, port, mode) { return; }
     let maybe_idx = env
         .objc
         .borrow::<NSRunLoopHostObject>(this)
@@ -402,8 +193,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         this,
         ns_string::to_rust_string(env, mode),
     );
-
-    register_mode(env, this, timer, mode);
 
     // FIX: Check if the timer is already in the list. If it is, exit early to
     // prevent duplicate entries and subsequent assertion panics on removal.
@@ -490,32 +279,28 @@ pub fn remove_audio_unit(env: &mut Environment, run_loop: id, unit: AudioUnit) -
 }
 
 /// For use by Audio Toolbox.
-/// TODO: Honor the requested callback mode: NewOutput treats explicit modes
-/// as common, while NewInput currently ignores the mode argument.
 /// TODO: Maybe replace this with a `CFRunLoopObserver` or some other generic
 /// mechanism?
-pub fn add_audio_queue(
-    env: &mut Environment,
-    run_loop: id,
-    queue: AudioQueueRef,
-    independent: bool,
-) {
-    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
-    let queues = if independent {
-        &mut state.independent_audio_queues
-    } else {
-        &mut state.audio_queues
-    };
+/// TODO: Handle run loop modes. Currently assumes the common modes.
+pub fn add_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
+    let queues = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_queues;
     if !queues.contains(&queue) {
         queues.push(queue);
     }
 }
 
-/// For use by Audio Toolbox, for either callback scheduling policy.
+/// For use by Audio Toolbox.
 pub fn remove_audio_queue(env: &mut Environment, run_loop: id, queue: AudioQueueRef) {
-    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
-    state.audio_queues.retain(|item| *item != queue);
-    state.independent_audio_queues.retain(|item| *item != queue);
+    let queues = &mut env
+        .objc
+        .borrow_mut::<NSRunLoopHostObject>(run_loop)
+        .audio_queues;
+    if let Some(queue_idx) = queues.iter().position(|&item| item == queue) {
+        queues.remove(queue_idx);
+    }
 }
 
 /// For use by NSTimer so it can remove itself once it's invalidated.
@@ -528,9 +313,7 @@ pub(crate) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
         return;
     }
 
-    let state = env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop);
-    state.registrations.remove(&timer);
-    let timers = &mut state.timers;
+    let NSRunLoopHostObject { timers, .. } = env.objc.borrow_mut(run_loop);
 
     let mut i = 0;
     let mut release_count = 0;
@@ -551,51 +334,10 @@ pub(crate) fn remove_timer(env: &mut Environment, run_loop: id, timer: id) {
     }
 }
 
-/// Run one paced host UI iteration for the app picker. Guest NS/CF APIs
-/// use their own activation and deadline instead.
+/// Run the run loop for just a single iteration. Used by the app picker and
+/// by `-[NSRunLoop runMode:beforeDate:]`.
 pub fn run_run_loop_single_iteration(env: &mut Environment, run_loop: id) {
     run_run_loop(env, run_loop, /* single_iteration: */ true, None)
-}
-
-/// Run a caller-selected mode until a source is handled or the limit is reached.
-/// The return values match CFRunLoopRunResult.
-pub(crate) fn run_in_mode(
-    env: &mut Environment,
-    run_loop: id,
-    mode: id,
-    unix_time_limit: Option<f64>,
-    return_after_source: bool,
-) -> RunResult {
-    let mode = ns_string::to_rust_string(env, mode).to_string();
-    // Common modes are a registration set, not an executable mode.
-    if mode == NSRunLoopCommonModes {
-        return RunResult::Finished;
-    }
-    run_loop_impl(
-        env,
-        run_loop,
-        false,
-        unix_time_limit,
-        &mode,
-        return_after_source,
-        false,
-    )
-}
-
-/// UIApplicationMain must keep pumping host events even without a window
-/// or any guest sources. Ordinary NS/CF run-loop calls may finish when empty.
-pub(crate) fn run_application_main_loop(env: &mut Environment, run_loop: id) {
-    loop {
-        run_loop_impl(
-            env,
-            run_loop,
-            false,
-            None,
-            NSDefaultRunLoopMode,
-            false,
-            true,
-        );
-    }
 }
 
 pub fn run_run_loop(
@@ -604,61 +346,6 @@ pub fn run_run_loop(
     single_iteration: bool,
     unix_time_limit: Option<f64>,
 ) {
-    run_loop_impl(
-        env,
-        run_loop,
-        single_iteration,
-        unix_time_limit,
-        NSDefaultRunLoopMode,
-        false,
-        single_iteration || (env.current_thread == 0 && env.window.is_some()),
-    );
-}
-
-fn run_loop_impl(
-    env: &mut Environment,
-    run_loop: id,
-    single_iteration: bool,
-    unix_time_limit: Option<f64>,
-    mode: &str,
-    return_after_source: bool,
-    keep_alive: bool,
-) -> RunResult {
-    if !keep_alive && !mode_has_work(env, run_loop, mode) {
-        return RunResult::Finished;
-    }
-    env.objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .activations
-        .push(Activation {
-            mode: mode.to_string(),
-            stopped: false,
-        });
-    let result = run_loop_body(
-        env,
-        run_loop,
-        single_iteration,
-        unix_time_limit,
-        mode,
-        return_after_source,
-        keep_alive,
-    );
-    env.objc
-        .borrow_mut::<NSRunLoopHostObject>(run_loop)
-        .activations
-        .pop();
-    result
-}
-
-fn run_loop_body(
-    env: &mut Environment,
-    run_loop: id,
-    single_iteration: bool,
-    unix_time_limit: Option<f64>,
-    mode: &str,
-    return_after_source: bool,
-    keep_alive: bool,
-) -> RunResult {
     // Temporary vectors used to track things without needing a reference to the
     // environment or to lock the object. Re-used each iteration for efficiency.
     let mut timers_tmp = Vec::new();
@@ -683,7 +370,6 @@ fn run_loop_body(
 
     loop {
         let mut sleep_until = None;
-        let mut handled = false;
 
         // Commit implicit CATransactions
         // From the CATransaction docs:
@@ -693,9 +379,8 @@ fn run_loop_body(
         ca_transaction::State::commit_implicit_transaction(env);
 
         // We want to process those only on the main run loop
-        if is_main_run_loop && (mode == NSDefaultRunLoopMode || mode == "UITrackingRunLoopMode") {
-            let (next_due, delivered) = uikit::handle_events_with_result(env);
-            handled |= delivered;
+        if is_main_run_loop {
+            let next_due = uikit::handle_events(env);
             limit_sleep_time(&mut sleep_until, next_due);
 
             let force_video_composition = media_player::has_active_video(env);
@@ -704,16 +389,7 @@ fn run_loop_body(
         }
 
         assert!(timers_tmp.is_empty());
-        {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            timers_tmp.extend(
-                state
-                    .timers
-                    .iter()
-                    .copied()
-                    .filter(|timer| matches_mode(state, *timer, mode)),
-            );
-        }
+        timers_tmp.extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).timers);
         // Retain the timers in case a timer cancels another timer
         // (which releases it)
         for timer in timers_tmp.iter() {
@@ -733,15 +409,11 @@ fn run_loop_body(
         // would be best done by implementing a more general run loop source
         // system that can handle invalidation.
         assert!(audio_queues_tmp.is_empty());
-        {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            if is_common_mode(state, mode) {
-                audio_queues_tmp.extend_from_slice(&state.audio_queues);
-            }
-            if is_main_run_loop {
-                audio_queues_tmp.extend_from_slice(&state.independent_audio_queues);
-            }
-        }
+        audio_queues_tmp.extend_from_slice(
+            &env.objc
+                .borrow::<NSRunLoopHostObject>(run_loop)
+                .audio_queues,
+        );
 
         for audio_queue in audio_queues_tmp.drain(..) {
             handle_audio_queue(env, audio_queue);
@@ -749,59 +421,11 @@ fn run_loop_body(
 
         // TODO: not clear if audio units should be processed in the run loop
         assert!(audio_units_tmp.is_empty());
-        {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            if is_main_run_loop {
-                audio_units_tmp.extend_from_slice(&state.audio_units);
-            }
-        }
+        audio_units_tmp
+            .extend_from_slice(&env.objc.borrow::<NSRunLoopHostObject>(run_loop).audio_units);
 
         for audio_unit in audio_units_tmp.drain(..) {
             render_audio_unit(env, audio_unit);
-        }
-
-        // Main-thread requests without an explicit mode use common modes.
-        handled |= handle_perform_requests(env, run_loop, mode);
-        let mut sources = {
-            let state = env.objc.borrow::<NSRunLoopHostObject>(run_loop);
-            state
-                .sources
-                .iter()
-                .copied()
-                .filter(|source| matches_mode(state, *source, mode))
-                .collect::<Vec<_>>()
-        };
-        sources.sort_by_key(|source| env.objc.borrow::<crate::frameworks::core_foundation::cf_run_loop::CFRunLoopSourceHostObject>(*source).order);
-        for source in &sources {
-            retain(env, *source);
-        }
-        for source in sources {
-            // A version-0 source is one input event. Leave later signaled
-            // sources pending when the caller requested one handled source.
-            if handled && return_after_source {
-                release(env, source);
-                continue;
-            }
-            if !contains_in_mode(env, run_loop, source, mode) {
-                release(env, source);
-                continue;
-            }
-            let call = {
-                let state = env.objc.borrow_mut::<crate::frameworks::core_foundation::cf_run_loop::CFRunLoopSourceHostObject>(source);
-                if state.valid && state.signaled {
-                    state.signaled = false;
-                    Some((state.perform, state.info))
-                } else {
-                    None
-                }
-            };
-            if let Some((perform, info)) = call {
-                handled = true;
-                if !perform.to_ptr().is_null() {
-                    let _: () = perform.call_from_host(env, (info,));
-                }
-            }
-            release(env, source);
         }
 
         // Process Audio Services completion callbacks. Apple's
@@ -829,48 +453,33 @@ fn run_loop_body(
         // The compromise used here is that we will wait for a 60th of a second,
         // or until the next scheduled event, whichever is sooner. iPhone OS
         // apps can't do more than 60fps so this should be fine.
-        // Match CFRunLoop's precedence when more than one exit condition
-        // applies: handled input, deadline, stop, then an empty mode.
-        if handled && return_after_source {
-            return RunResult::HandledSource;
+        let limit = Duration::from_millis(1000 / 60);
+        env.sleep(sleep_until.map_or(limit, |i| i.duration_since(Instant::now()).min(limit)));
+
+        if single_iteration {
+            break;
         }
+
+        // CFRunLoopStop sets this flag to break out of the loop.
+        if env.objc.borrow::<NSRunLoopHostObject>(run_loop).stopped {
+            env.objc.borrow_mut::<NSRunLoopHostObject>(run_loop).stopped = false;
+            break;
+        }
+
         if let Some(limit) = unix_time_limit {
-            let now = env
-                .guest_clock
-                .system_time()
+            // We use Unix epoch as a convenience reference date.
+            // (Apple's epoch is less convenient in Rust. And "pure"
+            // Rust approach with Duration/Instant is just too troublesome
+            // and not worthy to convert back and forth)
+            // The host clock could be set before the Unix epoch (or skew
+            // backwards); never panic on that, just treat it as "not yet".
+            let now_secs = env.guest_clock.system_time()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs_f64();
-            if now >= limit {
-                return RunResult::TimedOut;
+            if now_secs >= limit {
+                break;
             }
-            // Recompute using the guest clock each pass, including speed changes.
-            let remaining = Duration::try_from_secs_f64(limit - now).unwrap_or(Duration::MAX);
-            if let Some(due) = env.guest_clock.now().checked_add(remaining) {
-                limit_sleep_time(&mut sleep_until, Some(env.guest_clock.host_deadline(due)));
-            }
-        }
-        if env
-            .objc
-            .borrow::<NSRunLoopHostObject>(run_loop)
-            .activations
-            .last()
-            .unwrap()
-            .stopped
-        {
-            return RunResult::Stopped;
-        }
-        if !keep_alive && !mode_has_work(env, run_loop, mode) {
-            return RunResult::Finished;
-        }
-        let limit = Duration::from_millis(1000 / 60);
-        env.sleep(sleep_until.map_or(limit, |i| {
-            i.saturating_duration_since(Instant::now()).min(limit)
-        }));
-        // The host app picker uses a paced UI pump. CFRunLoopRunInMode(0)
-        // uses the deadline path above and never sleeps here.
-        if single_iteration {
-            return RunResult::TimedOut;
         }
     }
 }
@@ -885,17 +494,12 @@ pub(crate) fn run_loop_for_thread(env: &mut Environment, this: Class, thread_id:
         == nil
     {
         let host_object = Box::new(NSRunLoopHostObject {
-            selector_objects: VecDeque::new(),
-            next_perform_sequence: 0,
             audio_units: Vec::new(),
             audio_queues: Vec::new(),
-            independent_audio_queues: Vec::new(),
             timers: Vec::new(),
             sources: Vec::new(),
             ports: Vec::new(),
-            registrations: HashMap::new(),
-            common_modes: HashSet::new(),
-            activations: Vec::new(),
+            stopped: false,
         });
         // TODO: is it OK to allocate static object for all threads,
         // not only main one?

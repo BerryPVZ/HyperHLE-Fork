@@ -11,9 +11,9 @@ use crate::abi::{DotDotDot, VaList};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::foundation::{ns_string, unichar};
 use crate::libc::clocale::{setlocale, LC_CTYPE};
-use crate::libc::errno::{set_errno, EOVERFLOW, ERANGE};
+use crate::libc::errno::{set_errno, EOVERFLOW};
 use crate::libc::posix_io::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
-use crate::libc::stdio::{fwrite, getc, ungetc, wait_for_stdout_lock, with_file_lock, EOF, FILE};
+use crate::libc::stdio::{fwrite, getc, ungetc, EOF, FILE};
 use crate::libc::stdlib::{atof_inner_generic, str_to_int_inner_generic};
 use crate::libc::string::strlen;
 use crate::libc::wchar::wchar_t;
@@ -881,7 +881,7 @@ fn f_format(
     if left_justified {
         format!("{float:<pad_width$.precision$}")
     } else if pad_char == '0' {
-        format!("{float:0pad_width$.precision$}")
+        format!("{float:0>pad_width$.precision$}")
     } else {
         // Space-padded right-justification: sign, then digits padded
         // with spaces to fill the total width.
@@ -1103,7 +1103,6 @@ fn vprintf(env: &mut Environment, format: ConstPtr<u8>, arg: VaList) -> i32 {
         format,
         env.mem.cstr_at_utf8(format)
     );
-    wait_for_stdout_lock(env);
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
     // Real libc returns a negative value when writing to stdout fails
     // (e.g. a closed pipe); mirror that instead of ignoring the error.
@@ -1421,7 +1420,6 @@ fn wprintf(env: &mut Environment, format: ConstPtr<wchar_t>, args: DotDotDot) ->
 
     let wcstr_format_bytes = wcstr_format.as_bytes();
     let len: GuestUSize = wcstr_format_bytes.len() as GuestUSize;
-    wait_for_stdout_lock(env);
     let res = printf_inner::<false, _>(
         env,
         |_mem, idx| {
@@ -1452,7 +1450,6 @@ fn printf(env: &mut Environment, format: ConstPtr<u8>, args: DotDotDot) -> i32 {
         format,
         env.mem.cstr_at_utf8(format)
     );
-    wait_for_stdout_lock(env);
     let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), args.start());
     // Real libc returns a negative value when writing to stdout fails
     // (e.g. a closed pipe); mirror that instead of ignoring the error.
@@ -1530,8 +1527,6 @@ where
     let mut format_char_idx = 0;
 
     let mut matched_args = 0;
-    // Set at the end: reading further input would clear errno.
-    let mut range_error = false;
     'outer: loop {
         let c = env.mem.read(format + format_char_idx);
         format_char_idx += 1;
@@ -1566,7 +1561,7 @@ where
                 continue;
             }
             if c != cc {
-                break 'outer;
+                return matched_args;
             }
             src_char_idx += 1;
             continue;
@@ -1651,60 +1646,130 @@ where
                     // automatic base detection in strtol
                     0
                 };
-                if let Some(lm) = length_modifier {
-                    if !matches!(lm, "hh" | "h" | "l" | "ll") {
-                        log!(
-                            "Warning: sscanf %d/%i: unhandled length modifier '{}' — skipping",
-                            lm
+                match length_modifier {
+                    Some(lm) => {
+                        match lm {
+                            "h" => {
+                                // signed short*
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| i16::from_str_radix(s, base).unwrap_or(i16::MAX),
+                                    |num| num.checked_mul(-1).unwrap_or(i16::MIN),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<i16> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            "hh" => {
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| i8::from_str_radix(s, base).unwrap_or(i8::MAX) as i16,
+                                    |num| num.checked_mul(-1).unwrap_or(i16::MIN),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<i8> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val as i8);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            "l" => {
+                                // On 32-bit ARM, long is 32-bit.
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| i32::from_str_radix(s, base).unwrap_or(i32::MAX),
+                                    |num| num.checked_mul(-1).unwrap_or(i32::MIN),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<i32> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            "ll" => {
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| i64::from_str_radix(s, base).unwrap_or(i64::MAX),
+                                    |num| num.checked_mul(-1).unwrap_or(i64::MIN),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<i64> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            _ => {
+                                log!("Warning: sscanf %d/%i: unhandled length modifier '{}' — skipping", lm);
+                                break;
+                            }
+                        }
+                    }
+                    _ => {
+                        let res = str_to_int_inner_generic(
+                            env,
+                            &getc_fn,
+                            &ungetc_fn,
+                            subject,
+                            src_char_idx,
+                            base,
+                            if max_width > 0 { max_width } else { u32::MAX },
+                            |s, base| i32::from_str_radix(s, base).unwrap_or(i32::MAX),
+                            |num| num.checked_mul(-1).unwrap_or(i32::MIN),
                         );
-                        break;
-                    }
-                }
-                // Like Apple's vfscanf, read the number with strtoimax
-                // semantics (64-bit, saturating with ERANGE on overflow) and
-                // truncate it to the size of the argument. The digits are
-                // parsed wider than 64 bits so that the sign is applied
-                // before saturating.
-                let res = str_to_int_inner_generic(
-                    env,
-                    &getc_fn,
-                    &ungetc_fn,
-                    subject,
-                    src_char_idx,
-                    base,
-                    if max_width > 0 { max_width } else { u32::MAX },
-                    |s, base| i128::from_str_radix(s, base).unwrap_or(i128::MAX),
-                    |num| -num,
-                );
-                let (val, overflow) = match res {
-                    Ok((val, len)) => {
-                        src_char_idx += len;
-                        match i64::try_from(val) {
-                            Ok(val) => (val, false),
-                            Err(_) => (val.clamp(i64::MIN.into(), i64::MAX.into()) as i64, true),
-                        }
-                    }
-                    Err(_) => break,
-                };
-                if !suppress_assignment {
-                    range_error |= overflow;
-                    match length_modifier {
-                        Some("hh") => {
-                            let ptr: ConstPtr<i8> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as i8);
-                        }
-                        Some("h") => {
-                            let ptr: ConstPtr<i16> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as i16);
-                        }
-                        Some("ll") => {
-                            let ptr: ConstPtr<i64> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val);
-                        }
-                        // On 32-bit ARM, long is 32-bit.
-                        _ => {
-                            let ptr: ConstPtr<i32> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as i32);
+                        match res {
+                            Ok((val, len)) => {
+                                src_char_idx += len;
+                                if !suppress_assignment {
+                                    let c_int_ptr: ConstPtr<i32> = args.next(env);
+                                    env.mem.write(c_int_ptr.cast_mut(), val);
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1757,62 +1822,107 @@ where
                     // be defensive against future refactors.
                     _ => 10,
                 };
-                if let Some(lm) = length_modifier {
-                    if !matches!(lm, "hh" | "h" | "l" | "ll") {
-                        log!(
-                            "Warning: sscanf %x/%u: unhandled length modifier '{}' — skipping",
-                            lm
+                match length_modifier {
+                    Some(lm) => {
+                        match lm {
+                            "h" => { /* same as below generally */ }
+                            "hh" => {
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| u8::from_str_radix(s, base).unwrap_or(u8::MAX) as u16,
+                                    |num| num.wrapping_neg(),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<u8> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val as u8);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            "l" => {
+                                // On 32-bit ARM, unsigned long is 32-bit.
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| u32::from_str_radix(s, base).unwrap_or(u32::MAX),
+                                    |num| num.wrapping_neg(),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<u32> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            "ll" => {
+                                let res = str_to_int_inner_generic(
+                                    env,
+                                    &getc_fn,
+                                    &ungetc_fn,
+                                    subject,
+                                    src_char_idx,
+                                    base,
+                                    if max_width > 0 { max_width } else { u32::MAX },
+                                    |s, base| u64::from_str_radix(s, base).unwrap_or(u64::MAX),
+                                    |num| num.wrapping_neg(),
+                                );
+                                match res {
+                                    Ok((val, len)) => {
+                                        src_char_idx += len;
+                                        if !suppress_assignment {
+                                            let ptr: ConstPtr<u64> = args.next(env);
+                                            env.mem.write(ptr.cast_mut(), val);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            _ => {
+                                log!("Warning: sscanf %x/%u: unhandled length modifier '{}' — skipping", lm);
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        let res = str_to_int_inner_generic(
+                            env,
+                            &getc_fn,
+                            &ungetc_fn,
+                            subject,
+                            src_char_idx,
+                            base,
+                            if max_width > 0 { max_width } else { u32::MAX },
+                            |s, base| u32::from_str_radix(s, base).unwrap_or(u32::MAX),
+                            |num| num.wrapping_neg(),
                         );
-                        break;
-                    }
-                }
-                // Like Apple's vfscanf, read the number with strtoumax
-                // semantics (64-bit, a minus sign wraps it around, overflow
-                // saturates with ERANGE even with a minus sign) and truncate
-                // it to the size of the argument.
-                let res = str_to_int_inner_generic(
-                    env,
-                    &getc_fn,
-                    &ungetc_fn,
-                    subject,
-                    src_char_idx,
-                    base,
-                    if max_width > 0 { max_width } else { u32::MAX },
-                    |s, base| u128::from_str_radix(s, base).unwrap_or(u128::MAX),
-                    |num| match u64::try_from(num) {
-                        Ok(num) => num.wrapping_neg().into(),
-                        Err(_) => num,
-                    },
-                );
-                let (val, overflow) = match res {
-                    Ok((val, len)) => {
-                        src_char_idx += len;
-                        match u64::try_from(val) {
-                            Ok(val) => (val, false),
-                            Err(_) => (u64::MAX, true),
-                        }
-                    }
-                    Err(_) => break,
-                };
-                if !suppress_assignment {
-                    range_error |= overflow;
-                    match length_modifier {
-                        Some("hh") => {
-                            let ptr: ConstPtr<u8> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as u8);
-                        }
-                        Some("h") => {
-                            let ptr: ConstPtr<u16> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as u16);
-                        }
-                        Some("ll") => {
-                            let ptr: ConstPtr<u64> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val);
-                        }
-                        // On 32-bit ARM, unsigned long is 32-bit.
-                        _ => {
-                            let ptr: ConstPtr<u32> = args.next(env);
-                            env.mem.write(ptr.cast_mut(), val as u32);
+                        match res {
+                            Ok((val, len)) => {
+                                src_char_idx += len;
+                                if !suppress_assignment {
+                                    let c_u32_ptr: ConstPtr<u32> = args.next(env);
+                                    env.mem.write(c_u32_ptr.cast_mut(), val);
+                                }
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1996,7 +2106,7 @@ where
                 }
                 let cc: u8 = x.unwrap().into();
                 if cc != b'%' {
-                    break 'outer;
+                    return matched_args;
                 }
                 src_char_idx += 1;
                 continue;
@@ -2067,9 +2177,6 @@ where
         }
     }
 
-    if range_error {
-        set_errno(env, ERANGE);
-    }
     matched_args
 }
 
@@ -2150,41 +2257,39 @@ fn fscanf(
         format,
         env.mem.cstr_at_utf8(format)
     );
-    with_file_lock(env, stream, |env| {
-        let cc = getc(env, stream);
-        if cc == EOF {
-            return EOF;
-        }
-        // The pushback can fail on an unseekable stream (e.g. a pipe). Real
-        // libc scans via its internal buffer; we cannot, so report EOF rather
-        // than asserting (which would crash the host).
-        if ungetc(env, cc, stream) != cc {
-            log!("Warning: fscanf(): unable to push back first character; returning EOF.");
-            return EOF;
-        }
+    let cc = getc(env, stream);
+    if cc == EOF {
+        return EOF;
+    }
+    // The pushback can fail on an unseekable stream (e.g. a pipe). Real
+    // libc scans via its internal buffer; we cannot, so report EOF rather
+    // than asserting (which would crash the host).
+    if ungetc(env, cc, stream) != cc {
+        log!("Warning: fscanf(): unable to push back first character; returning EOF.");
+        return EOF;
+    }
 
-        sscanf_common_generic(
-            env,
-            |env, file, _idx| {
-                let c = getc(env, file);
-                if c == EOF {
-                    Err::<u8, ()>(())
-                } else {
-                    Ok(<i32 as TryInto<u8>>::try_into(c).unwrap())
-                }
-            },
-            |env, file, c| {
-                // Best effort: on an unseekable stream the pushback can fail;
-                // log and continue rather than panicking the host.
-                if ungetc(env, c as i32, file) != c as i32 {
-                    log!("Warning: fscanf(): ungetc failed; input character lost.");
-                }
-            },
-            stream,
-            format,
-            args.start(),
-        )
-    })
+    sscanf_common_generic(
+        env,
+        |env, file, _idx| {
+            let c = getc(env, file);
+            if c == EOF {
+                Err::<u8, ()>(())
+            } else {
+                Ok(<i32 as TryInto<u8>>::try_into(c).unwrap())
+            }
+        },
+        |env, file, c| {
+            // Best effort: on an unseekable stream the pushback can fail;
+            // log and continue rather than panicking the host.
+            if ungetc(env, c as i32, file) != c as i32 {
+                log!("Warning: fscanf(): ungetc failed; input character lost.");
+            }
+        },
+        stream,
+        format,
+        args.start(),
+    )
 }
 
 fn fprintf(
@@ -2211,50 +2316,48 @@ fn vfprintf(env: &mut Environment, stream: MutPtr<FILE>, format: ConstPtr<u8>, a
         format,
         env.mem.cstr_at_utf8(format)
     );
-    with_file_lock(env, stream, |env| {
-        let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
-        match env.mem.read(stream).fd {
-            STDIN_FILENO => {
-                // vfprintf() to stdin is nonsense; real libc would EBADF. We
-                // simply log and discard the bytes rather than crashing.
+    let res = printf_inner::<false, _>(env, |mem, idx| mem.read(format + idx), arg);
+    match env.mem.read(stream).fd {
+        STDIN_FILENO => {
+            // vfprintf() to stdin is nonsense; real libc would EBADF. We
+            // simply log and discard the bytes rather than crashing.
+            log!(
+                "Warning: vfprintf() called on STDIN_FILENO; discarding {} bytes.",
+                res.len()
+            );
+        }
+        STDOUT_FILENO => {
+            if std::io::stdout().write_all(&res).is_err() {
+                log!("Warning: vfprintf(): writing to stdout failed; returning EOF.");
+                return EOF;
+            }
+        }
+        STDERR_FILENO => {
+            if std::io::stderr().write_all(&res).is_err() {
+                log!("Warning: vfprintf(): writing to stderr failed; returning EOF.");
+                return EOF;
+            }
+        }
+        _ => {
+            let buf = env.mem.alloc_and_write_cstr(res.as_slice());
+            let result = fwrite(
+                env,
+                buf.cast_const().cast(),
+                1,
+                res.len() as GuestUSize,
+                stream,
+            );
+            if result != res.len() as GuestUSize {
                 log!(
-                    "Warning: vfprintf() called on STDIN_FILENO; discarding {} bytes.",
+                    "Warning: vfprintf(): fwrite wrote {} bytes but {} bytes were formatted.",
+                    result,
                     res.len()
                 );
             }
-            STDOUT_FILENO => {
-                if std::io::stdout().write_all(&res).is_err() {
-                    log!("Warning: vfprintf(): writing to stdout failed; returning EOF.");
-                    return EOF;
-                }
-            }
-            STDERR_FILENO => {
-                if std::io::stderr().write_all(&res).is_err() {
-                    log!("Warning: vfprintf(): writing to stderr failed; returning EOF.");
-                    return EOF;
-                }
-            }
-            _ => {
-                let buf = env.mem.alloc_and_write_cstr(res.as_slice());
-                let result = fwrite(
-                    env,
-                    buf.cast_const().cast(),
-                    1,
-                    res.len() as GuestUSize,
-                    stream,
-                );
-                if result != res.len() as GuestUSize {
-                    log!(
-                        "Warning: vfprintf(): fwrite wrote {} bytes but {} bytes were formatted.",
-                        result,
-                        res.len()
-                    );
-                }
-                env.mem.free(buf.cast());
-            }
+            env.mem.free(buf.cast());
         }
-        res.len().try_into().unwrap_or(i32::MAX)
-    })
+    }
+    res.len().try_into().unwrap_or(i32::MAX)
 }
 
 fn vwprintf(env: &mut Environment, format: ConstPtr<wchar_t>, arg: VaList) -> i32 {
@@ -2274,7 +2377,6 @@ fn vwprintf(env: &mut Environment, format: ConstPtr<wchar_t>, arg: VaList) -> i3
     let wcstr_format_bytes = wcstr_format.as_bytes();
     let len: GuestUSize = wcstr_format_bytes.len() as GuestUSize;
     // Передаем байты формата в printf_inner
-    wait_for_stdout_lock(env);
     let res = printf_inner::<false, _>(
         env,
         |_mem, idx| {

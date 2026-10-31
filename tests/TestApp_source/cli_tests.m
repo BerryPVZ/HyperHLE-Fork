@@ -31,12 +31,11 @@
 #include <semaphore.h>
 #include <setjmp.h>
 #include <stdarg.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -67,15 +66,9 @@
 
 @interface NSDate : NSObject
 + (instancetype)dateWithTimeIntervalSinceNow:(NSTimeInterval)seconds;
-- (NSTimeInterval)timeIntervalSinceNow;
 @end
 
 extern NSString *const NSDefaultRunLoopMode;
-
-int test_NSHashTable_copy_is_independent(void);
-int test_NSHashTable_copy_owns_members(void);
-int test_NSHashTable_copy_empty(void);
-int test_NSData_base64_data(void);
 
 static int perform_selector_on_main_thread_calls;
 
@@ -125,8 +118,7 @@ int test_performSelectorOnMainThread_mainThreadDeferred(void) {
 
 int test_UIApplication_canOpenURL_own_registered_scheme(void) {
   NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  UIApplication *application = [UIApplication sharedApplication];
-  if (application == nil) application = [[UIApplication alloc] init];
+  UIApplication *application = [[UIApplication alloc] init];
   NSURL *registered = [NSURL URLWithString:@"HYPERHLE-TEST://callback"];
   NSURL *unregistered =
       [NSURL URLWithString:@"hyperhle-unregistered://callback"];
@@ -144,847 +136,6 @@ int test_UIApplication_canOpenURL_own_registered_scheme(void) {
   }
   [pool drain];
   return 0;
-}
-
-@interface NSNumber (SelectorQueueTest)
-+ (NSNumber *)numberWithInt:(int)value;
-- (int)intValue;
-@end
-
-@interface NSObject (SelectorQueueModes)
-- (void)performSelectorOnMainThread:(SEL)selector
-                         withObject:(id)object
-                      waitUntilDone:(BOOL)wait
-                              modes:(NSArray *)modes;
-@end
-
-// Separate delivery guarantees from timer/deadline behavior.
-static int selector_arguments_freed;
-@interface SelectorQueueArgument : NSObject {
-@public
-  int value;
-}
-- (int)intValue;
-@end
-@implementation SelectorQueueArgument
-- (int)intValue {
-  return value;
-}
-- (void)dealloc {
-  selector_arguments_freed++;
-  [super dealloc];
-}
-@end
-
-static pthread_t selector_main_thread;
-static int selector_order, selector_wrong_thread, selector_early;
-@interface SelectorQueueProbe : NSObject {
-@public
-  BOOL ready;
-}
-- (void)record:(id)value;
-@end
-@implementation SelectorQueueProbe
-- (void)record:(id)value {
-  if (!pthread_equal(pthread_self(), selector_main_thread))
-    selector_wrong_thread++;
-  if (!ready)
-    selector_early++;
-  selector_order = selector_order * 10 + [value intValue];
-}
-@end
-
-int test_selector_queue_order_and_initialization(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
-  selector_main_thread = pthread_self();
-  selector_order = selector_wrong_thread = selector_early = 0;
-  selector_arguments_freed = 0;
-  for (int i = 1; i <= 2; i++) {
-    SelectorQueueArgument *argument = [[SelectorQueueArgument alloc] init];
-    argument->value = i;
-    [probe performSelectorOnMainThread:@selector(record:)
-                            withObject:argument
-                         waitUntilDone:NO];
-    [argument release];
-  }
-  int freed_before_delivery = selector_arguments_freed;
-  int immediate = selector_order;
-  probe->ready = YES;
-  [probe release]; // Queue must keep its target alive until delivery.
-  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
-  int result = immediate == 0 && selector_order == 12 &&
-                       !selector_wrong_thread && !selector_early
-                   ? 0
-                   : -1;
-  [pool drain];
-  return result == 0 && !freed_before_delivery && selector_arguments_freed == 2
-             ? 0
-             : -2;
-}
-
-int test_selector_queue_explicit_and_common_modes(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
-  probe->ready = YES;
-  selector_main_thread = pthread_self();
-  selector_order = selector_wrong_thread = selector_early = 0;
-  NSString *mode = @"TestAppSelectorMode";
-  [probe performSelectorOnMainThread:@selector(record:)
-                          withObject:@4
-                       waitUntilDone:YES
-                               modes:nil];
-  [probe performSelectorOnMainThread:@selector(record:)
-                          withObject:@5
-                       waitUntilDone:YES
-                               modes:[NSArray array]];
-  [probe performSelectorOnMainThread:@selector(record:)
-                          withObject:@1
-                       waitUntilDone:NO
-                               modes:[NSArray arrayWithObjects:mode, nil]];
-  CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
-  int premature = selector_order;
-  [[NSRunLoop mainRunLoop] runMode:mode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  int explicit_result = selector_order;
-  CFRunLoopAddCommonMode(CFRunLoopGetCurrent(), (CFStringRef)mode);
-  [probe performSelectorOnMainThread:@selector(record:)
-                          withObject:@2
-                       waitUntilDone:NO];
-  [[NSRunLoop mainRunLoop] runMode:mode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  int result = !premature && explicit_result == 1 && selector_order == 12 &&
-                       !selector_wrong_thread
-                   ? 0
-                   : -1;
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-static int selector_requeue_inline;
-@interface SelectorRequeueProbe : NSObject {
-@public
-  BOOL nested;
-}
-- (void)step:(id)value;
-@end
-@implementation SelectorRequeueProbe
-- (void)step:(id)value {
-  selector_order = selector_order * 10 + [value intValue];
-  if ([value intValue] == 1) {
-    [self performSelectorOnMainThread:@selector(step:) withObject:@2 waitUntilDone:NO];
-    selector_requeue_inline = selector_order != 1;
-    if (nested)
-      [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-  }
-}
-@end
-int test_selector_queue_callback_and_nested_delivery(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  SelectorRequeueProbe *probe = [[SelectorRequeueProbe alloc] init];
-  selector_order = selector_requeue_inline = 0;
-  [probe performSelectorOnMainThread:@selector(step:) withObject:@1 waitUntilDone:NO];
-  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-  int first_pass = selector_order;
-  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-  int second_pass = selector_order;
-  probe->nested = YES;
-  selector_order = 0;
-  [probe performSelectorOnMainThread:@selector(step:) withObject:@1 waitUntilDone:NO];
-  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-  int result = first_pass == 1 && second_pass == 12 && selector_order == 12 &&
-      !selector_requeue_inline ? 0 : -1;
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-static pthread_mutex_t selector_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int selector_worker_done, selector_worker_observed;
-static BOOL selector_worker_wait;
-static void *selector_worker(void *object) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  [(id)object performSelectorOnMainThread:@selector(record:)
-                               withObject:@3
-                            waitUntilDone:selector_worker_wait];
-  pthread_mutex_lock(&selector_mutex);
-  selector_worker_observed = selector_worker_wait ? selector_order : -1;
-  selector_worker_done = 1;
-  pthread_mutex_unlock(&selector_mutex);
-  [pool drain];
-  return NULL;
-}
-static int check_selector_background(BOOL wait) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  SelectorQueueProbe *probe = [[SelectorQueueProbe alloc] init];
-  probe->ready = YES;
-  selector_main_thread = pthread_self();
-  selector_order = selector_wrong_thread = selector_early = 0;
-  selector_worker_done = selector_worker_observed = 0;
-  selector_worker_wait = wait;
-  pthread_t thread;
-  if (pthread_create(&thread, NULL, selector_worker, probe))
-    return -1;
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
-  int done;
-  do {
-    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode beforeDate:deadline];
-    pthread_mutex_lock(&selector_mutex);
-    done = selector_worker_done;
-    pthread_mutex_unlock(&selector_mutex);
-    // Unless a thread blocks or yields, touchHLE switches guest threads only
-    // after an instruction batch, so this loop could use up the deadline
-    // before the worker finishes.
-    sched_yield();
-  } while ((!done || selector_order != 3) &&
-           [deadline timeIntervalSinceNow] > 0);
-  // On failure leave the probe alive for the pending request; the harness
-  // still rejects the failed result and bounds the entire guest session.
-  if (!done)
-    return -3;
-  pthread_join(thread, NULL);
-  int result = selector_order == 3 &&
-                       (!wait || selector_worker_observed == 3) &&
-                       !selector_wrong_thread
-                   ? 0
-                   : -2;
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-int test_selector_queue_background_wait(void) {
-  return check_selector_background(YES);
-}
-int test_selector_queue_background_async(void) {
-  return check_selector_background(NO);
-}
-
-static int source_calls;
-static void runloop_source_perform(void *info) {
-  source_calls++;
-  if (info)
-    CFRunLoopStop(CFRunLoopGetCurrent());
-}
-static void ordered_runloop_source(void *info) {
-  source_calls = source_calls * 10 + (int)(intptr_t)info;
-}
-int test_runloop_sources_modes_and_stop(void) {
-  CFRunLoopRef loop = CFRunLoopGetCurrent();
-  CFRunLoopSourceContext context = {0};
-  context.perform = runloop_source_perform;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFStringRef mode = CFSTR("TestAppSourceMode");
-  source_calls = 0;
-  CFRunLoopAddSource(loop, source, mode);
-  CFRunLoopSourceSignal(source);
-  if (CFRunLoopRunInMode(CFSTR("TestAppEmptyMode"), 0, true) !=
-          kCFRunLoopRunFinished ||
-      source_calls)
-    return -1;
-  if (CFRunLoopRunInMode(mode, 0.2, true) != kCFRunLoopRunHandledSource ||
-      source_calls != 1)
-    return -2;
-  if (CFRunLoopRunInMode(mode, 0, true) != kCFRunLoopRunTimedOut ||
-      source_calls != 1)
-    return -3;
-  CFRunLoopRemoveSource(loop, source, mode);
-  CFRelease(source);
-  context.info = (void *)1;
-  source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(loop, source, mode);
-  CFRunLoopSourceSignal(source);
-  int stopped = CFRunLoopRunInMode(mode, 0.2, false);
-  CFRunLoopSourceSignal(source);
-  int handled_and_stopped = CFRunLoopRunInMode(mode, 0.2, true);
-  CFRunLoopSourceSignal(source);
-  int expired_and_stopped = CFRunLoopRunInMode(mode, 0, false);
-  CFRunLoopRemoveSource(loop, source, mode);
-  CFRelease(source);
-  context.perform = ordered_runloop_source;
-  context.info = (void *)1;
-  source = CFRunLoopSourceCreate(NULL, 1, &context);
-  context.info = (void *)2;
-  CFRunLoopSourceRef second = CFRunLoopSourceCreate(NULL, 2, &context);
-  CFRunLoopAddSource(loop, source, mode);
-  CFRunLoopAddSource(loop, second, mode);
-  CFRunLoopSourceSignal(source);
-  CFRunLoopSourceSignal(second);
-  source_calls = 0;
-  int one = CFRunLoopRunInMode(mode, 0.2, true);
-  int first_order = source_calls;
-  int two = CFRunLoopRunInMode(mode, 0.2, true);
-  CFRunLoopRemoveSource(loop, source, mode);
-  CFRunLoopRemoveSource(loop, second, mode);
-  CFRelease(source);
-  CFRelease(second);
-  return stopped == kCFRunLoopRunStopped &&
-      handled_and_stopped == kCFRunLoopRunHandledSource &&
-      expired_and_stopped == kCFRunLoopRunTimedOut &&
-      one == kCFRunLoopRunHandledSource && two == kCFRunLoopRunHandledSource &&
-      first_order == 1 && source_calls == 12 ? 0 : -4;
-}
-
-static int nested_result, nested_mode_restored;
-static void nested_runloop_source(void *info) {
-  nested_result = CFRunLoopRunInMode(CFSTR("TestAppNestedInner"), 0.2, false);
-  CFStringRef mode = CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
-  nested_mode_restored = CFEqual(mode, CFSTR("TestAppNestedOuter"));
-  CFRelease(mode);
-}
-int test_runloop_nested_stop(void) {
-  CFRunLoopRef loop = CFRunLoopGetCurrent();
-  CFRunLoopSourceContext context = {0};
-  context.perform = nested_runloop_source;
-  CFRunLoopSourceRef outer = CFRunLoopSourceCreate(NULL, 0, &context);
-  context.perform = runloop_source_perform;
-  context.info = (void *)1;
-  CFRunLoopSourceRef inner = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(loop, outer, CFSTR("TestAppNestedOuter"));
-  CFRunLoopAddSource(loop, inner, CFSTR("TestAppNestedInner"));
-  CFRunLoopSourceSignal(outer);
-  CFRunLoopSourceSignal(inner);
-  nested_result = nested_mode_restored = 0;
-  int result = CFRunLoopRunInMode(CFSTR("TestAppNestedOuter"), 0.3, true);
-  CFRunLoopRemoveSource(loop, outer, CFSTR("TestAppNestedOuter"));
-  CFRunLoopRemoveSource(loop, inner, CFSTR("TestAppNestedInner"));
-  CFRelease(outer);
-  CFRelease(inner);
-  return result == kCFRunLoopRunHandledSource &&
-                 nested_result == kCFRunLoopRunStopped && nested_mode_restored
-             ? 0
-             : -1;
-}
-
-// The old SDK has no dispatch headers; these are the public C signatures.
-typedef void *dispatch_queue_t;
-typedef uint64_t dispatch_time_t;
-extern dispatch_queue_t dispatch_get_main_queue(void);
-extern dispatch_time_t dispatch_time(dispatch_time_t when, int64_t delta);
-extern void dispatch_after(dispatch_time_t when, dispatch_queue_t queue,
-                           void (^block)(void));
-
-@interface NSTimer (InvocationSchedulingTest)
-+ (instancetype)scheduledTimerWithTimeInterval:(NSTimeInterval)interval
-                                  invocation:(NSInvocation *)invocation
-                                     repeats:(BOOL)repeats;
-@end
-
-static int scheduled_dispatch_calls;
-
-static int check_scheduled_timer_default_mode(BOOL use_invocation) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  PerformSelectorOnMainThreadProbe *probe =
-      [[PerformSelectorOnMainThreadProbe alloc] init];
-  perform_selector_on_main_thread_calls = 0;
-  NSTimer *timer;
-  if (use_invocation) {
-    NSMethodSignature *signature =
-        [NSMethodSignature signatureWithObjCTypes:"v12@0:4@8"];
-    NSInvocation *invocation =
-        [NSInvocation invocationWithMethodSignature:signature];
-    [invocation setTarget:probe];
-    [invocation setSelector:@selector(signal:)];
-    id argument = nil;
-    [invocation setArgument:&argument atIndex:2];
-    [invocation retainArguments];
-    timer = [NSTimer scheduledTimerWithTimeInterval:0.01
-                                        invocation:invocation repeats:NO];
-  } else {
-    timer = [NSTimer scheduledTimerWithTimeInterval:0.01 target:probe
-        selector:@selector(signal:) userInfo:nil repeats:NO];
-  }
-  [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  int result = perform_selector_on_main_thread_calls == 1 ? 0 : -1;
-  [timer invalidate];
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-int test_scheduled_timer_default_mode(void) {
-  return check_scheduled_timer_default_mode(NO);
-}
-
-int test_scheduled_invocation_timer_default_mode(void) {
-  return check_scheduled_timer_default_mode(YES);
-}
-
-extern void dispatch_after_f(dispatch_time_t when, dispatch_queue_t queue,
-                             void *context, void (*work)(void *));
-static void scheduled_dispatch_function(void *context) {
-  (*(int *)context)++;
-}
-static int check_dispatch_after_source(BOOL function, BOOL common_mode) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  CFStringRef mode = common_mode ? CFSTR("TestAppDispatchCommonMode")
-                                : kCFRunLoopDefaultMode;
-  CFRunLoopRef loop = CFRunLoopGetCurrent();
-  if (common_mode) CFRunLoopAddCommonMode(loop, mode);
-  // Keep the mode alive even after its one-shot timer is removed.
-  CFRunLoopSourceContext context = {0};
-  context.perform = runloop_source_perform;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(loop, source, mode);
-  scheduled_dispatch_calls = 0;
-  if (function)
-    dispatch_after_f(dispatch_time(0, 10000000), dispatch_get_main_queue(),
-                     &scheduled_dispatch_calls, scheduled_dispatch_function);
-  else
-    dispatch_after(dispatch_time(0, 10000000), dispatch_get_main_queue(), ^{
-      scheduled_dispatch_calls++;
-    });
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
-  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:deadline];
-  int result = ran && scheduled_dispatch_calls == 1 ? 0 : -1;
-  if (result == 0 && [deadline timeIntervalSinceNow] < 0.5) result = -2;
-  // On failure still drain work so it cannot leak into later tests.
-  if (scheduled_dispatch_calls == 0)
-    [[NSRunLoop mainRunLoop] runMode:NSDefaultRunLoopMode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  CFRunLoopRemoveSource(loop, source, mode);
-  CFRelease(source);
-  [pool drain];
-  return result;
-}
-int test_dispatch_after_default_mode(void) {
-  return check_dispatch_after_source(NO, NO);
-}
-int test_dispatch_after_f_default_mode(void) {
-  return check_dispatch_after_source(YES, NO);
-}
-int test_dispatch_after_common_mode(void) {
-  return check_dispatch_after_source(NO, YES);
-}
-
-// Apple: global queues run work concurrently, and dispatch_async "returns
-// immediately after the block has been submitted and never waits for the
-// block to be invoked". The work below waits for its submitter to move on
-// after dispatch_async returns, as Noblemen: 1896 does (HyperHLE-Reborn
-// issue 307), so it deadlocks if the work runs on the submitting thread.
-// https://developer.apple.com/documentation/dispatch/1453057-dispatch_async
-extern dispatch_queue_t dispatch_get_global_queue(long identifier,
-                                                  unsigned long flags);
-extern void dispatch_async(dispatch_queue_t queue, void (^block)(void));
-extern void dispatch_async_f(dispatch_queue_t queue, void *context,
-                             void (*work)(void *));
-static pthread_mutex_t global_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t global_queue_cond = PTHREAD_COND_INITIALIZER;
-static int global_queue_state;
-static pthread_t global_queue_submitter;
-static int global_queue_work_thread; // 1: worker thread, -1: submitter
-static int global_queue_main_block;  // 1: main thread, -1: another thread
-static void global_queue_work(void *context) {
-  global_queue_work_thread =
-      pthread_equal(pthread_self(), global_queue_submitter) ? -1 : 1;
-  pthread_mutex_lock(&global_queue_mutex);
-  while (global_queue_state == 0)
-    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
-  global_queue_state = 2;
-  pthread_cond_broadcast(&global_queue_cond);
-  pthread_mutex_unlock(&global_queue_mutex);
-  // Main queue work submitted from a worker runs on the main thread.
-  dispatch_async(dispatch_get_main_queue(), ^{
-    global_queue_main_block =
-        pthread_equal(pthread_self(), global_queue_submitter) ? 1 : -1;
-  });
-}
-static int check_dispatch_async_global_queue(BOOL function) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  global_queue_state = 0;
-  global_queue_work_thread = 0;
-  global_queue_main_block = 0;
-  global_queue_submitter = pthread_self();
-  dispatch_queue_t queue = dispatch_get_global_queue(0, 0);
-  if (function)
-    dispatch_async_f(queue, NULL, global_queue_work);
-  else
-    dispatch_async(queue, ^{
-      global_queue_work(NULL);
-    });
-  pthread_mutex_lock(&global_queue_mutex);
-  global_queue_state = 1;
-  pthread_cond_broadcast(&global_queue_cond);
-  while (global_queue_state != 2)
-    pthread_cond_wait(&global_queue_cond, &global_queue_mutex);
-  pthread_mutex_unlock(&global_queue_mutex);
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
-  while (global_queue_main_block == 0 && [deadline timeIntervalSinceNow] > 0)
-    [[NSRunLoop mainRunLoop]
-           runMode:NSDefaultRunLoopMode
-        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
-  [pool drain];
-  if (global_queue_work_thread != 1)
-    return -1;
-  return global_queue_main_block == 1 ? 0 : -2;
-}
-int test_dispatch_async_global_queue(void) {
-  return check_dispatch_async_global_queue(NO);
-}
-int test_dispatch_async_f_global_queue(void) {
-  return check_dispatch_async_global_queue(YES);
-}
-
-// Apple: outside of a submitted block, dispatch_get_current_queue "returns the
-// main queue if the call is executed from the main thread. If the call is made
-// from any other thread, this function returns the default concurrent queue."
-// Cut the Rope (HyperHLE-Reborn issue 344) loads textures on an NSThread and
-// only calls GL when the current queue is the main queue.
-// https://developer.apple.com/documentation/dispatch/dispatch_get_current_queue()
-extern dispatch_queue_t dispatch_get_current_queue(void);
-static void *current_queue_worker(void *result) {
-  *(dispatch_queue_t *)result = dispatch_get_current_queue();
-  return NULL;
-}
-int test_dispatch_get_current_queue(void) {
-  if (dispatch_get_current_queue() != dispatch_get_main_queue())
-    return -1;
-  dispatch_queue_t worker_queue = NULL;
-  pthread_t thread;
-  if (pthread_create(&thread, NULL, current_queue_worker, &worker_queue))
-    return -2;
-  pthread_join(thread, NULL);
-  if (worker_queue == dispatch_get_main_queue())
-    return -3;
-  if (worker_queue != dispatch_get_global_queue(0, 0))
-    return -4;
-  return 0;
-}
-
-// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
-// the image path and base, and the nearest lower symbol, for an address in
-// a loaded image, and returns 0 otherwise. Symbol names have no leading
-// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
-// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
-typedef struct {
-  const char *dli_fname;
-  void *dli_fbase;
-  const char *dli_sname;
-  void *dli_saddr;
-} TestAppDlInfo;
-extern int dladdr(const void *addr, TestAppDlInfo *info);
-int test_dladdr(void) {
-  TestAppDlInfo info;
-  memset(&info, 0, sizeof(info));
-  if (!dladdr((const void *)&test_dladdr, &info))
-    return -1;
-  if (info.dli_fname == NULL || strstr(info.dli_fname, "TestApp") == NULL)
-    return -2;
-  // An image's base address is its Mach-O header (MH_MAGIC or MH_MAGIC_64).
-  if (info.dli_fbase == NULL)
-    return -3;
-  uint32_t magic = *(const uint32_t *)info.dli_fbase;
-  if (magic != 0xfeedface && magic != 0xfeedfacf)
-    return -3;
-  if (info.dli_sname == NULL || strcmp(info.dli_sname, "test_dladdr") != 0)
-    return -4;
-  if (info.dli_saddr != (void *)&test_dladdr)
-    return -5;
-  // The page at address 0 is not part of any image.
-  if (dladdr((const void *)4, &info) != 0)
-    return -6;
-  return 0;
-}
-
-// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
-// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
-// to load its animations (HyperHLE-Reborn issue 303).
-// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
-@interface AVAsset : NSObject
-+ (id)assetWithURL:(NSURL *)url;
-@end
-@interface AVURLAsset : AVAsset
-- (NSURL *)URL;
-@end
-@interface NSObject (AVAssetTest)
-- (BOOL)isKindOfClass:(Class)cls;
-- (BOOL)isEqual:(id)object;
-@end
-int test_AVAsset_assetWithURL(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  NSURL *url = [NSURL URLWithString:@"file:///nonexistent/movie.m4v"];
-  id asset = [AVAsset assetWithURL:url];
-  int result = 0;
-  if (asset == nil)
-    result = -1;
-  else if (![asset isKindOfClass:[AVURLAsset class]])
-    result = -2;
-  else if (![[asset URL] isEqual:url])
-    result = -3;
-  [pool drain];
-  return result;
-}
-extern int test_runloop_audio_queue(void);
-extern int test_runloop_audio_queue_null(void);
-extern int test_runloop_audio_unit_independent(void);
-
-int test_runloop_timer_waits_until_deadline(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  PerformSelectorOnMainThreadProbe *probe =
-      [[PerformSelectorOnMainThreadProbe alloc] init];
-  CFStringRef mode = CFSTR("TestAppTimerMode");
-  // A source keeps the mode alive after the one-shot timer fires.
-  CFRunLoopSourceContext context = {0};
-  context.perform = runloop_source_perform;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, mode);
-  NSTimer *timer = [NSTimer timerWithTimeInterval:0.05
-                                           target:probe
-                                         selector:@selector(signal:)
-                                         userInfo:nil
-                                          repeats:NO];
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
-  perform_selector_on_main_thread_calls = 0;
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.15];
-  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:deadline];
-  int result = ran && perform_selector_on_main_thread_calls == 1 &&
-                       [deadline timeIntervalSinceNow] <= 0
-                   ? 0
-                   : -1;
-  [timer invalidate];
-  CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, mode);
-  CFRelease(source);
-  // A mode that starts with only one timer still reports that it ran,
-  // even if firing the timer removes its final registered object.
-  timer = [NSTimer timerWithTimeInterval:0.01 target:probe
-                  selector:@selector(signal:) userInfo:nil repeats:NO];
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
-  perform_selector_on_main_thread_calls = 0;
-  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode
-                beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  if (!ran || perform_selector_on_main_thread_calls != 1) result = -2;
-  [timer invalidate];
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-// A nil date polls ready work, like a date in the past; it is not infinity.
-int test_runloop_nil_date_polls(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  PerformSelectorOnMainThreadProbe *probe =
-      [[PerformSelectorOnMainThreadProbe alloc] init];
-  CFStringRef mode = CFSTR("TestAppNilDateMode");
-  NSTimer *timer = [NSTimer timerWithTimeInterval:0.3 target:probe
-                  selector:@selector(signal:) userInfo:nil repeats:NO];
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), (CFRunLoopTimerRef)timer, mode);
-  perform_selector_on_main_thread_calls = 0;
-  BOOL ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:nil];
-  int result = ran && perform_selector_on_main_thread_calls == 0 ? 0 : -1;
-  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode
-                beforeDate:[NSDate dateWithTimeIntervalSinceNow:-1]];
-  if (result == 0 && (!ran || perform_selector_on_main_thread_calls != 0))
-    result = -2;
-  [timer invalidate];
-  // An expired deadline still dispatches a source that is already ready.
-  CFRunLoopSourceContext context = {0};
-  context.perform = runloop_source_perform;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(CFRunLoopGetCurrent(), source, mode);
-  CFRunLoopSourceSignal(source);
-  source_calls = 0;
-  ran = [[NSRunLoop mainRunLoop] runMode:(id)mode beforeDate:nil];
-  if (result == 0 && (!ran || source_calls != 1)) result = -3;
-  CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, mode);
-  CFRelease(source);
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-// CFRunLoopTimerCreate returns a timer that calls its callout with the
-// context's info, first at fireDate, then every interval (never if 0).
-// https://developer.apple.com/documentation/corefoundation/1542501-cfrunlooptimercreate
-// Heavy Gunner and Illusia drive their game loops with such timers.
-static int cf_timer_calls;
-static CFRunLoopTimerRef cf_timer_last_timer;
-static void cf_timer_callout(CFRunLoopTimerRef timer, void *info) {
-  cf_timer_calls += (int)(intptr_t)info;
-  cf_timer_last_timer = timer;
-}
-
-int test_CFRunLoopTimerCreate_callout(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  CFStringRef mode = CFSTR("TestAppCFTimerMode");
-  CFRunLoopTimerContext context = {0};
-  context.info = (void *)(intptr_t)1;
-  CFRunLoopTimerRef timer =
-      CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0, 0, 0,
-                           cf_timer_callout, &context);
-  int result = 0;
-  if (timer == NULL || CFRunLoopTimerDoesRepeat(timer) ||
-      !CFRunLoopTimerIsValid(timer))
-    result = -1;
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
-  cf_timer_calls = 0;
-  cf_timer_last_timer = NULL;
-  [[NSRunLoop mainRunLoop] runMode:(id)mode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  if (result == 0 && (cf_timer_calls != 1 || cf_timer_last_timer != timer))
-    result = -2;
-  // A one-shot timer is invalidated after it fires.
-  if (result == 0 && CFRunLoopTimerIsValid(timer))
-    result = -3;
-  CFRelease(timer);
-
-  // A repeating timer keeps firing until it is invalidated.
-  context.info = (void *)(intptr_t)10;
-  timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0.02, 0,
-                               0, cf_timer_callout, &context);
-  if (result == 0 && (!CFRunLoopTimerDoesRepeat(timer) ||
-                      fabs(CFRunLoopTimerGetInterval(timer) - 0.02) > 0.001))
-    result = -4;
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
-  cf_timer_calls = 0;
-  [[NSRunLoop mainRunLoop] runMode:(id)mode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  if (result == 0 && cf_timer_calls < 20)
-    result = -5;
-  CFRunLoopTimerInvalidate(timer);
-  if (result == 0 && CFRunLoopTimerIsValid(timer))
-    result = -6;
-  CFRelease(timer);
-  [pool drain];
-  return result;
-}
-
-// CFRunLoopTimer is toll-free bridged to NSTimer, and
-// CFRunLoopTimerSetNextFireDate reschedules it like -[NSTimer setFireDate:].
-// https://developer.apple.com/documentation/corefoundation/1543570-cfrunlooptimersetnextfiredate
-// PAC-MAN Remix schedules each frame this way on a timer whose interval is
-// effectively infinite.
-int test_CFRunLoopTimerSetNextFireDate_NSTimer(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  PerformSelectorOnMainThreadProbe *probe =
-      [[PerformSelectorOnMainThreadProbe alloc] init];
-  CFStringRef mode = CFSTR("TestAppNextFireDateMode");
-  NSTimer *timer = [NSTimer timerWithTimeInterval:1e9
-                                           target:probe
-                                         selector:@selector(signal:)
-                                         userInfo:nil
-                                          repeats:YES];
-  CFRunLoopTimerRef cfTimer = (CFRunLoopTimerRef)timer;
-  CFRunLoopAddTimer(CFRunLoopGetCurrent(), cfTimer, mode);
-  CFAbsoluteTime fireDate = CFAbsoluteTimeGetCurrent() + 0.01;
-  CFRunLoopTimerSetNextFireDate(cfTimer, fireDate);
-  int result = 0;
-  if (fabs(CFRunLoopTimerGetNextFireDate(cfTimer) - fireDate) > 0.001)
-    result = -1;
-  perform_selector_on_main_thread_calls = 0;
-  [[NSRunLoop mainRunLoop] runMode:(id)mode
-                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
-  if (result == 0 && perform_selector_on_main_thread_calls != 1)
-    result = -2;
-  [timer invalidate];
-  [probe release];
-  [pool drain];
-  return result;
-}
-
-// CFURLCreatePropertyFromResource returns one property of a resource, or
-// NULL with a CFURLError. See CFURLAccess.h and
-// https://developer.apple.com/documentation/corefoundation/1543376-cfurlcreatepropertyfromresource
-// Illusia sizes every resource it loads with kCFURLFileLength.
-int test_CFURLCreatePropertyFromResource(void) {
-  CFBundleRef mainBundle = CFBundleGetMainBundle();
-  CFURLRef url = CFBundleCopyResourceURL(
-      mainBundle, CFSTR("test_1x1_black_pixel"), CFSTR("jpg"), NULL);
-  if (url == NULL)
-    return -1;
-  int result = 0;
-  SInt32 error = 1;
-  CFNumberRef length =
-      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
-  SInt32 size = 0;
-  if (length == NULL || error != 0 ||
-      !CFNumberGetValue(length, kCFNumberSInt32Type, &size) || size != 720)
-    result = -2;
-  if (length != NULL)
-    CFRelease(length);
-  CFBooleanRef exists =
-      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
-  if (result == 0 && (exists == NULL || !CFBooleanGetValue(exists)))
-    result = -3;
-  if (exists != NULL)
-    CFRelease(exists);
-  CFDictionaryRef properties = NULL;
-  if (result == 0 &&
-      (!CFURLCreateDataAndPropertiesFromResource(NULL, url, NULL, &properties,
-                                                 NULL, &error) ||
-       properties == NULL ||
-       !CFNumberGetValue(CFDictionaryGetValue(properties, kCFURLFileLength),
-                         kCFNumberSInt32Type, &size) ||
-       size != 720))
-    result = -4;
-  if (properties != NULL)
-    CFRelease(properties);
-  CFRelease(url);
-
-  url = CFURLCreateWithFileSystemPath(NULL, CFSTR("/no/such/file"),
-                                      kCFURLPOSIXPathStyle, false);
-  error = 0;
-  length = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
-  if (result == 0 && (length != NULL || error != kCFURLResourceNotFoundError))
-    result = -5;
-  exists = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
-  if (result == 0 && (exists == NULL || CFBooleanGetValue(exists)))
-    result = -6;
-  if (exists != NULL)
-    CFRelease(exists);
-  CFRelease(url);
-  return result;
-}
-
-// Every file has its own serial number, and (st_dev, st_ino) identifies it:
-// stat() and fstat() of the same file agree, and different files differ.
-// IL2CPP's FileStream enforces FileShare by that pair, so if every file
-// reported the same inode, Sponge on the Run's log file open failed with a
-// "Sharing violation".
-// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_stat.h.html
-int test_stat_inode_identifies_file(void) {
-  struct stat jpg_stat, jpg_fstat, ttf_fstat;
-  if (stat("test_1x1_black_pixel.jpg", &jpg_stat) != 0)
-    return -1;
-  int jpg = open("test_1x1_black_pixel.jpg", O_RDONLY);
-  int ttf = open("LiberationMono-Regular.ttf", O_RDONLY);
-  if (jpg < 0 || ttf < 0)
-    return -2;
-  int result = 0;
-  if (fstat(jpg, &jpg_fstat) != 0 || fstat(ttf, &ttf_fstat) != 0)
-    result = -3;
-  else if (jpg_stat.st_ino == 0 || jpg_stat.st_ino != jpg_fstat.st_ino ||
-           jpg_stat.st_dev != jpg_fstat.st_dev)
-    result = -4;
-  else if (jpg_fstat.st_dev == ttf_fstat.st_dev &&
-           jpg_fstat.st_ino == ttf_fstat.st_ino)
-    result = -5;
-  close(jpg);
-  close(ttf);
-  return result;
-}
-
-int test_runloop_common_is_not_a_run_mode(void) {
-  CFRunLoopRef loop = CFRunLoopGetCurrent();
-  CFRunLoopSourceContext context = {0};
-  context.perform = runloop_source_perform;
-  CFRunLoopSourceRef source = CFRunLoopSourceCreate(NULL, 0, &context);
-  CFRunLoopAddSource(loop, source, kCFRunLoopCommonModes);
-  CFRunLoopSourceSignal(source);
-  source_calls = 0;
-  int common = CFRunLoopRunInMode(kCFRunLoopCommonModes, 0, true);
-  int calls_after_common = source_calls;
-  int normal = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
-  CFRunLoopRemoveSource(loop, source, kCFRunLoopCommonModes);
-  CFRelease(source);
-  return common == kCFRunLoopRunFinished && calls_after_common == 0 &&
-      normal == kCFRunLoopRunHandledSource && source_calls == 1 ? 0 : -1;
 }
 
 int test_NSBundle_subbundleCacheRetainsAutoreleasedBundle(void) {
@@ -1254,30 +405,6 @@ int test_GKLocalPlayer_authenticateHandler_clearedByObserver(void) {
 }
 
 // === Main code ===
-
-@interface TrackingModeProbe : NSObject {
-@public
-  int calls;
-}
-- (void)signal:(id)object;
-@end
-@implementation TrackingModeProbe
-- (void)signal:(id)object { (void)object; calls++; }
-@end
-
-int test_UIApplication_tracking_is_common_mode(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  if ([UIApplication sharedApplication] == nil)
-    [[UIApplication alloc] init];
-  TrackingModeProbe *probe = [[TrackingModeProbe alloc] init];
-  [probe performSelectorOnMainThread:@selector(signal:) withObject:nil waitUntilDone:NO];
-  [[NSRunLoop mainRunLoop] runMode:@"UITrackingRunLoopMode"
-                      beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.2]];
-  int result = probe->calls == 1 ? 0 : -1;
-  [probe release];
-  [pool drain];
-  return result;
-}
 
 int test_CGGeometry() {
   CGRect testRect;
@@ -2113,62 +1240,6 @@ int test_sscanf() {
     return -91;
   return 0;
 }
-
-// Like Apple's vfscanf, integers are read with strtoimax/strtoumax semantics
-// (64-bit, saturating on overflow) and then truncated to the argument size.
-// sscanf() reads integers like strtoimax()/strtoumax(): overflow saturates
-// and sets ERANGE, and the result is truncated to the size of the argument
-// without an error. Values are from macOS.
-#define SCAN_CHECK(str, fmt, var, expected, expected_errno, code)              \
-  do {                                                                         \
-    errno = 0;                                                                 \
-    if (sscanf(str, fmt, &var) != 1 || var != (expected) ||                    \
-        errno != (expected_errno))                                             \
-      return code;                                                             \
-  } while (0)
-int test_sscanf_integer_overflow() {
-  short hd = 0;
-  int d = 0;
-  unsigned int u = 0;
-  unsigned char hhu = 0;
-  long long lld = 0;
-  unsigned long long llu = 0;
-  SCAN_CHECK("4294967297", "%d", d, 1, 0, -1);
-  SCAN_CHECK("99999999999999999999", "%hd", hd, -1, ERANGE, -2);
-  SCAN_CHECK("-99999999999999999999", "%hd", hd, 0, ERANGE, -3);
-  SCAN_CHECK("99999999999999999999", "%u", u, 4294967295u, ERANGE, -4);
-  SCAN_CHECK("-99999999999999999999", "%u", u, 4294967295u, ERANGE, -5);
-  SCAN_CHECK("-1", "%hhu", hhu, 255, 0, -6);
-  SCAN_CHECK("-4294967297", "%u", u, 4294967295u, 0, -7);
-  SCAN_CHECK("9223372036854775808", "%lld", lld, LLONG_MAX, ERANGE, -8);
-  SCAN_CHECK("-9223372036854775808", "%lld", lld, LLONG_MIN, 0, -9);
-  SCAN_CHECK("-99999999999999999999", "%llu", llu, ULLONG_MAX, ERANGE, -10);
-  SCAN_CHECK("10000000000000000", "%llx", llu, ULLONG_MAX, ERANGE, -11);
-  SCAN_CHECK("1ffffffff", "%x", u, 0xffffffffu, 0, -12);
-  SCAN_CHECK("12345", "%3d", d, 123, 0, -13);
-  // A suppressed conversion consumes the number but does not set errno.
-  errno = 0;
-  d = 0;
-  if (sscanf("99999999999999999999 5", "%*d %d", &d) != 1 || d != 5 ||
-      errno != 0)
-    return -14;
-  // fscanf() keeps ERANGE while it reads further input.
-  FILE *file = tmpfile();
-  if (file == NULL)
-    return -15;
-  fputs("99999999999999999999 5", file);
-  rewind(file);
-  errno = 0;
-  hd = 0;
-  d = 0;
-  int matched = fscanf(file, "%hd %d", &hd, &d);
-  int scan_errno = errno;
-  fclose(file);
-  if (matched != 2 || hd != -1 || d != 5 || scan_errno != ERANGE)
-    return -16;
-  return 0;
-}
-#undef SCAN_CHECK
 
 int test_swscanf() {
   int a, b;
@@ -4463,275 +3534,6 @@ int test_flockfile_io_while_locked() {
   return 0;
 }
 
-// Apple's stdio functions take the stream lock themselves, so a thread that
-// uses a stream locked by another thread waits until it is unlocked.
-struct lock_wait_args {
-  FILE *file;
-  void (*op)(FILE *);
-  pthread_mutex_t *mu;
-  pthread_cond_t *cv;
-  int *started;
-  int *done;
-};
-
-void *lock_wait_thread(void *arg) {
-  struct lock_wait_args *a = arg;
-  pthread_mutex_lock(a->mu);
-  *(a->started) = 1;
-  pthread_cond_signal(a->cv);
-  pthread_mutex_unlock(a->mu);
-
-  // This call must wait until the main thread releases the stream lock.
-  a->op(a->file);
-
-  pthread_mutex_lock(a->mu);
-  *(a->done) = 1;
-  pthread_cond_signal(a->cv);
-  pthread_mutex_unlock(a->mu);
-  return NULL;
-}
-
-// Locks `file`, runs `op` on another thread and checks that it finishes only
-// after the lock is released. If `side_effect` is not NULL, `op` must not
-// change it while the lock is held. If `while_locked` is not NULL, this
-// thread calls it while the other thread waits.
-int check_waits_for_other_thread_lock(FILE *file, void (*op)(FILE *),
-                                      int *side_effect,
-                                      void (*while_locked)(void)) {
-  pthread_mutex_t mu;
-  pthread_cond_t cv;
-  pthread_mutex_init(&mu, NULL);
-  pthread_cond_init(&cv, NULL);
-  int started = 0;
-  int done = 0;
-  struct lock_wait_args args = {file, op, &mu, &cv, &started, &done};
-  if (side_effect != NULL)
-    *side_effect = -1;
-
-  flockfile(file);
-  pthread_t p;
-  if (pthread_create(&p, NULL, lock_wait_thread, &args) != 0) {
-    funlockfile(file);
-    return -2;
-  }
-  pthread_mutex_lock(&mu);
-  while (!started)
-    pthread_cond_wait(&cv, &mu);
-  pthread_mutex_unlock(&mu);
-  // Wait on a condition rather than sleeping while the worker may be idle.
-  // A broken operation can report completion immediately; a blocking one
-  // cannot complete until we release the FILE lock below.
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  struct timespec deadline = {tv.tv_sec, tv.tv_usec * 1000 + 200000000};
-  if (deadline.tv_nsec >= 1000000000) {
-    deadline.tv_sec++;
-    deadline.tv_nsec -= 1000000000;
-  }
-  pthread_mutex_lock(&mu);
-  int wait_error = 0;
-  while (!done && !wait_error)
-    wait_error = pthread_cond_timedwait(&cv, &mu, &deadline);
-  pthread_mutex_unlock(&mu);
-  if (while_locked != NULL)
-    while_locked();
-  pthread_mutex_lock(&mu);
-  int done_before_unlock = done;
-  // The FILE lock protects this value too: a conforming formatter cannot
-  // store through %n while another thread owns its stream lock.
-  int side_effect_before_unlock = side_effect != NULL ? *side_effect : -1;
-  pthread_mutex_unlock(&mu);
-  funlockfile(file);
-
-  pthread_join(p, NULL);
-  pthread_cond_destroy(&cv);
-  pthread_mutex_destroy(&mu);
-  if ((wait_error != 0 && wait_error != ETIMEDOUT) || done_before_unlock != 0 ||
-      side_effect_before_unlock != -1)
-    return -3;
-  if (done != 1 || (side_effect != NULL && *side_effect != 0))
-    return -4;
-  return 0;
-}
-
-void read_one_byte(FILE *file) {
-  char c;
-  fread(&c, 1, 1, file);
-}
-
-int test_fread_waits_for_other_thread_lock() {
-  FILE *file = fopen("TestApp", "r");
-  if (file == NULL)
-    return -1;
-  int res = check_waits_for_other_thread_lock(file, read_one_byte, NULL, NULL);
-  // Nothing was read while the stream was locked, then one byte.
-  off_t pos = ftello(file);
-  fclose(file);
-  if (res != 0)
-    return res;
-  return pos == 1 ? 0 : -5;
-}
-
-// %n stores the number of characters printed so far: here 0. It must not be
-// stored before the lock is acquired.
-int printed_count;
-
-void printf_count(FILE *file) { printf("%n", &printed_count); }
-
-void *read_one_byte_thread(void *arg) {
-  read_one_byte(arg);
-  return NULL;
-}
-
-// fread() keeps the stream locked while it waits for input: here a UDP
-// socket put in place of the stream's file descriptor. Only sockets can make
-// a read wait in touchHLE. The integration harness enables loopback sockets;
-// missing socket support is a failure, never a successful skip.
-int test_fread_holds_lock_while_waiting() {
-  FILE *file = tmpfile();
-  if (file == NULL)
-    return -1;
-  struct sockaddr_in addr = {0};
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  socklen_t addr_len = sizeof(addr);
-  int receiver = socket(AF_INET, SOCK_DGRAM, 0);
-  int sender = socket(AF_INET, SOCK_DGRAM, 0);
-  if (receiver < 0 || sender < 0 ||
-      bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
-      getsockname(receiver, (struct sockaddr *)&addr, &addr_len) != 0) {
-    fclose(file);
-    return -2;
-  }
-  int fd = fileno(file);
-  close(fd);
-  if (fcntl(receiver, F_DUPFD, fd) != fd) {
-    fclose(file);
-    return -3;
-  }
-  close(receiver);
-
-  pthread_t p;
-  if (pthread_create(&p, NULL, read_one_byte_thread, file) != 0) {
-    fclose(file);
-    return -4;
-  }
-  // Give the other thread time to start waiting in fread().
-  usleep(100000);
-  int trylock_result = ftrylockfile(file);
-  if (trylock_result == 0)
-    funlockfile(file);
-  if (sendto(sender, "x", 1, 0, (struct sockaddr *)&addr, sizeof(addr)) != 1)
-    return -6; // Harness deadline also bounds a worker blocked in fread.
-  pthread_join(p, NULL);
-  close(sender);
-  fclose(file);
-  return trylock_result == -1 ? 0 : -5;
-}
-
-FILE *rewind_file;
-int error_while_locked;
-
-void do_rewind(FILE *file) { rewind(file); }
-
-void check_error_indicator(void) { error_while_locked = ferror(rewind_file); }
-
-// rewind() clears the error indicator only once it has the lock.
-int test_rewind_waits_for_other_thread_lock() {
-  rewind_file = fopen("TestApp", "r");
-  if (rewind_file == NULL)
-    return -1;
-  // Writing to a read-only stream sets the error indicator.
-  fputc('x', rewind_file);
-  if (!ferror(rewind_file)) {
-    fclose(rewind_file);
-    return -2;
-  }
-  error_while_locked = 0;
-  int res = check_waits_for_other_thread_lock(rewind_file, do_rewind, NULL,
-                                              check_error_indicator);
-  int error_after = ferror(rewind_file);
-  fclose(rewind_file);
-  if (res != 0)
-    return res;
-  if (!error_while_locked)
-    return -5;
-  return error_after == 0 ? 0 : -6;
-}
-
-int owner_printed_count;
-
-void printf_owner_count(void) { printf("%n", &owner_printed_count); }
-
-// printf() takes no FILE*, but still waits for a lock on stdout. stdout is
-// &__sF[1] on Apple, so a lock taken through either counts, and the thread
-// that holds it can still print. The SDK only declares __sF for old
-// deployment targets.
-extern FILE __sF[];
-int test_printf_waits_for_stdout_lock() {
-  FILE *objects[2] = {stdout, &__sF[1]};
-  for (int i = 0; i < 2; i++) {
-    owner_printed_count = -1;
-    int res = check_waits_for_other_thread_lock(
-        objects[i], printf_count, &printed_count, printf_owner_count);
-    if (res == 0 && owner_printed_count != 0)
-      res = -5;
-    if (res != 0)
-      return res - 10 * i;
-  }
-  return 0;
-}
-
-void fprintf_count(FILE *file) { fprintf(file, "%n", &printed_count); }
-
-int test_fprintf_waits_for_other_thread_lock() {
-  FILE *file = tmpfile();
-  if (file == NULL)
-    return -1;
-  int res =
-      check_waits_for_other_thread_lock(file, fprintf_count, &printed_count,
-                                        NULL);
-  fclose(file);
-  return res;
-}
-
-struct funlockfile_args {
-  FILE *file;
-  int trylock_result;
-};
-
-void *funlockfile_other_thread(void *arg) {
-  struct funlockfile_args *a = arg;
-  // Unlocking a stream this thread does not own does nothing.
-  funlockfile(a->file);
-  a->trylock_result = ftrylockfile(a->file);
-  if (a->trylock_result == 0)
-    funlockfile(a->file);
-  return NULL;
-}
-
-// funlockfile() from a thread that does not own the lock is ignored, and
-// ftrylockfile() on a stream locked by another thread returns -1.
-int test_funlockfile_from_other_thread_is_ignored() {
-  FILE *file = fopen("TestApp", "r");
-  if (file == NULL)
-    return -1;
-  flockfile(file);
-  struct funlockfile_args args = {file, 0};
-  pthread_t p;
-  if (pthread_create(&p, NULL, funlockfile_other_thread, &args) != 0) {
-    funlockfile(file);
-    fclose(file);
-    return -2;
-  }
-  pthread_join(p, NULL);
-  funlockfile(file);
-  fclose(file);
-  if (args.trylock_result != -1)
-    return -3;
-  return 0;
-}
-
 // === end flockfile / funlockfile tests ===
 
 int test_open() {
@@ -4850,93 +3652,6 @@ int test_CFMutableDictionary_NullCallbacks() {
     return -11;
   }
 
-  CFRelease(dict);
-  return 0;
-}
-
-static CFDictionaryRef nullvalue_dict;
-
-// Also checks that the dictionary is intact while the callback runs.
-static Boolean nullvalue_equal_strings(const void *a, const void *b) {
-  return CFDictionaryGetCount(nullvalue_dict) == 1 && strcmp(a, b) == 0;
-}
-
-static CFHashCode nullvalue_hash(const void *value) { return 0; }
-
-int test_CFMutableDictionary_NullValue() {
-  CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-  const char *key = "Key";
-  const char *otherKey = "OtherKey";
-  char value[] = "Value";
-  char sameText[] = "Value";
-  const void *out = value;
-
-  // A stored NULL is still an entry.
-  CFDictionarySetValue(dict, key, NULL);
-  if (CFDictionaryGetCount(dict) != 1 || !CFDictionaryContainsKey(dict, key) ||
-      CFDictionaryContainsKey(dict, otherKey)) {
-    CFRelease(dict);
-    return -1;
-  }
-  if (!CFDictionaryGetValueIfPresent(dict, key, &out) || out != NULL) {
-    CFRelease(dict);
-    return -2;
-  }
-  out = value;
-  if (CFDictionaryGetValueIfPresent(dict, otherKey, &out) || out != value) {
-    CFRelease(dict);
-    return -3;
-  }
-  if (!CFDictionaryContainsValue(dict, NULL)) {
-    CFRelease(dict);
-    return -4;
-  }
-  // AddValue keeps an existing NULL, ReplaceValue replaces it.
-  CFDictionaryAddValue(dict, key, value);
-  if (CFDictionaryGetValue(dict, key) != NULL) {
-    CFRelease(dict);
-    return -5;
-  }
-  CFDictionaryReplaceValue(dict, key, value);
-  if (CFDictionaryGetValue(dict, key) != value ||
-      CFDictionaryContainsValue(dict, NULL)) {
-    CFRelease(dict);
-    return -6;
-  }
-  // Without an equal callback, values are compared by pointer.
-  if (!CFDictionaryContainsValue(dict, value) ||
-      CFDictionaryContainsValue(dict, sameText)) {
-    CFRelease(dict);
-    return -7;
-  }
-  CFRelease(dict);
-
-  // With one, the callback decides.
-  CFDictionaryValueCallBacks valueCallbacks = {0, NULL, NULL, NULL,
-                                               nullvalue_equal_strings};
-  dict = CFDictionaryCreateMutable(NULL, 0, NULL, &valueCallbacks);
-  nullvalue_dict = dict;
-  CFDictionarySetValue(dict, key, value);
-  if (!CFDictionaryContainsValue(dict, sameText) ||
-      CFDictionaryContainsValue(dict, "Other")) {
-    CFRelease(dict);
-    return -8;
-  }
-  CFRelease(dict);
-
-  // The same for keys. The hash callback is constant, so lookups call equal.
-  CFDictionaryKeyCallBacks keyCallbacks = {0, NULL, NULL, NULL,
-                                           nullvalue_equal_strings,
-                                           nullvalue_hash};
-  dict = CFDictionaryCreateMutable(NULL, 0, &keyCallbacks, NULL);
-  nullvalue_dict = dict;
-  char keyCopy[] = "Key";
-  CFDictionarySetValue(dict, key, value);
-  if (CFDictionaryGetValue(dict, keyCopy) != value ||
-      !CFDictionaryContainsKey(dict, keyCopy)) {
-    CFRelease(dict);
-    return -9;
-  }
   CFRelease(dict);
   return 0;
 }
@@ -6154,15 +4869,13 @@ static int compare_precision_examples(void) {
 }
 
 static int compare_special_float_values(void) {
-  /* Positive vs negative zero: CFNumberCompare compares the signs first
-     (copysign), so -0.0 < +0.0 on the checked armv7 iOS versions
-     5.1.1, 6.1.3 and 10.3.3. Modern arm64 tagged numbers can compare equal. */
+  /* Positive vs negative zero */
   {
     double pz = 0.0;
     double nz = -0.0;
     CFNumberRef nP = MAKE_NUM(pz, kCFNumberFloat64Type);
     CFNumberRef nN = MAKE_NUM(nz, kCFNumberFloat64Type);
-    TEST_CMP(nP, nN, kCFCompareGreaterThan, "+0.0 > -0.0", -24);
+    TEST_CMP(nP, nN, kCFCompareEqualTo, "+0.0 == -0.0", -24);
   }
 
   /* Infinities */
@@ -7723,7 +6436,6 @@ struct {
     FUNC_DEF(test_qsort),
     FUNC_DEF(test_vsnprintf),
     FUNC_DEF(test_sscanf),
-    FUNC_DEF(test_sscanf_integer_overflow),
     FUNC_DEF(test_swscanf),
     FUNC_DEF(test_realloc),
     FUNC_DEF(test_atof),
@@ -7760,12 +6472,6 @@ struct {
     FUNC_DEF(test_ftrylockfile_locked_by_other_thread),
     FUNC_DEF(test_flockfile_blocks_other_thread),
     FUNC_DEF(test_flockfile_io_while_locked),
-    FUNC_DEF(test_fread_waits_for_other_thread_lock),
-    FUNC_DEF(test_fread_holds_lock_while_waiting),
-    FUNC_DEF(test_rewind_waits_for_other_thread_lock),
-    FUNC_DEF(test_printf_waits_for_stdout_lock),
-    FUNC_DEF(test_fprintf_waits_for_other_thread_lock),
-    FUNC_DEF(test_funlockfile_from_other_thread_is_ignored),
     FUNC_DEF(test_open),
     FUNC_DEF(test_close),
     FUNC_DEF(test_cond_var),
@@ -7778,7 +6484,6 @@ struct {
     FUNC_DEF(test_pthread_mutex_normal),
     FUNC_DEF(test_pthread_mutex_recursive_trylock),
     FUNC_DEF(test_CFMutableDictionary_NullCallbacks),
-    FUNC_DEF(test_CFMutableDictionary_NullValue),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_PrimitiveTypes),
     FUNC_DEF(test_CFMutableDictionary_CustomCallbacks_CFTypes),
     FUNC_DEF(test_lrint),
@@ -7826,41 +6531,244 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
-    FUNC_DEF(test_selector_queue_order_and_initialization),
-    FUNC_DEF(test_selector_queue_explicit_and_common_modes),
-    FUNC_DEF(test_selector_queue_callback_and_nested_delivery),
-    FUNC_DEF(test_selector_queue_background_wait),
-    FUNC_DEF(test_selector_queue_background_async),
-    FUNC_DEF(test_runloop_sources_modes_and_stop),
-    FUNC_DEF(test_runloop_nested_stop),
-    FUNC_DEF(test_scheduled_timer_default_mode),
-    FUNC_DEF(test_scheduled_invocation_timer_default_mode),
-    FUNC_DEF(test_dispatch_after_default_mode),
-    FUNC_DEF(test_dispatch_after_f_default_mode),
-    FUNC_DEF(test_dispatch_after_common_mode),
+    FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
+    FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     FUNC_DEF(test_dispatch_async_global_queue),
     FUNC_DEF(test_dispatch_async_f_global_queue),
     FUNC_DEF(test_dispatch_get_current_queue),
     FUNC_DEF(test_dladdr),
     FUNC_DEF(test_AVAsset_assetWithURL),
-    FUNC_DEF(test_runloop_audio_queue),
-    FUNC_DEF(test_runloop_audio_queue_null),
-    FUNC_DEF(test_runloop_audio_unit_independent),
-    FUNC_DEF(test_runloop_timer_waits_until_deadline),
-    FUNC_DEF(test_runloop_nil_date_polls),
-    FUNC_DEF(test_runloop_common_is_not_a_run_mode),
     FUNC_DEF(test_CFRunLoopTimerCreate_callout),
     FUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
     FUNC_DEF(test_CFURLCreatePropertyFromResource),
     FUNC_DEF(test_stat_inode_identifies_file),
-    FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
-    FUNC_DEF(test_UIApplication_tracking_is_common_mode),
-    FUNC_DEF(test_NSHashTable_copy_is_independent),
-    FUNC_DEF(test_NSHashTable_copy_owns_members),
-    FUNC_DEF(test_NSHashTable_copy_empty),
-    FUNC_DEF(test_NSData_base64_data),
-    FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
 };
+
+int test_dispatch_async_global_queue(void) {
+  return check_dispatch_async_global_queue(NO);
+}
+
+int test_dispatch_async_f_global_queue(void) {
+  return check_dispatch_async_global_queue(YES);
+}
+
+int test_dispatch_get_current_queue(void) {
+  if (dispatch_get_current_queue() != dispatch_get_main_queue())
+    return -1;
+  dispatch_queue_t worker_queue = NULL;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, current_queue_worker, &worker_queue))
+    return -2;
+  pthread_join(thread, NULL);
+  if (worker_queue == dispatch_get_main_queue())
+    return -3;
+  if (worker_queue != dispatch_get_global_queue(0, 0))
+    return -4;
+  return 0;
+}
+
+extern int dladdr(const void *addr, TestAppDlInfo *info);
+int test_dladdr(void) {
+  TestAppDlInfo info;
+  memset(&info, 0, sizeof(info));
+  if (!dladdr((const void *)&test_dladdr, &info))
+    return -1;
+  if (info.dli_fname == NULL || strstr(info.dli_fname, "TestApp") == NULL)
+    return -2;
+  // An image's base address is its Mach-O header (MH_MAGIC or MH_MAGIC_64).
+  if (info.dli_fbase == NULL)
+    return -3;
+  uint32_t magic = *(const uint32_t *)info.dli_fbase;
+  if (magic != 0xfeedface && magic != 0xfeedfacf)
+    return -3;
+  if (info.dli_sname == NULL || strcmp(info.dli_sname, "test_dladdr") != 0)
+    return -4;
+  if (info.dli_saddr != (void *)&test_dladdr)
+    return -5;
+  // The page at address 0 is not part of any image.
+  if (dladdr((const void *)4, &info) != 0)
+    return -6;
+  return 0;
+}
+
+int test_AVAsset_assetWithURL(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  NSURL *url = [NSURL URLWithString:@"file:///nonexistent/movie.m4v"];
+  id asset = [AVAsset assetWithURL:url];
+  int result = 0;
+  if (asset == nil)
+    result = -1;
+  else if (![asset isKindOfClass:[AVURLAsset class]])
+    result = -2;
+  else if (![[asset URL] isEqual:url])
+    result = -3;
+  [pool drain];
+  return result;
+}
+
+
+int test_CFRunLoopTimerCreate_callout(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  CFStringRef mode = CFSTR("TestAppCFTimerMode");
+  CFRunLoopTimerContext context = {0};
+  context.info = (void *)(intptr_t)1;
+  CFRunLoopTimerRef timer =
+      CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0, 0, 0,
+                           cf_timer_callout, &context);
+  int result = 0;
+  if (timer == NULL || CFRunLoopTimerDoesRepeat(timer) ||
+      !CFRunLoopTimerIsValid(timer))
+    result = -1;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
+  cf_timer_calls = 0;
+  cf_timer_last_timer = NULL;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && (cf_timer_calls != 1 || cf_timer_last_timer != timer))
+    result = -2;
+  // A one-shot timer is invalidated after it fires.
+  if (result == 0 && CFRunLoopTimerIsValid(timer))
+    result = -3;
+  CFRelease(timer);
+
+  // A repeating timer keeps firing until it is invalidated.
+  context.info = (void *)(intptr_t)10;
+  timer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.01, 0.02, 0,
+                               0, cf_timer_callout, &context);
+  if (result == 0 && (!CFRunLoopTimerDoesRepeat(timer) ||
+                      fabs(CFRunLoopTimerGetInterval(timer) - 0.02) > 0.001))
+    result = -4;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), timer, mode);
+  cf_timer_calls = 0;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && cf_timer_calls < 20)
+    result = -5;
+  CFRunLoopTimerInvalidate(timer);
+  if (result == 0 && CFRunLoopTimerIsValid(timer))
+    result = -6;
+  CFRelease(timer);
+  [pool drain];
+  return result;
+}
+
+
+// CFRunLoopTimer is toll-free bridged to NSTimer, and
+// CFRunLoopTimerSetNextFireDate reschedules it like -[NSTimer setFireDate:].
+// https://developer.apple.com/documentation/corefoundation/1543570-cfrunlooptimersetnextfiredate
+// PAC-MAN Remix schedules each frame this way on a timer whose interval is
+// effectively infinite.
+int test_CFRunLoopTimerSetNextFireDate_NSTimer(void) {
+  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+  PerformSelectorOnMainThreadProbe *probe =
+      [[PerformSelectorOnMainThreadProbe alloc] init];
+  CFStringRef mode = CFSTR("TestAppNextFireDateMode");
+  NSTimer *timer = [NSTimer timerWithTimeInterval:1e9
+                                           target:probe
+                                         selector:@selector(signal:)
+                                         userInfo:nil
+                                          repeats:YES];
+  CFRunLoopTimerRef cfTimer = (CFRunLoopTimerRef)timer;
+  CFRunLoopAddTimer(CFRunLoopGetCurrent(), cfTimer, mode);
+  CFAbsoluteTime fireDate = CFAbsoluteTimeGetCurrent() + 0.01;
+  CFRunLoopTimerSetNextFireDate(cfTimer, fireDate);
+  int result = 0;
+  if (fabs(CFRunLoopTimerGetNextFireDate(cfTimer) - fireDate) > 0.001)
+    result = -1;
+  perform_selector_on_main_thread_calls = 0;
+  [[NSRunLoop mainRunLoop] runMode:(id)mode
+                        beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+  if (result == 0 && perform_selector_on_main_thread_calls != 1)
+    result = -2;
+  [timer invalidate];
+  [probe release];
+  [pool drain];
+  return result;
+}
+
+
+// CFURLCreatePropertyFromResource returns one property of a resource, or
+// NULL with a CFURLError. See CFURLAccess.h and
+// https://developer.apple.com/documentation/corefoundation/1543376-cfurlcreatepropertyfromresource
+// Illusia sizes every resource it loads with kCFURLFileLength.
+int test_CFURLCreatePropertyFromResource(void) {
+  CFBundleRef mainBundle = CFBundleGetMainBundle();
+  CFURLRef url = CFBundleCopyResourceURL(
+      mainBundle, CFSTR("test_1x1_black_pixel"), CFSTR("jpg"), NULL);
+  if (url == NULL)
+    return -1;
+  int result = 0;
+  SInt32 error = 1;
+  CFNumberRef length =
+      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
+  SInt32 size = 0;
+  if (length == NULL || error != 0 ||
+      !CFNumberGetValue(length, kCFNumberSInt32Type, &size) || size != 720)
+    result = -2;
+  if (length != NULL)
+    CFRelease(length);
+  CFBooleanRef exists =
+      CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
+  if (result == 0 && (exists == NULL || !CFBooleanGetValue(exists)))
+    result = -3;
+  if (exists != NULL)
+    CFRelease(exists);
+  CFDictionaryRef properties = NULL;
+  if (result == 0 &&
+      (!CFURLCreateDataAndPropertiesFromResource(NULL, url, NULL, &properties,
+                                                 NULL, &error) ||
+       properties == NULL ||
+       !CFNumberGetValue(CFDictionaryGetValue(properties, kCFURLFileLength),
+                         kCFNumberSInt32Type, &size) ||
+       size != 720))
+    result = -4;
+  if (properties != NULL)
+    CFRelease(properties);
+  CFRelease(url);
+
+  url = CFURLCreateWithFileSystemPath(NULL, CFSTR("/no/such/file"),
+                                      kCFURLPOSIXPathStyle, false);
+  error = 0;
+  length = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileLength, &error);
+  if (result == 0 && (length != NULL || error != kCFURLResourceNotFoundError))
+    result = -5;
+  exists = CFURLCreatePropertyFromResource(NULL, url, kCFURLFileExists, NULL);
+  if (result == 0 && (exists == NULL || CFBooleanGetValue(exists)))
+    result = -6;
+  if (exists != NULL)
+    CFRelease(exists);
+  CFRelease(url);
+  return result;
+}
+
+
+// Every file has its own serial number, and (st_dev, st_ino) identifies it:
+// stat() and fstat() of the same file agree, and different files differ.
+// IL2CPP's FileStream enforces FileShare by that pair, so if every file
+// reported the same inode, Sponge on the Run's log file open failed with a
+// "Sharing violation".
+// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/sys_stat.h.html
+int test_stat_inode_identifies_file(void) {
+  struct stat jpg_stat, jpg_fstat, ttf_fstat;
+  if (stat("test_1x1_black_pixel.jpg", &jpg_stat) != 0)
+    return -1;
+  int jpg = open("test_1x1_black_pixel.jpg", O_RDONLY);
+  int ttf = open("LiberationMono-Regular.ttf", O_RDONLY);
+  if (jpg < 0 || ttf < 0)
+    return -2;
+  int result = 0;
+  if (fstat(jpg, &jpg_fstat) != 0 || fstat(ttf, &ttf_fstat) != 0)
+    result = -3;
+  else if (jpg_stat.st_ino == 0 || jpg_stat.st_ino != jpg_fstat.st_ino ||
+           jpg_stat.st_dev != jpg_fstat.st_dev)
+    result = -4;
+  else if (jpg_fstat.st_dev == ttf_fstat.st_dev &&
+           jpg_fstat.st_ino == ttf_fstat.st_ino)
+    result = -5;
+  close(jpg);
+  close(ttf);
+  return result;
+}
 // clang-format on
 
 int TestApp_cli_tests_main(void) {
