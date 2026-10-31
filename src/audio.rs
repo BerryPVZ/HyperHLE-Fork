@@ -20,12 +20,6 @@ pub use ima4::{decode_ima4, encode_ima4};
 use crate::fs::{Fs, GuestPath};
 use std::io::Cursor;
 
-pub(crate) fn decode_host_caf(bytes: Vec<u8>) -> Result<(Vec<u8>, u32, u32), ()> {
-    let pcm = caf_decoder::decode_caf_to_pcm(Cursor::new(bytes.clone()))
-        .or_else(|_| symphonia_formats::decode_symphonia_to_pcm(Cursor::new(bytes)))?;
-    Ok((pcm.bytes, pcm.sample_rate, pcm.channels))
-}
-
 #[derive(Debug)]
 pub enum AudioFileOpenError {
     FileReadError,

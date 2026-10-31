@@ -41,7 +41,6 @@ use crate::options::{Options, PerformanceOverlayCorner, PerformanceOverlayMode};
 use crate::paths;
 use crate::window::DeviceOrientation;
 use crate::Environment;
-use sdl2::audio::{AudioQueue, AudioSpecDesired};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
@@ -2287,80 +2286,6 @@ fn update_icon_grid(
     }
 }
 
-
-/// Prepare the sound before the lock screen becomes interactive so opening the
-/// audio device and decoding a custom file cannot interrupt the swipe.
-fn prepare_unlock_sound() -> Result<(AudioQueue<i16>, Vec<i16>), String> {
-    let custom = paths::user_data_base_path().join(paths::UNLOCK_SOUND_FILE);
-    let pcm = if custom.exists() {
-        match std::fs::read(&custom)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                crate::audio::decode_host_caf(bytes)
-                    .map_err(|()| "unsupported CAF audio format".to_string())
-            }) {
-            Ok((bytes, rate, channels))
-                if (8_000..=192_000).contains(&rate)
-                    && (1..=2).contains(&channels)
-                    && !bytes.is_empty()
-                    && bytes.len() % (channels as usize * 2) == 0 =>
-            {
-                Some((bytes, rate, channels))
-            }
-            Ok(_) => {
-                log!("Warning: {} has unsupported PCM properties; using built-in unlock sound", custom.display());
-                None
-            }
-            Err(error) => {
-                log!("Warning: could not use {}: {error}; using built-in unlock sound", custom.display());
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let sdl = sdl2::init()?;
-    let audio = sdl.audio()?;
-    let desired = AudioSpecDesired {
-        freq: Some(pcm.as_ref().map_or(44_100, |(_, rate, _)| *rate as i32)),
-        channels: Some(pcm.as_ref().map_or(1, |(_, _, channels)| *channels as u8)),
-        samples: None,
-    };
-    let queue = audio.open_queue::<i16, _>(None, &desired)?;
-    if let Some((bytes, _, _)) = pcm {
-        let samples = bytes
-            .chunks_exact(2)
-            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
-            .collect();
-        return Ok((queue, samples));
-    }
-    let rate = queue.spec().freq as f32;
-    let sample_count = (rate * 0.36) as usize;
-    let mut samples = Vec::with_capacity(sample_count);
-    let tau = std::f32::consts::TAU;
-    for index in 0..sample_count {
-        let t = index as f32 / rate;
-        let click = if t < 0.012 {
-            (1.0 - t / 0.012) * (tau * 2400.0 * t).sin()
-        } else {
-            0.0
-        };
-        let tone = |start: f32, frequency: f32| {
-            let elapsed = (t - start).max(0.0);
-            if t < start {
-                0.0
-            } else {
-                (-elapsed * 16.0).exp()
-                    * ((tau * frequency * elapsed).sin()
-                        + 0.28 * (tau * frequency * 2.01 * elapsed).sin())
-            }
-        };
-        let value = 0.11 * click + 0.17 * tone(0.015, 1050.0) + 0.15 * tone(0.105, 790.0);
-        samples.push((value.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-    }
-    Ok((queue, samples))
-}
-
 /// Construct and display the iPhone OS 4 lock screen over the picker wallpaper.
 /// A rightward swipe dismisses the lock screen; a pulsing label recreates the
 /// animated “slide to unlock” treatment.
@@ -2548,13 +2473,6 @@ fn run_lock_screen(
                               action:slider_selector
                     forControlEvents:UIControlEventValueChanged];
     () = msg![env; track addSubview:slider];
-    let unlock_sound = match env.on_parent_stack_in_coroutine(|_, _| prepare_unlock_sound()) {
-        Ok(sound) => Some(sound),
-        Err(error) => {
-            log!("Warning: could not prepare unlock sound: {error}");
-            None
-        }
-    };
     () = msg![env; parent addSubview:lock];
 
     {
@@ -2617,18 +2535,6 @@ fn run_lock_screen(
         host.swipe_right = false;
         host.swipe_left = false;
     }
-    let _unlock_sound = unlock_sound.and_then(|(queue, samples)| {
-        match queue.queue_audio(&samples) {
-            Ok(()) => {
-                queue.resume();
-                Some(queue)
-            }
-            Err(error) => {
-                log!("Warning: could not play unlock sound: {error}");
-                None
-            }
-        }
-    });
     animate_for(env, run_loop, delegate, Duration::from_millis(480), |env, t| {
         let p = ease_in_out_cubic(t) as CGFloat;
         let mut frame: CGRect = msg![env; lock frame];
