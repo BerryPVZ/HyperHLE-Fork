@@ -370,7 +370,15 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
-    pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
+    /// Buffers the guest currently has mapped, keyed by target and buffer
+    /// object name: `(guest mirror, driver mapping, size)`.
+    ///
+    /// The driver mapping is only set for `glMapBufferRange`, whose mapping is
+    /// still open; `glMapBufferOES` keeps the data in the guest mirror alone
+    /// and uploads it on unmap, so it never holds a driver pointer across a
+    /// guest call (see `gles_guest::glMapBufferOES`).
+    pub mapped_buffers:
+        HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, Option<*mut GLvoid>, usize)>,
 }
 impl HostObject for EAGLContextHostObject {}
 
