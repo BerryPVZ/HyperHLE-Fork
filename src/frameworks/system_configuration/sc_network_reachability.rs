@@ -11,9 +11,8 @@ use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::frameworks::core_foundation::cf_allocator::CFAllocatorRef;
 use crate::frameworks::core_foundation::{CFRelease, CFRetain, CFTypeRef};
-use crate::frameworks::foundation::ns_run_loop;
 use crate::mem::{guest_size_of, ConstPtr, GuestISize, Mem, MutPtr, MutVoidPtr, SafeRead};
-use crate::objc::{id, msg_class, nil, objc_classes, ClassExports, HostObject};
+use crate::objc::{objc_classes, ClassExports, HostObject};
 use crate::Environment;
 
 type SCNetworkReachabilityFlags = u32;
@@ -41,11 +40,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         for context in retired {
             release_context(env, Some(context));
         }
-    }
-
-    // Queued on the run loop by SCNetworkReachabilityScheduleWithRunLoop.
-    - (())_touchHLE_deliverScheduledCallback {
-        deliver_scheduled_callback(env, this);
     }
     @end
 };
@@ -122,10 +116,6 @@ struct SCNetworkReachabilityHostObject {
     context: Option<SCNetworkReachabilityContext>,
     active_callbacks: usize,
     retired_contexts: Vec<SCNetworkReachabilityContext>,
-    /// Scheduled on a run loop and not unscheduled since.
-    scheduled: bool,
-    /// The initial notification is queued on the run loop.
-    notification_pending: bool,
 }
 impl HostObject for SCNetworkReachabilityHostObject {}
 
@@ -145,24 +135,6 @@ impl SCNetworkReachabilityHostObject {
             self.retired_contexts.push(old);
         }
         None
-    }
-
-    /// Returns true when the caller must queue the initial notification.
-    fn schedule(&mut self) -> bool {
-        self.scheduled = true;
-        !std::mem::replace(&mut self.notification_pending, true)
-    }
-
-    /// Runs on the run loop. The callback may have been unregistered or the
-    /// target unscheduled since the notification was queued.
-    fn begin_scheduled_callback(&mut self) -> Option<(GuestFunction, MutVoidPtr)> {
-        self.notification_pending = false;
-        if !self.scheduled {
-            return None;
-        }
-        let callout = self.callout?;
-        self.active_callbacks += 1;
-        Some((callout, self.context.map_or(MutVoidPtr::null(), |c| c.info)))
     }
 
     fn finish_callback(&mut self) -> Vec<SCNetworkReachabilityContext> {
@@ -328,68 +300,49 @@ fn SCNetworkReachabilitySetCallback(
 fn SCNetworkReachabilityScheduleWithRunLoop(
     env: &mut Environment,
     target: SCNetworkReachabilityRef,
-    run_loop: CFTypeRef,
-    run_loop_mode: CFTypeRef,
+    _run_loop: CFTypeRef,
+    _run_loop_mode: CFTypeRef,
 ) -> bool {
-    if !is_reachability(env, target) || run_loop.is_null() || run_loop_mode.is_null() {
+    if !is_reachability(env, target) {
         return false;
     }
-    // The callout is a run-loop event, never called from inside this call:
-    // https://developer.apple.com/documentation/systemconfiguration/scnetworkreachabilityschedulewithrunloop(_:_:_:)
-    // Wrappers such as Disney's EasyReachability schedule a new target from
-    // their callout, so calling it here recursed without bound.
-    // There are no network-change events yet, so deliver one initial
-    // notification, like iOS does once a host name target resolves.
-    if env
-        .objc
-        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
-        .schedule()
-    {
-        let modes: id = msg_class![env; NSArray arrayWithObject:run_loop_mode];
-        let selector = env
+    // Keep the existing immediate-notification stub for now. A real run-loop
+    // source/network-change implementation is separate from this ABI fix.
+    CFRetain(env, target);
+    let (callback, info) = {
+        let host = env
             .objc
-            .lookup_selector("_touchHLE_deliverScheduledCallback")
-            .unwrap();
-        // The request retains the target until it is delivered.
-        ns_run_loop::add_perform_request(env, run_loop, target, selector, nil, false, modes);
-    }
-    true
-}
-
-fn deliver_scheduled_callback(env: &mut Environment, target: SCNetworkReachabilityRef) {
-    let Some((callback, info)) = env
-        .objc
-        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
-        .begin_scheduled_callback()
-    else {
-        return;
+            .borrow_mut::<SCNetworkReachabilityHostObject>(target);
+        if host.callout.is_some() {
+            host.active_callbacks += 1;
+        }
+        (
+            host.callout,
+            host.context.map_or(MutVoidPtr::null(), |c| c.info),
+        )
     };
-    // Match GetFlags: do not invent a cellular/direct connection here.
-    let flags = current_flags(env);
-    let _: () = callback.call_from_host(env, (target, flags, info));
-    let retired = env
-        .objc
-        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
-        .finish_callback();
-    for context in retired {
-        release_context(env, Some(context));
+    if let Some(callback) = callback {
+        // Match GetFlags: do not invent a cellular/direct connection here.
+        let flags = current_flags(env);
+        let _: () = callback.call_from_host(env, (target, flags, info));
+        let retired = env
+            .objc
+            .borrow_mut::<SCNetworkReachabilityHostObject>(target)
+            .finish_callback();
+        for context in retired {
+            release_context(env, Some(context));
+        }
     }
-}
-
-fn SCNetworkReachabilityUnscheduleFromRunLoop(
-    env: &mut Environment,
-    target: SCNetworkReachabilityRef,
-    run_loop: CFTypeRef,
-    run_loop_mode: CFTypeRef,
-) -> bool {
-    if !is_reachability(env, target) || run_loop.is_null() || run_loop_mode.is_null() {
-        return false;
-    }
-    // A queued initial notification is dropped when delivered.
-    env.objc
-        .borrow_mut::<SCNetworkReachabilityHostObject>(target)
-        .scheduled = false;
+    CFRelease(env, target);
     true
+}
+fn SCNetworkReachabilityUnscheduleFromRunLoop(
+    _env: &mut Environment,
+    _target: SCNetworkReachabilityRef,
+    _run_loop: CFTypeRef,
+    _run_loop_mode: CFTypeRef,
+) -> bool {
+    false
 }
 fn SCNetworkReachabilitySetDispatchQueue(
     _env: &mut Environment,

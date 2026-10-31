@@ -9,6 +9,7 @@
 //! but here it is the same type.
 
 use crate::abi::CallFromHost;
+use crate::frameworks::foundation::ns_run_loop;
 use crate::abi::GuestFunction;
 use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant};
 use crate::frameworks::core_foundation::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
