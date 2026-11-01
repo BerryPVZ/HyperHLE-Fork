@@ -296,9 +296,7 @@ pub fn AudioQueueNewOutput(
         }
     }
 
-    // Preserve NULL's independent scheduling before choosing our polling loop.
-    let independent_callback = in_callback_run_loop.is_null();
-    let in_callback_run_loop = if independent_callback {
+    let in_callback_run_loop = if in_callback_run_loop.is_null() {
         CFRunLoopGetMain(env)
     } else {
         in_callback_run_loop
@@ -363,7 +361,7 @@ pub fn AudioQueueNewOutput(
 
     env.mem.write(out_aq, aq_ref);
 
-    ns_run_loop::add_audio_queue(env, in_callback_run_loop, aq_ref, independent_callback);
+    ns_run_loop::add_audio_queue(env, in_callback_run_loop, aq_ref);
 
     log_if_broken_audio_format(&format);
 
@@ -3282,9 +3280,7 @@ pub fn AudioQueueNewInput(
         return crate::frameworks::carbon_core::paramErr;
     }
 
-    // Preserve NULL's independent scheduling before choosing our polling loop.
-    let independent_callback = in_callback_run_loop.is_null();
-    let in_callback_run_loop = if independent_callback {
+    let in_callback_run_loop = if in_callback_run_loop.is_null() {
         CFRunLoopGetMain(env)
     } else {
         in_callback_run_loop
@@ -3333,7 +3329,7 @@ pub fn AudioQueueNewInput(
 
     env.mem.write(out_aq, aq_ref);
 
-    ns_run_loop::add_audio_queue(env, in_callback_run_loop, aq_ref, independent_callback);
+    ns_run_loop::add_audio_queue(env, in_callback_run_loop, aq_ref);
 
     0
 }

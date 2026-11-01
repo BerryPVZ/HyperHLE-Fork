@@ -14,6 +14,8 @@ The repository does not distribute commercial apps or iOS firmware. Put an app b
 - Builds for Android, iOS, Windows, macOS, and Linux. The iOS app comes from [Applesauce](https://github.com/johnny901901901/Applesauce); see [`platform/ios`](platform/ios/README.md).
 - Virtual iPhone and iPad device profiles.
 - Android touch input and fullscreen/orientation handling.
+- SharpEmu-style performance display: full counters with a 128-frame graph, minimal panel, or title-bar summary. **F1** toggles it; **F2** cycles panel corners. Mobile builds expose Full/Minimal modes in the app picker; `titlebar` falls back to Minimal where the OS has no title bar.
+- The GLES backend reports `Q DIRECT` and tracked `GLALLOC` storage instead of inventing Vulkan queue/allocation counts. Android GPU load uses readable vendor counters; kernels that hide them can still show `GPU N/A`. `GC 0/0/0` is expected because HyperHLE is written in Rust and has no garbage collector.
 - Ongoing GLES, EAGL, Core Animation, audio, and iOS framework compatibility work.
 - Download build artifacts from the [BerryHLE GitHub Actions workflow](https://github.com/BerryPVZ/BerryHLE/actions/workflows/HyperHLE_release.yml).
 
@@ -33,13 +35,14 @@ The titles below have been tested with HyperHLE-Reborn and are known to run. Com
 - Real Racing 3 (Playable)
 - Silent Ops (Playable)
 - Need For Speed: Most Wanted (Playable)
-- Minecraft 0.14.2-0.16.2 (Playable)
+- Minecraft 0.16.2 (Playable)
 - Oceanhorn (Playable)
 - Asphalt 8 (Playable)
 - GTA 3 (Ingame)
 - Granny (Ingame)
 - Talking Tom Hero Dash (Playable)
 - My Talking Hank (Playable)
+- Subway Surfers 1.106.0 (Playable)
 - And more more games
 
 ## Build and documentation

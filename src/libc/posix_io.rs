@@ -283,6 +283,172 @@ struct iovec {
 }
 unsafe impl SafeRead for iovec {}
 
+/// Implementation shared by `dup()`, `dup2()` and `fcntl(F_DUPFD)`.
+///
+/// The new descriptor shares the underlying file description (seek position,
+/// status flags) with `fd`, but gets its own descriptor flags. Sockets need
+/// special handling: their `GuestFile` is only a placeholder and the host
+/// socket is registered per-descriptor in `sys::socket`, so it is duplicated
+/// there once the new descriptor number is known (see `duplicate_socket`).
+/// Clone the file description behind `fd` into a fresh descriptor entry.
+///
+/// Returns the new [PosixFileHostObject] and whether the source descriptor is
+/// a socket (whose host side has to be re-registered under the new number by
+/// the caller). Returns [None] and sets `errno` on failure.
+fn clone_file_object(
+    env: &mut Environment,
+    fd: FileDescriptor,
+    cloexec: bool,
+) -> Option<(PosixFileHostObject, bool)> {
+    let src_is_socket = is_socket(env, fd);
+    let Some(src_file) = env.libc_state.posix_io.file_for_fd(fd) else {
+        set_errno(env, EBADF);
+        return None;
+    };
+    let cloned = if src_is_socket {
+        GuestFile::Socket
+    } else {
+        match src_file.file.try_clone() {
+            Ok(f) => f,
+            Err(_e) => {
+                log!("dup({}) — try_clone failed: {}", fd, _e);
+                set_errno(env, EMFILE);
+                return None;
+            }
+        }
+    };
+    let src_status_flags = src_file.status_flags;
+    let src_path = src_file.path.clone();
+    let new_flags = if cloexec { FD_CLOEXEC } else { 0 };
+    Some((
+        PosixFileHostObject {
+            file: cloned,
+            needs_flush: false,
+            reached_eof: false,
+            flags: new_flags,
+            status_flags: src_status_flags,
+            path: src_path,
+            locks: Vec::new(),
+            flock_state: None,
+        },
+        src_is_socket,
+    ))
+}
+
+fn duplicate_fd(
+    env: &mut Environment,
+    fd: FileDescriptor,
+    min_fd: FileDescriptor,
+    cloexec: bool,
+) -> FileDescriptor {
+    let Some((host_object, src_is_socket)) = clone_file_object(env, fd, cloexec) else {
+        return -1;
+    };
+    // Find the lowest free fd >= min_fd
+    let min_idx = if min_fd >= NORMAL_FILENO_BASE {
+        fd_to_file_idx(min_fd)
+    } else {
+        0
+    };
+    let files = &mut env.libc_state.posix_io.files;
+    let new_idx = files
+        .iter()
+        .enumerate()
+        .skip(min_idx)
+        .find(|(_, slot)| slot.is_none())
+        .map(|(idx, _)| idx);
+    let idx = match new_idx {
+        Some(idx) => {
+            files[idx] = Some(host_object);
+            idx
+        }
+        None => {
+            let idx = files.len();
+            if idx < min_idx {
+                // Extend with None slots up to min_idx
+                files.resize_with(min_idx, || None);
+                files.push(Some(host_object));
+                min_idx
+            } else {
+                files.push(Some(host_object));
+                idx
+            }
+        }
+    };
+    let new_fd = file_idx_to_fd(idx);
+    if src_is_socket {
+        duplicate_socket(env, fd, new_fd);
+    }
+    new_fd
+}
+
+/// `int dup(int fd)`: lowest-numbered free descriptor sharing `fd`'s file
+/// description (seek position and status flags stay shared with the guest's
+/// copy of POSIX semantics, since the host file handle is cloned).
+fn dup(env: &mut Environment, fd: FileDescriptor) -> FileDescriptor {
+    set_errno(env, 0);
+    if fd >= 0 && fd < NORMAL_FILENO_BASE {
+        // The guest's stdio descriptors are modelled on the host side rather
+        // than in `posix_io.files`, so there is no file description to clone.
+        log!(
+            "Warning: dup({}) on a stdio descriptor, returning -1 (not modelled)",
+            fd
+        );
+        set_errno(env, EBADF);
+        return -1;
+    }
+    let new_fd = duplicate_fd(env, fd, 0, false);
+    log_dbg!("dup({}) => {}", fd, new_fd);
+    new_fd
+}
+
+/// `int dup2(int fd, int fd2)`: make `fd2` refer to `fd`'s file description,
+/// closing `fd2` first if it is open.
+fn dup2(env: &mut Environment, fd: FileDescriptor, new_fd: FileDescriptor) -> FileDescriptor {
+    set_errno(env, 0);
+    if fd == new_fd {
+        if env.libc_state.posix_io.file_for_fd(fd).is_none() {
+            set_errno(env, EBADF);
+            return -1;
+        }
+        return new_fd;
+    }
+    if fd < 0 || new_fd < 0 || new_fd < NORMAL_FILENO_BASE {
+        log!(
+            "Warning: dup2({}, {}) — stdio descriptors are not modelled, returning -1",
+            fd,
+            new_fd
+        );
+        set_errno(env, EBADF);
+        return -1;
+    }
+    let Some((host_object, src_is_socket)) = clone_file_object(env, fd, false) else {
+        return -1;
+    };
+    let idx = fd_to_file_idx(new_fd);
+    let old = {
+        let files = &mut env.libc_state.posix_io.files;
+        if files.len() <= idx {
+            files.resize_with(idx + 1, || None);
+        }
+        files[idx].take()
+    };
+    if let Some(mut old) = old {
+        old.file.close_pipe_endpoint();
+        if matches!(old.file, GuestFile::Socket) {
+            close_socket(env, new_fd);
+        } else if old.needs_flush {
+            let _ = old.file.sync_all();
+        }
+    }
+    env.libc_state.posix_io.files[idx] = Some(host_object);
+    if src_is_socket {
+        duplicate_socket(env, fd, new_fd);
+    }
+    log_dbg!("dup2({}, {}) => {}", fd, new_fd, new_fd);
+    new_fd
+}
+
 fn open(env: &mut Environment, path: ConstPtr<u8>, flags: i32, _args: DotDotDot) -> FileDescriptor {
     set_errno(env, 0);
     self::open_direct(env, path, flags)
@@ -330,6 +496,17 @@ fn path_after_app_bundle_component(path: &str) -> Option<&str> {
     None
 }
 
+/// Unreal's IPhoneTOC records cooked assets under `../UDKGame/`,
+/// while iOS mounts them at the app bundle root.
+fn strip_udk_game_bundle_prefix(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let path = normalized.strip_prefix("./").unwrap_or(&normalized);
+    let relative = path.strip_prefix("../")?;
+    let (root, contents) = relative.split_once('/').unwrap_or((relative, ""));
+    root.eq_ignore_ascii_case("UDKGame")
+        .then(|| contents.to_string())
+}
+
 /// Resolve an existing file path as iPhone OS would see it.
 ///
 /// Bundle files live on a case-insensitive volume on the devices this emulator
@@ -363,18 +540,17 @@ pub(crate) fn resolve_existing_guest_path(env: &Environment, path: &str) -> Opti
         // redirect arbitrary absolute filesystem paths.
         path_after_app_bundle_component(path)
     } else {
-        // Relative paths are resolved against the working directory
-        // only. Looking them up in the bundle too would find bundle files
-        // from any directory.
-        None
+        Some(path.trim_start_matches("./"))
     }?;
+    let relative_path =
+        strip_udk_game_bundle_prefix(relative_path).unwrap_or_else(|| relative_path.to_string());
 
     let data_relative_path = relative_path
         .split_once('/')
         .and_then(|(component, remainder)| {
             component.eq_ignore_ascii_case("Data").then_some(remainder)
         })
-        .unwrap_or(relative_path);
+        .unwrap_or(relative_path.as_str());
     let mut candidates = vec![
         format!("{bundle_root}/{relative_path}"),
         format!("{bundle_root}/Data/{data_relative_path}"),
@@ -1294,86 +1470,7 @@ fn fcntl(
             // Per Apple `man 2 fcntl`: F_DUPFD returns a new file descriptor
             // that is the lowest numbered available descriptor >= min_fd.
             // F_DUPFD_CLOEXEC does the same but sets FD_CLOEXEC on the new fd.
-            // The new descriptor shares the same underlying file description
-            // (seek position, status flags) but has its own fd flags.
-            // Sockets need special handling: their `GuestFile` is only a
-            // placeholder and the host socket is registered per-descriptor in
-            // `sys::socket`, so it is duplicated there once the new descriptor
-            // number is known (see `duplicate_socket`).
-            let src_is_socket = is_socket(env, fd);
-            let Some(src_file) = env.libc_state.posix_io.file_for_fd(fd) else {
-                set_errno(env, EBADF);
-                return -1;
-            };
-            let cloned = if src_is_socket {
-                GuestFile::Socket
-            } else {
-                match src_file.file.try_clone() {
-                    Ok(f) => f,
-                    Err(_e) => {
-                        log!(
-                            "fcntl({}, F_DUPFD, {}) — try_clone failed: {}",
-                            fd,
-                            min_fd,
-                            _e
-                        );
-                        set_errno(env, EMFILE);
-                        return -1;
-                    }
-                }
-            };
-            let src_status_flags = src_file.status_flags;
-            let src_path = src_file.path.clone();
-            let new_flags = if cmd == F_DUPFD_CLOEXEC {
-                FD_CLOEXEC
-            } else {
-                0
-            };
-            let host_object = PosixFileHostObject {
-                file: cloned,
-                needs_flush: false,
-                reached_eof: false,
-                flags: new_flags,
-                status_flags: src_status_flags,
-                path: src_path,
-                locks: Vec::new(),
-                flock_state: None,
-            };
-            // Find the lowest free fd >= min_fd
-            let min_idx = if min_fd >= NORMAL_FILENO_BASE {
-                fd_to_file_idx(min_fd)
-            } else {
-                0
-            };
-            let files = &mut env.libc_state.posix_io.files;
-            let new_idx = files
-                .iter()
-                .enumerate()
-                .skip(min_idx)
-                .find(|(_, slot)| slot.is_none())
-                .map(|(idx, _)| idx);
-            let idx = match new_idx {
-                Some(idx) => {
-                    files[idx] = Some(host_object);
-                    idx
-                }
-                None => {
-                    let idx = files.len();
-                    if idx < min_idx {
-                        // Extend with None slots up to min_idx
-                        files.resize_with(min_idx, || None);
-                        files.push(Some(host_object));
-                        min_idx
-                    } else {
-                        files.push(Some(host_object));
-                        idx
-                    }
-                }
-            };
-            let new_fd = file_idx_to_fd(idx);
-            if src_is_socket {
-                duplicate_socket(env, fd, new_fd);
-            }
+            let new_fd = duplicate_fd(env, fd, min_fd, cmd == F_DUPFD_CLOEXEC);
             log_dbg!(
                 "fcntl({}, {}, {}) => {} (duplicated fd)",
                 fd,
@@ -1741,6 +1838,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(pwrite(_, _, _, _)),
     export_c_func!(lseek(_, _, _)),
     export_c_func!(close(_)),
+    export_c_func!(dup(_)),
+    export_c_func!(dup2(_, _)),
     export_c_func!(rename(_, _)),
     export_c_func!(getcwd(_, _)),
     export_c_func!(chdir(_)),
@@ -1969,7 +2068,7 @@ fn release_range_from_locks(locks: &mut Vec<LockRange>, release: &LockRange) {
 
 #[cfg(test)]
 mod tests {
-    use super::path_after_app_bundle_component;
+    use super::{path_after_app_bundle_component, strip_udk_game_bundle_prefix};
 
     #[test]
     fn finds_case_insensitive_complete_app_bundle_components() {
@@ -1987,6 +2086,22 @@ mod tests {
             path_after_app_bundle_component(
                 "/var/mobile/Applications/old-id/Granny.app.backup/Data/data.unity3d"
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn maps_unreal_cooked_paths_from_project_root_to_bundle_root() {
+        assert_eq!(
+            strip_udk_game_bundle_prefix("../UDKGame/CookedIPhone/Core.xxx").as_deref(),
+            Some("CookedIPhone/Core.xxx")
+        );
+        assert_eq!(
+            strip_udk_game_bundle_prefix(r"..\udkgame\CookedIPhone\Core.xxx").as_deref(),
+            Some("CookedIPhone/Core.xxx")
+        );
+        assert_eq!(
+            strip_udk_game_bundle_prefix("../OtherGame/CookedIPhone/Core.xxx"),
             None
         );
     }

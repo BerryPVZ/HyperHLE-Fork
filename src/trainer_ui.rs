@@ -1232,6 +1232,30 @@ pub unsafe fn draw_es2(
     render_es2(gles, viewport, &quads);
 }
 
+pub unsafe fn draw_texture_es2(
+    gles: &mut dyn GLES,
+    viewport: (u32, u32, u32, u32),
+    _context_token: usize,
+    texture: GLuint,
+    rect: (f32, f32, f32, f32),
+    uv: (f32, f32),
+) {
+    bind_overlay_context();
+    let quad = Quad {
+        tex: texture,
+        x: rect.0,
+        y: rect.1,
+        w: rect.2,
+        h: rect.3,
+        u0: 0.0,
+        v0: 0.0,
+        u1: uv.0,
+        v1: uv.1,
+        col: (1.0, 1.0, 1.0, 1.0),
+    };
+    render_es2(gles, viewport, &[quad]);
+}
+
 /// Build the overlay scene (shared by both renderers). Returns None when the
 /// overlay is disabled or the glyph atlas is unavailable.
 unsafe fn build_scene(
@@ -1821,6 +1845,7 @@ unsafe fn ensure_overlay_white_tex(gles: &mut dyn GLES) -> GLuint {
 /// rest of the presenter state afterwards.
 unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads: &[Quad]) {
     use crate::gles::gles2_raw as gles2;
+    use gles2::types::*;
 
     if quads.is_empty() {
         return;
@@ -1831,10 +1856,6 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     if program.a_pos < 0 || program.a_uv < 0 || program.a_col < 0 {
         return;
     }
-    let vbo = ensure_overlay_vbo(gles);
-    let white = ensure_overlay_white_tex(gles);
-
-    // Save state we touch.
     let mut old_program: GLint = 0;
     gles.GetIntegerv(gles2::CURRENT_PROGRAM, &mut old_program);
     let mut old_array_buffer: GLint = 0;
@@ -1845,6 +1866,16 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut old_tex0: GLint = 0;
     gles.GetIntegerv(gles2::TEXTURE_BINDING_2D, &mut old_tex0);
     let blend_was_on = gles.IsEnabled(gles2::BLEND) != 0;
+    let mut old_color_mask = [gles2::TRUE; 4];
+    gles.GetBooleanv(gles2::COLOR_WRITEMASK, old_color_mask.as_mut_ptr());
+    let overlay_caps = [
+        gles2::SCISSOR_TEST,
+        gles2::DEPTH_TEST,
+        gles2::CULL_FACE,
+        gles2::STENCIL_TEST,
+        gles2::SAMPLE_ALPHA_TO_COVERAGE,
+    ];
+    let old_overlay_caps = overlay_caps.map(|cap| (cap, gles.IsEnabled(cap) != 0));
     let attribs = [program.a_pos as GLuint, program.a_uv as GLuint, program.a_col as GLuint];
     let attrib_states = attribs.map(|attrib|
         crate::frameworks::opengles::SavedAttribute::capture(gles, attrib));
@@ -1855,6 +1886,13 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     let mut equations=[0;2];
     for (value,pname) in equations.iter_mut().zip([gles2::BLEND_EQUATION_RGB,gles2::BLEND_EQUATION_ALPHA]) { gles.GetIntegerv(pname,value); }
     gles.BlendEquationSeparate(gles2::FUNC_ADD,gles2::FUNC_ADD);
+    let vbo = ensure_overlay_vbo(gles);
+    let white = ensure_overlay_white_tex(gles);
+
+    gles.ColorMask(gles2::TRUE, gles2::TRUE, gles2::TRUE, gles2::TRUE);
+    for (cap, _) in old_overlay_caps {
+        gles.Disable(cap);
+    }
     gles.UseProgram(program.program);
     gles.Uniform2f(program.u_viewport, viewport.2 as f32, viewport.3 as f32);
     gles.Uniform1i(program.u_tex, 0);
@@ -1928,6 +1966,17 @@ unsafe fn render_es2(gles: &mut dyn GLES, viewport: (u32, u32, u32, u32), quads:
     if !blend_was_on {
         gles.Disable(gles2::BLEND);
     }
+    for (cap, was_enabled) in old_overlay_caps {
+        if was_enabled {
+            gles.Enable(cap);
+        }
+    }
+    gles.ColorMask(
+        old_color_mask[0],
+        old_color_mask[1],
+        old_color_mask[2],
+        old_color_mask[3],
+    );
     gles.BindTexture(gles2::TEXTURE_2D, old_tex0 as _);
     gles.ActiveTexture(old_active_texture as _);
     gles.BindBuffer(gles2::ARRAY_BUFFER, old_array_buffer as _);

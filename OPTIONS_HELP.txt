@@ -319,9 +319,29 @@ Other options:
         argc/argv) rather than processed by touchHLE. This option can't be used
         via touchHLE_options.txt or touchHLE_default_options.txt.
 
+    --overlay=on|off
+        Start the performance display enabled or hidden. It is enabled by
+        default. The mode defaults to Title bar on desktop and Minimal on
+        mobile. F1 toggles it for the current run; F2 moves the on-screen panel
+        clockwise through the four corners. TOUCHHLE_OVERLAY=0 starts hidden,
+        but F1 can still enable it.
+
+    --overlay-mode=full|minimal|titlebar
+        Show all counters and the frame-time graph, only FPS/CPU/GPU/time, or
+        the minimal summary in the desktop window title bar. On Android/iOS,
+        titlebar falls back to Minimal because the OS has no window title bar.
+        Metrics unavailable from the host remain N/A; MEM is process resident
+        memory. Q DIRECT and GLALLOC describe HyperHLE's GLES path, not Vulkan.
+        GC stays 0/0/0 because the Rust runtime has no garbage collector. Android
+        GPU load is read from vendor kernel counters when the app can access them.
+
+    --overlay-corner=topleft|topright|bottomright|bottomleft
+        Choose the saved corner for the on-screen panel. F2 changes the corner
+        for the current run only.
+
     --print-fps
     --no-print-fps
-        Logs the current framerate (FPS) to the console once per second.
+        Separately log FPS to the console once per second.
 
     --fps-limit=...
         Modify or disable the framerate (FPS) limit.
@@ -382,11 +402,10 @@ Other options:
         Whether presenting a frame waits for the display's vertical refresh.
         One of:
 
-        'auto' (default): on Android, off — HyperHLE paces frames itself (see
-        --fps-limit) and the Android compositor is synchronised to the display
-        anyway, so a blocking swap can only stall the emulator (a frame that
-        takes slightly longer than one refresh then costs two, i.e. 60 FPS
-        becomes 30 FPS). On other systems the driver's default is left alone.
+        'auto' (default): on Android, synchronize swaps to the display; on
+        Android 11 and newer, the surface also requests 60 Hz to match the
+        default --fps-limit. On other systems the driver's default is left
+        alone.
 
         'on': every swap waits for the next refresh (swap interval 1).
 
@@ -440,6 +459,13 @@ Other options:
         Allow apps running in touchHLE to access the Internet and the local network,
         including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
         Disabled by default.
+
+    --game-center-authenticated
+    --no-game-center-authenticated
+        Report the local Game Center player as signed in. This can let games
+        that require authentication at startup enter their offline content.
+        Also available as "Local Game Center sign-in" in Settings > Emulation.
+        Disabled by default. Online Game Center services remain unavailable.
 
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
@@ -514,6 +540,18 @@ Other options:
     --no-fix-movie-player
         Use the legacy MPMoviePlayerController behavior, even if the fix was
         enabled by an app-specific options file.
+
+    --reverse-attrib-locations
+        When an OpenGL ES 2.0 app binds no attribute locations itself, give
+        the active attributes of a linked program the locations 0 to N-1, in
+        the reverse of the order the host driver chose. This is for games
+        that need locations below the attribute count and that send arrays to
+        location 0 for attributes a program does not have. Disabled globally;
+        the bundled default-options file enables it for Noblemen: 1896.
+
+    --no-reverse-attrib-locations
+        Use the usual attribute locations, even if --reverse-attrib-locations
+        was enabled by an app-specific options file.
 
     --rotation-fix
         Use UIKit's actual autorotation state to decide whether EAGL needs an

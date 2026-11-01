@@ -52,10 +52,18 @@ const TEXTURE_CUBE_MAP: GLenum = 0x8513;
 const TEXTURE_BINDING_CUBE_MAP: GLenum = 0x8514;
 const TEXTURE_CUBE_MAP_POSITIVE_X: GLenum = 0x8515;
 const TEXTURE_CUBE_MAP_NEGATIVE_Z: GLenum = 0x851A;
+const TEXTURE_3D: GLenum = 0x806F;
+const TEXTURE_BINDING_3D: GLenum = 0x806A;
+const TEXTURE_2D_ARRAY: GLenum = 0x8C1A;
+const TEXTURE_BINDING_2D_ARRAY: GLenum = 0x8C1D;
 
 fn texture_binding_pname(target: GLenum) -> Option<GLenum> {
     if target == gles11::TEXTURE_2D {
         Some(gles11::TEXTURE_BINDING_2D)
+    } else if target == TEXTURE_3D {
+        Some(TEXTURE_BINDING_3D)
+    } else if target == TEXTURE_2D_ARRAY {
+        Some(TEXTURE_BINDING_2D_ARRAY)
     } else if target == TEXTURE_CUBE_MAP
         || (TEXTURE_CUBE_MAP_POSITIVE_X..=TEXTURE_CUBE_MAP_NEGATIVE_Z).contains(&target)
     {
@@ -1017,17 +1025,16 @@ fn glGenBuffers(env: &mut Environment, n: GLsizei, buffers: MutPtr<GLuint>) {
 }
 fn glDeleteBuffers(env: &mut Environment, n: GLsizei, buffers: ConstPtr<GLuint>) {
     if n <= 0 || buffers.is_null() {
-        // Nothing to delete (n < 0 would be GL_INVALID_VALUE on a real
-        // driver; don't turn it into a host-side panic).
         return;
     }
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| {
         let n_usize: GuestUSize = n.try_into().unwrap();
-        for i in 0..n_usize {
-            shadow.on_buffers_deleted(mem.read(buffers + i));
+        let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(buffers + i)).collect();
+        for buffer in &deleted {
+            shadow.on_buffers_deleted(*buffer);
         }
-        let buffers = mem.ptr_at(buffers, n_usize);
-        unsafe { gles.DeleteBuffers(n, buffers) }
+        unsafe { gles.DeleteBuffers(n, deleted.as_ptr()) };
+        crate::gles::perf_overlay::delete_gl_buffers(shadow.resource_group_token, &deleted);
     })
 }
 fn glBindBuffer(env: &mut Environment, target: GLenum, buffer: GLuint) {
@@ -1120,7 +1127,7 @@ fn glBufferData(
     data: ConstPtr<GLvoid>,
     usage: GLenum,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         debug_log_buffer_upload(gles, mem, "BufferData", target, 0, size, data);
         if crate::env_flag_cached!("TOUCHHLE_TRACE_DRAW") && target == ARRAY_BUFFER && !data.is_null()
         {
@@ -1148,13 +1155,39 @@ fn glBufferData(
                 log!("BUFDATA-DIAG #{} ARRAY_BUFFER size={} floats={:?}", bn, size, floats);
             }
         }
+        let binding = match target {
+            ARRAY_BUFFER => gles11::ARRAY_BUFFER_BINDING,
+            ELEMENT_ARRAY_BUFFER => ELEMENT_ARRAY_BUFFER_BINDING,
+            0x88EB => 0x88ED,
+            0x88EC => 0x88EF,
+            0x8F36 => 0x8F36,
+            0x8F37 => 0x8F37,
+            0x8A11 => 0x8A28,
+            0x8C8E => 0x8C8F,
+            0x8F3F => 0x8F43,
+            0x90EE => 0x90EF,
+            0x90D2 => 0x90D3,
+            0x92C0 => 0x92C1,
+            _ => 0,
+        };
+        let mut bound_buffer: GLint = 0;
+        if binding != 0 {
+            gles.GetIntegerv(binding, &mut bound_buffer);
+        }
         let data: *const GLvoid = if data.is_null() {
             std::ptr::null()
         } else {
             mem.ptr_at(data.cast::<u8>(), size.try_into().unwrap())
                 .cast()
         };
-        gles.BufferData(target, size as HostGLsizeiptr, data, usage)
+        gles.BufferData(target, size as HostGLsizeiptr, data, usage);
+        if bound_buffer > 0 && size >= 0 {
+            crate::gles::perf_overlay::record_gl_buffer_allocation(
+                shadow.resource_group_token,
+                bound_buffer as GLuint,
+                size as u64,
+            );
+        }
     })
 }
 fn glBufferSubData(
@@ -1281,7 +1314,12 @@ unsafe fn translate_pointer_or_offset_to_guest(
     let _ = gles.GetError();
     if buffer_binding != 0 {
         let offset = pointer_or_offset as usize;
-        Ptr::from_bits(u32::try_from(offset).unwrap())
+        // A buffer object is bound, so the "pointer" is really an offset and
+        // must be passed through unchanged. Truncate to the guest's 32-bit
+        // address space instead of panicking when a host pointer that cannot
+        // be an offset at all arrives here (same convention as
+        // `Mem::host_ptr_to_guest_ptr`).
+        Ptr::from_bits(offset as u32)
     } else if pointer_or_offset.is_null() {
         Ptr::null()
     } else {
@@ -1601,6 +1639,7 @@ fn glDrawTexfOES(
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexfOES(x, y, z, width, height)
     })
 }
@@ -1620,6 +1659,7 @@ fn glDrawTexiOES(env: &mut Environment, x: GLint, y: GLint, z: GLint, width: GLi
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexiOES(x, y, z, width, height)
     })
 }
@@ -1646,35 +1686,41 @@ fn glDrawTexxOES(
         }
     }
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexxOES(x, y, z, width, height)
     })
 }
 fn glDrawTexfvOES(env: &mut Environment, coords: ConstPtr<GLfloat>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexfvOES(coords) }
     })
 }
 fn glDrawTexivOES(env: &mut Environment, coords: ConstPtr<GLint>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexivOES(coords) }
     })
 }
 fn glDrawTexxvOES(env: &mut Environment, coords: ConstPtr<GLfixed>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexxvOES(coords) }
     })
 }
 fn glDrawTexsOES(env: &mut Environment, x: i16, y: i16, z: i16, width: i16, height: i16) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawTexsOES(x, y, z, width, height)
     })
 }
 fn glDrawTexsvOES(env: &mut Environment, coords: ConstPtr<i16>) {
     with_ctx_and_mem(env, |gles, mem| {
         let coords = mem.ptr_at(coords, 5);
+        crate::gles::perf_overlay::record_draw();
         unsafe { gles.DrawTexsvOES(coords) }
     })
 }
@@ -2153,6 +2199,7 @@ fn glDrawArrays(env: &mut Environment, mode: GLenum, first: GLint, count: GLsize
             gles.Disable(0x0b44); // GL_CULL_FACE
         }
 
+        crate::gles::perf_overlay::record_draw();
         gles.DrawArrays(mode, first, count);
         restore_fog_state_values(gles, fog_state_backup);
         for index in disabled_arrays {
@@ -2411,6 +2458,7 @@ fn glDrawElements(
 
         let indices =
             translate_pointer_or_offset_to_host(gles, mem, shadow, indices, ELEMENT_ARRAY_BUFFER);
+        crate::gles::perf_overlay::record_draw();
         gles.DrawElements(mode, count, type_, indices);
         if count > 3 && crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static FB_DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2719,8 +2767,12 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
         // over it would be undefined behaviour.
         let deleted: Vec<GLuint> = (0..n_usize).map(|i| mem.read(textures + i)).collect();
         unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
-        for texture in deleted {
-            shadow.forget_pvrtc_texture(texture);
+        for texture in &deleted {
+            shadow.forget_pvrtc_texture(*texture);
+            crate::gles::perf_overlay::delete_gl_texture(
+                shadow.resource_group_token,
+                *texture,
+            );
         }
     })
 }
@@ -2999,6 +3051,116 @@ fn image_size_estimate(pixel_count: GuestUSize, format: GLenum, type_: GLenum) -
         GuestUSize::MAX
     })
 }
+fn texture_level_bytes(width: GLsizei, height: GLsizei, format: GLenum, type_: GLenum) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    let bytes_per_pixel = match type_ {
+        gles11::UNSIGNED_BYTE => match format {
+            gles11::ALPHA | gles11::LUMINANCE => Some(1),
+            gles11::LUMINANCE_ALPHA => Some(2),
+            gles11::RGB => Some(3),
+            gles11::RGBA | gles11::BGRA_EXT => Some(4),
+            _ => None,
+        },
+        gles11::UNSIGNED_SHORT_5_6_5
+        | gles11::UNSIGNED_SHORT_4_4_4_4
+        | gles11::UNSIGNED_SHORT_5_5_5_1 => Some(2),
+        _ => None,
+    };
+    bytes_per_pixel.map_or(0, |bytes_per_pixel| {
+        (width as u64)
+            .saturating_mul(height as u64)
+            .saturating_mul(bytes_per_pixel)
+    })
+}
+
+fn copied_texture_level_bytes(width: GLsizei, height: GLsizei, internalformat: GLenum) -> u64 {
+    texture_storage_level_bytes(width, height, internalformat)
+}
+
+fn texture_storage_bytes_per_pixel(internalformat: GLenum) -> Option<u64> {
+    match internalformat {
+        gles11::ALPHA | gles11::LUMINANCE | 0x8229 | 0x8055 | 0x8F94 => Some(1),
+        gles11::LUMINANCE_ALPHA
+        | 0x822A
+        | 0x822B
+        | 0x822D
+        | 0x8056
+        | 0x8057
+        | 0x8D62
+        | 0x8F95
+        | 0x81A5 => Some(2),
+        gles11::RGB | 0x8051 | 0x8C41 | 0x8F96 => Some(3),
+        gles11::RGBA
+        | 0x8052
+        | 0x8058
+        | 0x8059
+        | 0x8C43
+        | 0x8F97
+        | 0x81A6
+        | 0x81A7
+        | 0x88F0
+        | 0x8CAC
+        | 0x822C
+        | 0x822E
+        | 0x822F => Some(4),
+        0x8053 | 0x8054 | 0x881B => Some(6),
+        0x8230 | 0x805A | 0x805B | 0x881A => Some(8),
+        0x8815 => Some(12),
+        0x8814 => Some(16),
+        0x8CAD => Some(8),
+        _ => None,
+    }
+}
+
+fn texture_storage_level_bytes(width: GLsizei, height: GLsizei, internalformat: GLenum) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    let Some(bytes_per_pixel) = texture_storage_bytes_per_pixel(internalformat) else {
+        return 0;
+    };
+    (width as u64)
+        .saturating_mul(height as u64)
+        .saturating_mul(bytes_per_pixel)
+}
+
+fn texture_storage_volume_bytes(
+    width: GLsizei,
+    height: GLsizei,
+    depth: GLsizei,
+    internalformat: GLenum,
+) -> u64 {
+    if depth <= 0 {
+        return 0;
+    }
+    texture_storage_level_bytes(width, height, internalformat).saturating_mul(depth as u64)
+}
+
+fn compressed_texture_level_bytes(
+    internalformat: GLenum,
+    width: GLsizei,
+    height: GLsizei,
+    image_size: usize,
+) -> u64 {
+    if width <= 0 || height <= 0 {
+        return 0;
+    }
+    if let Some(format) = crate::gles::util::PalettedTextureFormat::get_info(internalformat) {
+        let size = texture_level_bytes(
+            width,
+            height,
+            format.palette_entry_format,
+            format.palette_entry_type,
+        );
+        if size > 0 {
+            return size;
+        }
+    }
+    image_size as u64
+}
+
 fn glTexImage2D(
     env: &mut Environment,
     target: GLenum,
@@ -3044,6 +3206,7 @@ fn glTexImage2D(
     let fix_filter = env.options.fix_texture_min_filter && level == 0;
     with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
         let bound_texture = current_bound_texture(gles, target);
+        let storage_size = texture_level_bytes(width, height, format, type_);
         let pixels = if pixels.is_null() {
             std::ptr::null()
         } else {
@@ -3064,6 +3227,13 @@ fn glTexImage2D(
         );
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
+            crate::gles::perf_overlay::record_gl_image_allocation(
+                shadow.resource_group_token,
+                target,
+                texture,
+                level,
+                storage_size,
+            );
         }
         if crate::env_flag_cached!("TOUCHHLE_DEBUG_ES2_DRAW") {
             static TEX_DUMP_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -3234,6 +3404,18 @@ fn glCompressedTexImage2D(
                 gles11::UNSIGNED_BYTE,
                 std::ptr::null(),
             );
+            if border == 0 {
+                if let Some(texture) = bound_texture {
+                    crate::gles::perf_overlay::record_gl_image_allocation(
+                        shadow.resource_group_token,
+                        target,
+                        texture,
+                        level,
+                        texture_level_bytes(width, height, gles11::RGBA, gles11::UNSIGNED_BYTE),
+                    );
+                }
+            }
+
             // Record this as a PVRTC level so later glCompressedTexSubImage2D
             // updates (how MCSM actually fills these atlases) take the
             // software-decode-into-RGBA path instead of handing PVRTC bytes to
@@ -3282,6 +3464,13 @@ fn glCompressedTexImage2D(
                             height,
                             internalformat,
                         );
+                        crate::gles::perf_overlay::record_gl_image_allocation(
+                            shadow.resource_group_token,
+                            target,
+                            texture,
+                            level,
+                            texture_level_bytes(width, height, gles11::RGBA, gles11::UNSIGNED_BYTE),
+                        );
                     }
                 }
                 if fix_filter {
@@ -3308,6 +3497,22 @@ fn glCompressedTexImage2D(
         // (visible at default level) but rate-limited per (format, error)
         // pair so a frame-by-frame texture stream can't flood the console.
         let post_err = gles.GetError();
+        if post_err == 0 {
+            if let Some(texture) = bound_texture {
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    compressed_texture_level_bytes(
+                        internalformat,
+                        width,
+                        height,
+                        image_size_usize,
+                    ),
+                );
+            }
+        }
         if post_err != 0 {
             use std::sync::atomic::{AtomicU64, Ordering};
             // Pack (internalformat << 32) | post_err into a single 64-bit
@@ -3372,6 +3577,13 @@ fn glCopyTexImage2D(
         gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture_level(target, texture, level);
+            crate::gles::perf_overlay::record_gl_image_allocation(
+                shadow.resource_group_token,
+                target,
+                texture,
+                level,
+                copied_texture_level_bytes(width, height, internalformat),
+            );
         }
     })
 }
@@ -3890,90 +4102,85 @@ fn glMapBufferOES(env: &mut Environment, target: GLenum, access: GLenum) -> MutP
         );
         return nil.cast();
     }
-    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
-    let host_buffer = with_ctx_and_mem_no_skip(env, |gles, _mem| unsafe {
-        gles.MapBufferOES(target, access)
-    });
-    if host_buffer.is_null() {
+    // glMapBufferOES requires a current context (Apple: "An EAGLContext must
+    // be current on the thread before any GL calls"). Without one the call
+    // fails and glMapBufferOES returns NULL.
+    let Some(current_ctx) = *env
+        .framework_state
+        .opengles
+        .current_ctx_for_thread(env.current_thread)
+    else {
         log!(
-            "Warning: host glMapBufferOES(target={:#x}, access={:#x}) returned NULL \
-             (buffer has no data store or the driver refused); the app will see NULL.",
-            target,
-            access
+            "Warning: glMapBufferOES on thread {} with no current EAGLContext; \
+             returning NULL.",
+            env.current_thread
         );
-        nil.cast()
-    } else {
-        let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
-            Ok(size) => size,
-            Err(_) => {
-                with_ctx_and_mem(env, |gles, _mem| unsafe {
-                    gles.UnmapBufferOES(target);
-                });
-                return nil.cast();
-            }
-        };
-        let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
-        unsafe {
-            env.mem
-                .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
-                .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
-        }
-        let Some(current_ctx) = *env
-            .framework_state
-            .opengles
-            .current_ctx_for_thread(env.current_thread)
-        else {
-            // glMapBufferOES requires a current context (Apple: "An
-            // EAGLContext must be current on the thread before any GL
-            // calls"). Without one, free the temporary guest buffer we
-            // just allocated and return NULL, matching the GL spec which
-            // says glMapBufferOES returns NULL on failure.
+        return nil.cast();
+    };
+    let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
+    let buffer_size = match usize::try_from(_get_buffer_size(env, target)) {
+        Ok(size) if size > 0 => size,
+        _ => {
+            // GL_OES_mapbuffer: mapping succeeds only if the buffer has a
+            // data store; a buffer created with size 0 has none.
             log!(
-                "Warning: glMapBufferOES on thread {} with no current EAGLContext; \
-                 returning NULL.",
-                env.current_thread
-            );
-            env.mem.free(guest_buffer);
-            return nil.cast();
-        };
-        let current_ctx_host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
-        // Per the GL_OES_mapbuffer spec, calling glMapBufferOES while a
-        // buffer is already mapped is a GL_INVALID_OPERATION and returns
-        // NULL. Some apps (e.g. ZAS) accidentally re-map without unmapping
-        // first; the previous host mapping is still owned by the GL
-        // driver, so we cannot just drop it without unmapping. To stay
-        // close to Apple's lenient behaviour, we unmap the stale mapping
-        // (freeing the previous guest mirror) and install the new one so
-        // the app can continue uploading data instead of crashing.
-        if let Some((stale_guest_buffer, _stale_host_buffer, _stale_size)) = current_ctx_host_object
-            .mapped_buffers
-            .remove(&(target, buffer_object_name))
-        {
-            log!(
-                "Warning: glMapBufferOES called on buffer {} that was already mapped; \
-                 discarding the previous mapping (the previous pointer is no longer valid).",
+                "Warning: glMapBufferOES(target={:#x}, access={:#x}) on buffer {} whose \
+                 data store is empty or unreadable; returning NULL.",
+                target,
+                access,
                 buffer_object_name
             );
-            env.mem.free(stale_guest_buffer);
-            // Issue a real glUnmapBufferOES so the driver releases its
-            // own mapping of the buffer that we just dropped.
+            return nil.cast();
+        }
+    };
+    // The mapping the guest sees is a mirror in guest memory, uploaded to the
+    // buffer object by glUnmapBufferOES. The driver's own mapping is never
+    // held across a guest call, because the driver is free to invalidate it
+    // whenever the buffer is re-specified, re-mapped or deleted, and writing
+    // through the stale pointer afterwards corrupted the heap and killed the
+    // emulator with a SIGSEGV at a garbage address (Republique, Unity 4.5).
+    let guest_buffer: MutVoidPtr = env.mem.alloc(buffer_size as GuestUSize).cast();
+    // Mirror the buffer's current contents only when the app is allowed to
+    // read them. With GL_WRITE_ONLY_OES the contents are undefined until the
+    // app writes them, so the read would be pure overhead. Either way the
+    // map/copy/unmap happens here, with no guest code in between, so the
+    // driver pointer cannot outlive this function.
+    if access != WRITE_ONLY_OES {
+        let host_buffer = with_ctx_and_mem(env, |gles, _mem| unsafe {
+            gles.MapBufferOES(target, access)
+        });
+        if !host_buffer.is_null() {
+            unsafe {
+                env.mem
+                    .bytes_at_mut(guest_buffer.cast(), buffer_size as GuestUSize)
+                    .copy_from_slice(from_raw_parts(host_buffer as *const u8, buffer_size));
+            }
             with_ctx_and_mem(env, |gles, _mem| unsafe {
                 gles.UnmapBufferOES(target);
             });
-            // Re-borrow because with_ctx_and_mem dropped our reference.
-            let current_ctx_host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
-            current_ctx_host_object.mapped_buffers.insert(
-                (target, buffer_object_name),
-                (guest_buffer, host_buffer, buffer_size),
-            );
-        } else {
-            current_ctx_host_object.mapped_buffers.insert(
-                (target, buffer_object_name),
-                (guest_buffer, host_buffer, buffer_size),
-            );
         }
-        guest_buffer
     }
+    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(current_ctx);
+    // Per the GL_OES_mapbuffer spec, calling glMapBufferOES while a buffer is
+    // already mapped is a GL_INVALID_OPERATION and returns NULL. Some apps
+    // (e.g. ZAS) accidentally re-map without unmapping first; the previous
+    // guest mirror is still owned by the guest, so we drop it and install the
+    // new one so the app can continue uploading data instead of crashing.
+    if let Some((stale_guest_buffer, _stale_host_ptr, _stale_size)) = host_object
+        .mapped_buffers
+        .remove(&(target, buffer_object_name))
+    {
+        log!(
+            "Warning: glMapBufferOES called on buffer {} that was already mapped; \
+             discarding the previous mapping (the previous pointer is no longer valid).",
+            buffer_object_name
+        );
+        env.mem.free(stale_guest_buffer);
+    }
+    host_object
+        .mapped_buffers
+        .insert((target, buffer_object_name), (guest_buffer, None, buffer_size));
+    guest_buffer
 }
 fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     let buffer_object_name = _get_currently_bound_buffer_object_name(env, target);
@@ -3991,7 +4198,7 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
         .borrow_mut::<EAGLContextHostObject>(current_ctx)
         .mapped_buffers
         .remove(&(target, buffer_object_name));
-    let Some((guest_buffer, host_buffer, buffer_size)) = mapping else {
+    let Some((guest_buffer, host_ptr, buffer_size)) = mapping else {
         // An unbalanced unmap (no guest mapping recorded for this buffer):
         // every driver-side mapping is owned by a recorded guest mapping, so
         // the buffer cannot be driver-mapped here. Forwarding the call would
@@ -4005,13 +4212,29 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
         );
         return gles11::TRUE;
     };
-    unsafe {
-        host_buffer.copy_from(
-            env.mem
-                .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
-                .as_ptr() as *mut GLvoid,
-            buffer_size,
-        );
+    // Upload the guest's mirror to the buffer object. A mapping recorded by
+    // glMapBufferRange still owns a real driver mapping, so it is filled and
+    // then unmapped; a mapping recorded by glMapBufferOES has no driver
+    // pointer (see the comment there) and is uploaded with glBufferSubData.
+    // Either way the guest never gets to see, or write through, a driver
+    // pointer that may have been invalidated in the meantime.
+    match host_ptr {
+        Some(host_ptr) => unsafe {
+            host_ptr.copy_from(
+                env.mem
+                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
+                    .as_ptr() as *mut GLvoid,
+                buffer_size,
+            );
+        },
+        None => {
+            with_ctx_and_mem(env, |gles, mem| unsafe {
+                let data = mem
+                    .bytes_at(guest_buffer.cast(), buffer_size as GuestUSize)
+                    .as_ptr() as *const GLvoid;
+                gles.BufferSubData(target, 0, buffer_size as HostGLsizeiptr, data);
+            });
+        }
     }
     // DIAG: cache the unmapped buffer content so TOUCHHLE_TRACE_DRAW can read
     // texcoords at draw time (the game streams its vertex data via map/unmap,
@@ -4030,7 +4253,11 @@ fn unmap_buffer(env: &mut Environment, target: GLenum, oes: bool) -> GLboolean {
     }
     env.mem.free(guest_buffer);
     with_ctx_and_mem(env, |gles, _mem| unsafe {
-        let result = if oes {
+        let result = if host_ptr.is_none() {
+            // The data was already uploaded with glBufferSubData above and no
+            // driver mapping is open, so there is nothing left to unmap.
+            gles11::TRUE
+        } else if oes {
             gles.UnmapBufferOES(target)
         } else {
             gles.UnmapBuffer(target)
@@ -4257,7 +4484,82 @@ fn glDetachShader(env: &mut Environment, program: GLuint, shader: GLuint) {
         record_shader_detach(program, shader);
     });
 }
+/// New locations for [crate::options::Options::reverse_attrib_locations].
+/// `attribs` holds each active attribute's location as the driver chose it
+/// and the number of locations it takes. The result gives the attributes the
+/// locations 0 to N-1 in the reverse order, in the same order as `attribs`.
+fn reversed_attrib_locations(attribs: &[(GLint, GLint)]) -> Vec<GLint> {
+    let mut order: Vec<usize> = (0..attribs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(attribs[i].0));
+    let mut locations = vec![0; attribs.len()];
+    let mut next = 0;
+    for i in order {
+        locations[i] = next;
+        next += attribs[i].1;
+    }
+    locations
+}
+
+/// Relink `program` with [reversed_attrib_locations]. Only called when the
+/// app bound no attribute locations itself.
+unsafe fn relink_with_reversed_attrib_locations(gles: &mut dyn GLES, program: GLuint) {
+    let mut ok: GLint = 0;
+    gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
+    if ok == 0 {
+        return;
+    }
+    let mut count: GLint = 0;
+    gles.GetProgramiv(program, 0x8B89 /* GL_ACTIVE_ATTRIBUTES */, &mut count);
+    let mut names = Vec::new();
+    let mut attribs = Vec::new();
+    for i in 0..count {
+        let mut name = [0u8; 256];
+        let mut len: GLsizei = 0;
+        let mut size: GLint = 0;
+        let mut type_: GLenum = 0;
+        gles.GetActiveAttrib(
+            program,
+            i as GLuint,
+            name.len() as GLsizei,
+            &mut len,
+            &mut size,
+            &mut type_,
+            name.as_mut_ptr().cast(),
+        );
+        let name = &name[..len.clamp(0, name.len() as GLsizei - 1) as usize];
+        if name.is_empty() || name.starts_with(b"gl_") {
+            continue;
+        }
+        let name = std::ffi::CString::new(name).unwrap();
+        let location = gles.GetAttribLocation(program, name.as_ptr());
+        if location < 0 {
+            continue;
+        }
+        // Matrix attributes take one location per column.
+        let slots = match type_ {
+            0x8B5A /* GL_FLOAT_MAT2 */ => 2,
+            0x8B5B /* GL_FLOAT_MAT3 */ => 3,
+            0x8B5C /* GL_FLOAT_MAT4 */ => 4,
+            _ => 1,
+        } * size.max(1);
+        names.push(name);
+        attribs.push((location, slots));
+    }
+    let locations = reversed_attrib_locations(&attribs);
+    if locations
+        .iter()
+        .zip(&attribs)
+        .all(|(new, (old, _))| new == old)
+    {
+        return;
+    }
+    for (name, &location) in names.iter().zip(&locations) {
+        gles.BindAttribLocation(program, location as GLuint, name.as_ptr());
+    }
+    gles.LinkProgram(program);
+}
 fn glLinkProgram(env: &mut Environment, program: GLuint) {
+    let reverse_locations = env.options.reverse_attrib_locations;
     with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
         // If the app explicitly bound attribute locations for this program,
         // respect them: forcing canonical bindings here would override the
@@ -4267,7 +4569,9 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             .guest_bound_attribs
             .get(&program)
             .map_or(false, |names| !names.is_empty());
-        if gles.is_es2() && !app_bound {
+        // The option needs the driver's own locations, see
+        // `Options::reverse_attrib_locations`.
+        if gles.is_es2() && !app_bound && !reverse_locations {
             for (index, names) in [
                 (
                     0,
@@ -4357,6 +4661,9 @@ fn glLinkProgram(env: &mut Environment, program: GLuint) {
             fix_fragment_only_varyings(gles, program);
         }
         gles.LinkProgram(program);
+        if gles.is_es2() && !app_bound && reverse_locations {
+            relink_with_reversed_attrib_locations(gles, program);
+        }
         let mut ok: GLint = 0;
         gles.GetProgramiv(program, 0x8B82 /* GL_LINK_STATUS */, &mut ok);
         if ok == 0 {
@@ -6521,7 +6828,7 @@ fn glMapBufferRange(
     let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(ctx);
     if let Some((old_guest_buf, _, _)) = host_obj.mapped_buffers.insert(
         (target, buffer_object_name),
-        (guest_buf, host_ptr, length_usize),
+        (guest_buf, Some(host_ptr), length_usize),
     ) {
         env.mem.free(old_guest_buf);
     }
@@ -6561,13 +6868,34 @@ fn glFlushMappedBufferRange(
                 Some(value) if value <= mapped_size => value,
                 _ => return,
             };
-            let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
-            unsafe {
-                let host_slice = std::slice::from_raw_parts_mut(
-                    (host_ptr as *mut u8).add(offset_usize),
-                    length_usize,
-                );
-                host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
+            match host_ptr {
+                Some(host_ptr) => {
+                    let guest_slice = env.mem.bytes_at(guest_buf.cast(), end as GuestUSize);
+                    unsafe {
+                        let host_slice = std::slice::from_raw_parts_mut(
+                            (host_ptr as *mut u8).add(offset_usize),
+                            length_usize,
+                        );
+                        host_slice.copy_from_slice(&guest_slice[offset_usize..end]);
+                    }
+                }
+                None => {
+                    // A glMapBufferOES mapping has no driver pointer; flushing
+                    // it means uploading the requested range. No driver-side
+                    // mapping exists, so there is nothing to forward the flush
+                    // to either.
+                    with_ctx_and_mem(env, |gles, mem| unsafe {
+                        let data = mem.bytes_at(guest_buf.cast(), end as GuestUSize).as_ptr()
+                            .add(offset_usize) as *const GLvoid;
+                        gles.BufferSubData(
+                            target,
+                            offset as HostGLintptr,
+                            length_usize as HostGLsizeiptr,
+                            data,
+                        );
+                    });
+                    return;
+                }
             }
         }
     }
@@ -6646,6 +6974,7 @@ fn glDrawRangeElements(
             let total_bytes = (count as GuestUSize) * bytes_per_index;
             mem.bytes_at(indices.cast(), total_bytes).as_ptr().cast()
         };
+        crate::gles::perf_overlay::record_draw();
         gles.DrawRangeElements(mode, start, end, count, type_, host_ptr)
     });
 }
@@ -6658,6 +6987,7 @@ fn glDrawArraysInstanced(
     instance_count: GLsizei,
 ) {
     with_ctx_and_mem(env, |gles, _mem| unsafe {
+        crate::gles::perf_overlay::record_draw();
         gles.DrawArraysInstanced(mode, first, count, instance_count)
     });
 }
@@ -6684,6 +7014,7 @@ fn glDrawElementsInstanced(
             let total_bytes = (count as GuestUSize) * bytes_per_index;
             mem.bytes_at(indices.cast(), total_bytes).as_ptr().cast()
         };
+        crate::gles::perf_overlay::record_draw();
         gles.DrawElementsInstanced(mode, count, type_, host_ptr, instance_count)
     });
 }
@@ -6855,12 +7186,9 @@ fn glTexImage3D(
     type_: GLenum,
     pixels: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
-        // PIXEL_UNPACK_BUFFER bound: pixels is a buffer offset. Otherwise
-        // it's a guest pointer to a host-readable image.
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let mut buf: GLint = 0;
-        // `GL_PIXEL_UNPACK_BUFFER_BINDING` (0x88EF) is an ES 3.0 / GL 2.1+
-        // enum; not present in our gles11 binding. Use the literal value.
         gles.GetIntegerv(0x88EF, &mut buf);
         let host_pixels: *const GLvoid = if buf != 0 || pixels.is_null() {
             pixels.cast::<u8>().to_bits() as usize as *const GLvoid
@@ -6879,7 +7207,20 @@ fn glTexImage3D(
             format,
             type_,
             host_pixels,
-        )
+        );
+        if border == 0 {
+            if let Some(texture) = bound_texture {
+                let level_bytes = texture_level_bytes(width, height, format, type_)
+                    .saturating_mul(depth.max(0) as u64);
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    level_bytes,
+                );
+            }
+        }
     });
 }
 
@@ -6957,6 +7298,26 @@ fn glTexStorage2D(
         gles.TexStorage2D(target, levels, internalformat, width, height);
         if let Some(texture) = bound_texture {
             shadow.forget_pvrtc_texture(texture);
+            crate::gles::perf_overlay::clear_gl_image_allocations(
+                shadow.resource_group_token,
+                texture,
+            );
+            let cube_faces = if target == TEXTURE_CUBE_MAP { 6 } else { 1 };
+            let mut level_width = width;
+            let mut level_height = height;
+            for level in 0..levels.max(0) {
+                let size = texture_storage_level_bytes(level_width, level_height, internalformat)
+                    .saturating_mul(cube_faces);
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    size,
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+            }
         }
     });
 }
@@ -6981,8 +7342,39 @@ fn glTexStorage3D(
     height: GLsizei,
     depth: GLsizei,
 ) {
-    with_ctx_and_mem(env, |gles, _mem| unsafe {
-        gles.TexStorage3D(target, levels, internalformat, width, height, depth)
+    with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
+        gles.TexStorage3D(target, levels, internalformat, width, height, depth);
+        if let Some(texture) = bound_texture {
+            shadow.forget_pvrtc_texture(texture);
+            crate::gles::perf_overlay::clear_gl_image_allocations(
+                shadow.resource_group_token,
+                texture,
+            );
+            let mut level_width = width;
+            let mut level_height = height;
+            let mut level_depth = depth;
+            for level in 0..levels.max(0) {
+                let size = texture_storage_volume_bytes(
+                    level_width,
+                    level_height,
+                    level_depth,
+                    internalformat,
+                );
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    size,
+                );
+                level_width = (level_width / 2).max(1);
+                level_height = (level_height / 2).max(1);
+                if target == TEXTURE_3D {
+                    level_depth = (level_depth / 2).max(1);
+                }
+            }
+        }
     });
 }
 
@@ -7200,7 +7592,8 @@ fn glCompressedTexImage3D(
     image_size: GLsizei,
     data: ConstVoidPtr,
 ) {
-    with_ctx_and_mem(env, |gles, mem| unsafe {
+    with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+        let bound_texture = current_bound_texture(gles, target);
         let data = if data.is_null() {
             std::ptr::null()
         } else {
@@ -7217,7 +7610,18 @@ fn glCompressedTexImage3D(
             border,
             image_size,
             data,
-        )
+        );
+        if border == 0 && image_size > 0 {
+            if let Some(texture) = bound_texture {
+                crate::gles::perf_overlay::record_gl_image_allocation(
+                    shadow.resource_group_token,
+                    target,
+                    texture,
+                    level,
+                    image_size as u64,
+                );
+            }
+        }
     });
 }
 
@@ -8974,5 +9378,46 @@ mod uniform_array_reconciliation_tests {
         let fixes = vec![("light".to_string(), 4u32)];
         let patched = rewrite_uniform_array_sizes(fragment, &fd, &fixes);
         assert!(patched.contains("light[4]"), "{patched}");
+    }
+}
+
+#[cfg(test)]
+mod reversed_attrib_location_tests {
+    use super::reversed_attrib_locations;
+
+    #[test]
+    fn reverses_driver_order_into_locations_below_the_count() {
+        // Noblemen: 1896's deferred light program: `position` and
+        // `positionWorld`.
+        assert_eq!(reversed_attrib_locations(&[(0, 1), (1, 1)]), [1, 0]);
+        // Gaps in the driver's locations are closed up.
+        assert_eq!(
+            reversed_attrib_locations(&[(0, 1), (6, 1), (2, 1)]),
+            [2, 0, 1]
+        );
+        // A mat4 takes four locations.
+        assert_eq!(reversed_attrib_locations(&[(0, 4), (4, 1)]), [1, 0]);
+    }
+}
+
+#[cfg(test)]
+mod performance_texture_size_tests {
+    use super::{texture_level_bytes, texture_storage_level_bytes, texture_storage_volume_bytes};
+    use crate::gles::gles11_raw as gles11;
+
+    #[test]
+    fn estimates_common_texture_storage_formats() {
+        assert_eq!(
+            texture_level_bytes(10, 10, gles11::RGBA, gles11::UNSIGNED_BYTE),
+            400
+        );
+        assert_eq!(texture_storage_level_bytes(16, 8, 0x8058), 512);
+        assert_eq!(
+            texture_storage_level_bytes(16, 8, gles11::RGB565_OES),
+            256
+        );
+        assert_eq!(texture_storage_volume_bytes(8, 4, 2, 0x8058), 256);
+        assert_eq!(texture_storage_level_bytes(0, 8, 0x8058), 0);
+        assert_eq!(texture_storage_level_bytes(16, 8, 0x83F1), 0);
     }
 }

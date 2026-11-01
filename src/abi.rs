@@ -159,10 +159,11 @@ macro_rules! impl_CallFromGuest {
                 let args: ($($P,)*) = {
                     ($(read_next_arg::<$P>(&mut reg_offset, regs, Ptr::from_bits(regs[Cpu::SP]), &env.mem),)*)
                 };
-                let va_list = DotDotDot(VaList {
+                let va_list = DotDotDot(VaList::from_call(
                     reg_offset,
-                    stack_pointer: Ptr::from_bits(regs[Cpu::SP])
-                });
+                    regs,
+                    Ptr::from_bits(regs[Cpu::SP]),
+                ));
 
                 log_dbg!("CallFromGuest with va_list: {:?}", va_list); // Аналогично убрали args
 
@@ -468,14 +469,31 @@ impl DotDotDot {
 #[derive(Copy, Clone, Debug)]
 pub struct VaList {
     reg_offset: usize,
+    /// r0-r3 as they were on entry. Like the register save area `va_start`
+    /// fills on ARM, this keeps register-passed arguments valid after the
+    /// host calls back into the runtime (e.g. `msg!` while formatting `%@`),
+    /// which overwrites the live argument registers.
+    arg_regs: [u32; 4],
     stack_pointer: ConstVoidPtr,
 }
 impl VaList {
+    fn from_call(reg_offset: usize, regs: &[u32], stack_pointer: ConstVoidPtr) -> Self {
+        VaList {
+            reg_offset,
+            arg_regs: regs[0..4].try_into().unwrap(),
+            stack_pointer,
+        }
+    }
+
     /// Get the next argument, like C's `va_arg()`. Be careful as the type may
     /// be inferred from the call-site if you don't specify it explicitly.
     pub fn next<T: GuestArg>(&mut self, env: &mut Environment) -> T {
+        self.next_from_mem(&env.mem)
+    }
+
+    fn next_from_mem<T: GuestArg>(&mut self, mem: &Mem) -> T {
         let sp_reg = self.stack_pointer.cast();
-        read_next_arg(&mut self.reg_offset, env.cpu.regs_mut(), sp_reg, &env.mem)
+        read_next_arg(&mut self.reg_offset, &self.arg_regs, sp_reg, mem)
     }
 }
 
@@ -559,6 +577,7 @@ impl GuestArg for VaList {
         // calling [read_next_arg]
         VaList {
             reg_offset: 4,
+            arg_regs: [0; 4],
             stack_pointer: <ConstVoidPtr as GuestArg>::from_regs(regs),
         }
     }
@@ -760,5 +779,39 @@ impl GuestRet for f64 {
     }
     fn to_regs(self, regs: &mut [u32]) {
         <u64 as GuestRet>::to_regs(self.to_bits(), regs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // AAPCS32 `va_list` is a pointer into memory, so a variadic callee
+    // spills r0-r3 and its later calls cannot change its arguments:
+    // https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst
+    // Regression test for NSLog printing "Build No: (null)" in Where's My
+    // Perry: formatting the first `%@` sent `characterAtIndex:4`, which
+    // overwrote r2 before the second `%@` read it.
+    #[test]
+    fn va_list_keeps_register_args_after_registers_change() {
+        let mut mem = Mem::new();
+        let stack: MutPtr<u32> = mem.alloc(8).cast();
+        mem.write(stack, 0x44);
+        mem.write(stack + 1, 0x55);
+        let mut regs = [0x1000u32, 0x11, 0x22, 0x33];
+        let mut va_list = VaList::from_call(1, &regs, stack.cast_const().cast());
+        regs[2] = 4; // what `characterAtIndex:4` leaves in r2
+        let args: [u32; 5] = std::array::from_fn(|_| va_list.next_from_mem(&mem));
+        assert_eq!(args, [0x11, 0x22, 0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn va_list_reads_a_u64_split_between_r3_and_the_stack() {
+        let mut mem = Mem::new();
+        let stack: MutPtr<u32> = mem.alloc(4).cast();
+        mem.write(stack, 0xAABBCCDD);
+        let regs = [0, 0, 0, 0x11223344];
+        let mut va_list = VaList::from_call(3, &regs, stack.cast_const().cast());
+        assert_eq!(va_list.next_from_mem::<u64>(&mem), 0xAABBCCDD_11223344);
     }
 }

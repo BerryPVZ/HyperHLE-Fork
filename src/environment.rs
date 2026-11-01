@@ -28,7 +28,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::libc::pthread::cond::pthread_cond_t;
-use crate::libc::stdio::FILE;
 use crate::window::DeviceFamily;
 use corosensei::stack::DefaultStack;
 use corosensei::{Coroutine, Yielder};
@@ -328,8 +327,6 @@ pub enum ThreadBlock {
     // resuming.
     #[allow(dead_code)]
     Suspended(usize, Box<ThreadBlock>),
-    // Thread is waiting on a FILE object lock.
-    FileObjectLock(MutPtr<FILE>),
     // Thread is waiting for a KeyMgr process-wide pointer lock.
     KeymgrLock(i32),
 }
@@ -676,8 +673,9 @@ impl Environment {
                 });
             Some(Box::new(window::Window::new(
                 &format!(
-                    "{} (BerryHLE {}{}{})",
+                    "{} ({} {}{}{})",
                     bundle.display_name(),
+                    super::DISPLAY_NAME,
                     super::branding(),
                     if super::branding().is_empty() {
                         ""
@@ -1159,9 +1157,8 @@ impl Environment {
         let launch_image = None;
 
         assert!(!options.headless);
-        // On macOS, leave NSApp's icon alone so Launch Services keeps the
-        // bundled HyperHLE.icns icon. SDL_SetWindowIcon would replace the Dock
-        // icon with the app picker's fallback artwork.
+        // On macOS, passing no icon restores the bundle's Dock icon after a
+        // game has replaced it through SDL_SetWindowIcon.
         #[cfg(target_os = "macos")]
         let window_icon = {
             let _ = icon;
@@ -1177,7 +1174,8 @@ impl Environment {
         };
         let window = Some(Box::new(window::Window::new(
             &format!(
-                "BerryHLE {}{}{}",
+                "{} {}{}{}",
+                super::DISPLAY_NAME,
                 super::branding(),
                 if super::branding().is_empty() {
                     ""
@@ -2018,6 +2016,12 @@ impl Environment {
                 assert!(thread.host_context.is_none());
                 thread.host_context = Some(curr_host_context);
                 return None;
+            }
+
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            if self.window.as_ref().is_some_and(|window| window.close_requested()) {
+                self.threads[self.current_thread].host_context = Some(curr_host_context);
+                return Some(GuestTermination::Exit(0));
             }
 
             if stepping {
@@ -4242,17 +4246,6 @@ impl Environment {
                     ThreadBlock::Suspended(cnt, _) => {
                         // Original enforced assertion
                         assert!(cnt > 0);
-                    }
-                    ThreadBlock::FileObjectLock(file_ptr) => {
-                        let acquired = self.libc_state.stdio.try_acquire_file_object_lock(
-                            &mut self.mem,
-                            file_ptr,
-                            thread_id,
-                        );
-                        if acquired {
-                            self.threads[thread_id].blocked_by = ThreadBlock::NotBlocked;
-                            return thread_id;
-                        }
                     }
                     ThreadBlock::KeymgrLock(key) => {
                         if self.libc_state.keymgr_processwide_ptr_is_unlocked(key) {

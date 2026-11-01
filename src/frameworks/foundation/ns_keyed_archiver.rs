@@ -169,7 +169,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     encode_object_for_key(env, this, object, key);
 }
 
-- (())encodeInt:(i32)value forKey:(id)key { // NSString *
+- (())encodeInt:(u32)value forKey:(id)key { // NSString *
     let Some(key) = normalize_key(env, key) else { return; };
     let scope = get_value_to_encode_for_current_key(env, this);
     if scope.contains_key(&key) {

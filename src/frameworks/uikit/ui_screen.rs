@@ -7,6 +7,7 @@
 
 use crate::frameworks::core_graphics::{CGFloat, CGPoint, CGRect, CGSize};
 use crate::frameworks::foundation::NSInteger;
+use crate::frameworks::uikit::ui_geometry::UIEdgeInsets;
 use crate::objc::{
     autorelease, id, msg, msg_class, nil, objc_classes, ClassExports, HostObject,
     TrivialHostObject, SEL,
@@ -20,6 +21,11 @@ pub struct State {
     brightness: CGFloat,
     /// `-wantsSoftwareDimming`.
     wants_software_dimming: bool,
+    /// `-overscanCompensation` (`UIScreenOverscanCompensation`). Overscan only
+    /// affects an external display, so on the built-in display we emulate this
+    /// is recorded and otherwise unused. iOS starts at
+    /// `UIScreenOverscanCompensationScale`, which is 0, the default here.
+    overscan_compensation: NSInteger,
 }
 
 /// Return the main screen's physical pixel size for the current orientation.
@@ -81,6 +87,11 @@ const UI_USER_INTERFACE_IDIOM_PAD: NSInteger = 1;
 const UI_USER_INTERFACE_SIZE_CLASS_COMPACT: NSInteger = 1;
 const UI_USER_INTERFACE_SIZE_CLASS_REGULAR: NSInteger = 2;
 const UI_FORCE_TOUCH_CAPABILITY_UNAVAILABLE: NSInteger = 1;
+// `UIScreenOverscanCompensation`, from UIKit's `UIScreen.h`. `None` was called
+// `InsetApplicationFrame` before iOS 9 and kept the same value.
+const UISCREEN_OVERSCAN_COMPENSATION_SCALE: NSInteger = 0;
+const UISCREEN_OVERSCAN_COMPENSATION_INSET_BOUNDS: NSInteger = 1;
+const UISCREEN_OVERSCAN_COMPENSATION_NONE: NSInteger = 2;
 
 #[derive(Default)]
 struct UITraitCollectionHostObject {
@@ -328,10 +339,41 @@ pub const CLASSES: ClassExports = objc_classes! {
     log_dbg!("[UIScreen setCurrentMode:] ignored; we emulate a single fixed display mode.");
 }
 
-- (CGFloat)overscanCompensationInsets {
-    // UIEdgeInsetsZero as four floats would need a custom return type.
-    // Return 0.0 as a stand-in; the real return type is UIEdgeInsets.
-    0.0
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/overscancompensation>
+// property. The documented values are Scale (0), InsetBounds (1) and None (2).
+- (NSInteger)overscanCompensation {
+    env.framework_state.uikit.ui_screen.overscan_compensation
+}
+
+- (())setOverscanCompensation:(NSInteger)compensation {
+    // Overscan compensation only applies to an external, overscanning
+    // display, and we emulate a single built-in one, so like iOS on a screen
+    // with nothing to compensate for, the setter just records the value.
+    // Undocumented values are a programming error and are ignored.
+    let documented = matches!(
+        compensation,
+        UISCREEN_OVERSCAN_COMPENSATION_SCALE
+            | UISCREEN_OVERSCAN_COMPENSATION_INSET_BOUNDS
+            | UISCREEN_OVERSCAN_COMPENSATION_NONE
+    );
+    if !documented {
+        log!(
+            "[UIScreen setOverscanCompensation:] ignoring undocumented value {}",
+            compensation
+        );
+        return;
+    }
+    env.framework_state.uikit.ui_screen.overscan_compensation = compensation;
+}
+
+// Apple's
+// <https://developer.apple.com/documentation/uikit/uiscreen/overscancompensationinsets>
+// property (iOS 9+): the insets that avoid clipping on an overscanning
+// display. The built-in display we emulate doesn't overscan, so this is
+// UIEdgeInsetsZero.
+- (UIEdgeInsets)overscanCompensationInsets {
+    UIEdgeInsets::default()
 }
 
 // MARK: - Mirroring (iOS 4.3+)

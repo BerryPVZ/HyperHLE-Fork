@@ -34,6 +34,73 @@ pub enum Button {
 /// Highest iOS version currently exposed by the emulator compatibility layer.
 pub const LATEST_IOS_VERSION: (i32, i32, i32) = (12, 0, 0);
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerformanceOverlayMode {
+    Full,
+    Minimal,
+    TitleBar,
+}
+
+impl PerformanceOverlayMode {
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "minimal" => Some(Self::Minimal),
+            "titlebar" => Some(Self::TitleBar),
+            _ => None,
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Minimal => "minimal",
+            Self::TitleBar => "titlebar",
+        }
+    }
+
+    pub fn for_current_platform(self) -> Self {
+        self.for_platform(!cfg!(any(target_os = "android", target_os = "ios")))
+    }
+
+    fn for_platform(self, title_bar_available: bool) -> Self {
+        if !title_bar_available && self == Self::TitleBar {
+            Self::Minimal
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PerformanceOverlayCorner {
+    TopLeft,
+    TopRight,
+    BottomRight,
+    BottomLeft,
+}
+
+impl PerformanceOverlayCorner {
+    pub fn from_short_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "topleft" => Some(Self::TopLeft),
+            "topright" => Some(Self::TopRight),
+            "bottomright" => Some(Self::BottomRight),
+            "bottomleft" => Some(Self::BottomLeft),
+            _ => None,
+        }
+    }
+
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::TopLeft => "topleft",
+            Self::TopRight => "topright",
+            Self::BottomRight => "bottomright",
+            Self::BottomLeft => "bottomleft",
+        }
+    }
+}
+
 /// How `-[EAGLContext presentRenderbuffer:]` gets a rendered frame onto the
 /// host window when the app draws into a fullscreen `CAEAGLLayer`
 /// (`--present-mode=`).
@@ -68,9 +135,8 @@ impl PresentMode {
 /// (`--vsync=`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VsyncMode {
-    /// Android: off (the emulator paces frames itself and the Android
-    /// compositor already synchronises to the display, so a blocking swap only
-    /// adds stalls). Other platforms: leave the driver's default alone.
+    /// Android: synchronize swaps to the display. Other platforms: leave the
+    /// driver's default alone.
     Auto,
     /// Swap interval 1: every swap waits for the next vertical refresh.
     On,
@@ -150,6 +216,9 @@ pub struct Options {
     pub preferred_languages: Option<Vec<String>>,
     pub headless: bool,
     pub print_fps: bool,
+    pub performance_overlay_enabled: bool,
+    pub performance_overlay_mode: PerformanceOverlayMode,
+    pub performance_overlay_corner: PerformanceOverlayCorner,
     pub fps_limit: Option<f64>,
     pub force_composition: bool,
     /// See [PresentMode]. Can also be set with the `TOUCHHLE_PRESENT_MODE`
@@ -231,6 +300,9 @@ pub struct Options {
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
     pub network_access: bool,
+    /// Report a local Game Center player as signed in, without providing
+    /// online Game Center services. Some games require this at startup.
+    pub game_center_authenticated: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
@@ -288,12 +360,18 @@ pub struct Options {
     /// enable it for GTA III. Off globally because some other games rely on
     /// the legacy eager-load and automatic fullscreen presentation behaviour.
     pub fix_movie_player: bool,
-    /// Expose a real guest-memory `xmlNode` struct tree ("DOM mirror") from
-    /// libxml2 instead of opaque handles, for games that read node struct
-    /// fields directly (`node->name`/`children`/`next`/…). Needed by Where's My
-    /// Water (`com.disney.SwampyGame`). Opt in with `--xml-dom-mirror` or
-    /// `TOUCHHLE_XML_MIRROR=1`; off by default so API-only guests are unaffected.
-    pub xml_dom_mirror: bool,
+    /// When an OpenGL ES 2.0 app binds no attribute locations itself, give a
+    /// linked program's active attributes the locations 0 to N-1 in the
+    /// reverse of the order the host driver chose. Turn it on with
+    /// `--reverse-attrib-locations`. The bundled defaults turn it on for
+    /// Noblemen: 1896. That game sizes a per-program array by
+    /// `GL_ACTIVE_ATTRIBUTES` and indexes it by location, so locations must
+    /// be 0 to N-1. Its deferred light pass also sets a texture-coordinate
+    /// array at location 0 for a program that has no such attribute, which
+    /// only works if `position` is not at location 0. The spec leaves
+    /// unbound locations to the implementation:
+    /// <https://registry.khronos.org/OpenGL-Refpages/es2.0/xhtml/glBindAttribLocation.xml>
+    pub reverse_attrib_locations: bool,
 }
 
 impl Default for Options {
@@ -330,6 +408,13 @@ impl Default for Options {
             preferred_languages: None,
             headless: false,
             print_fps: false,
+            performance_overlay_enabled: true,
+            performance_overlay_mode: if cfg!(any(target_os = "android", target_os = "ios")) {
+                PerformanceOverlayMode::Minimal
+            } else {
+                PerformanceOverlayMode::TitleBar
+            },
+            performance_overlay_corner: PerformanceOverlayCorner::TopRight,
             fps_limit: Some(60.0),
             force_composition: false,
             present_mode: std::env::var("TOUCHHLE_PRESENT_MODE")
@@ -362,6 +447,7 @@ impl Default for Options {
                 })
                 .unwrap_or(false),
             network_access: false,
+            game_center_authenticated: false,
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
@@ -393,9 +479,7 @@ impl Default for Options {
                 .map(|value| value != "0")
                 .unwrap_or(false),
             fix_movie_player: false,
-            xml_dom_mirror: std::env::var_os("TOUCHHLE_XML_MIRROR")
-                .map(|value| value != "0")
-                .unwrap_or(false),
+            reverse_attrib_locations: false,
         }
     }
 }
@@ -425,8 +509,6 @@ impl Options {
             self.preserve_aspect_ratio = false;
         } else if arg == "--fix-music" {
             self.gd_music_bypass = true;
-        } else if arg == "--xml-dom-mirror" {
-            self.xml_dom_mirror = true;
         } else if arg == "--fix-movie-player" {
             self.fix_movie_player = true;
         } else if arg == "--no-fix-movie-player" {
@@ -446,6 +528,10 @@ impl Options {
         } else if let Some(value) = arg.strip_prefix("--image-cache-mb=") {
             self.image_cache_mb = value.parse::<u32>().ok().filter(|n| *n <= 1024)
                 .ok_or("Image cache budget must be between 0 and 1024 MiB")?;
+        } else if arg == "--reverse-attrib-locations" {
+            self.reverse_attrib_locations = true;
+        } else if arg == "--no-reverse-attrib-locations" {
+            self.reverse_attrib_locations = false;
         } else if arg == "--landscape-left" {
             self.initial_orientation = DeviceOrientation::LandscapeLeft;
         } else if arg == "--landscape-right" {
@@ -618,6 +704,18 @@ impl Options {
             self.print_fps = true;
         } else if arg == "--no-print-fps" {
             self.print_fps = false;
+        } else if let Some(value) = arg.strip_prefix("--overlay=") {
+            self.performance_overlay_enabled = match value {
+                "on" => true,
+                "off" => false,
+                _ => return Err("Invalid value for --overlay=".to_string()),
+            };
+        } else if let Some(value) = arg.strip_prefix("--overlay-mode=") {
+            self.performance_overlay_mode = PerformanceOverlayMode::from_short_name(value)
+                .ok_or_else(|| "Invalid value for --overlay-mode=".to_string())?;
+        } else if let Some(value) = arg.strip_prefix("--overlay-corner=") {
+            self.performance_overlay_corner = PerformanceOverlayCorner::from_short_name(value)
+                .ok_or_else(|| "Invalid value for --overlay-corner=".to_string())?;
         } else if let Some(value) = arg.strip_prefix("--fps-limit=") {
             if value == "off" {
                 self.fps_limit = None;
@@ -693,6 +791,10 @@ impl Options {
             self.network_access = true;
         } else if arg == "--no-network-access" {
             self.network_access = false;
+        } else if arg == "--game-center-authenticated" {
+            self.game_center_authenticated = true;
+        } else if arg == "--no-game-center-authenticated" {
+            self.game_center_authenticated = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
@@ -868,6 +970,22 @@ mod option_parsing_tests {
     }
 
     #[test]
+    fn reverse_attrib_locations_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.reverse_attrib_locations);
+
+        assert!(options
+            .parse_argument("--reverse-attrib-locations")
+            .unwrap());
+        assert!(options.reverse_attrib_locations);
+
+        assert!(options
+            .parse_argument("--no-reverse-attrib-locations")
+            .unwrap());
+        assert!(!options.reverse_attrib_locations);
+    }
+
+    #[test]
     fn rotation_fix_is_opt_in_and_can_be_disabled() {
         let mut options = Options::default();
         assert!(!options.rotation_fix);
@@ -877,5 +995,61 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn local_game_center_sign_in_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.game_center_authenticated);
+        assert!(options.parse_argument("--game-center-authenticated").unwrap());
+        assert!(options.game_center_authenticated);
+        assert!(options.parse_argument("--no-game-center-authenticated").unwrap());
+        assert!(!options.game_center_authenticated);
+    }
+
+    #[test]
+    fn title_bar_mode_falls_back_when_unavailable() {
+        assert_eq!(
+            PerformanceOverlayMode::TitleBar.for_platform(false),
+            PerformanceOverlayMode::Minimal
+        );
+        assert_eq!(
+            PerformanceOverlayMode::TitleBar.for_platform(true),
+            PerformanceOverlayMode::TitleBar
+        );
+        assert_eq!(
+            PerformanceOverlayMode::Full.for_platform(false),
+            PerformanceOverlayMode::Full
+        );
+    }
+
+    #[test]
+    fn performance_overlay_options_parse_and_validate() {
+        let mut options = Options::default();
+        assert!(options.performance_overlay_enabled);
+        let default_mode = if cfg!(any(target_os = "android", target_os = "ios")) {
+            PerformanceOverlayMode::Minimal
+        } else {
+            PerformanceOverlayMode::TitleBar
+        };
+        assert_eq!(options.performance_overlay_mode, default_mode);
+        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::TopRight);
+
+        assert!(options.parse_argument("--overlay=off").unwrap());
+        assert!(!options.performance_overlay_enabled);
+        assert!(options.parse_argument("--overlay=on").unwrap());
+        assert!(options.performance_overlay_enabled);
+        assert!(options.parse_argument("--overlay-mode=full").unwrap());
+        assert_eq!(options.performance_overlay_mode, PerformanceOverlayMode::Full);
+        assert!(options.parse_argument("--overlay-corner=bottomleft").unwrap());
+        assert_eq!(options.performance_overlay_corner, PerformanceOverlayCorner::BottomLeft);
+        assert!(options.parse_argument("--overlay-mode=invalid").is_err());
+        assert!(options.parse_argument("--overlay-corner=invalid").is_err());
+    }
+
+    #[test]
+    fn xml_dom_mirror_is_not_a_user_option() {
+        let mut options = Options::default();
+        assert_eq!(options.parse_argument("--xml-dom-mirror"), Ok(false));
     }
 }

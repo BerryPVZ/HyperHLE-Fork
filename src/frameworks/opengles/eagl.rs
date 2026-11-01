@@ -159,6 +159,7 @@ fn effective_eagl_api(
 /// context (the presenter) always restores what it found, so the mirror stays
 /// valid across presents.
 pub(super) struct GLShadowState {
+    pub(super) resource_group_token: usize,
     /// `GL_ARRAY_BUFFER_BINDING`.
     pub(super) array_buffer: GLuint,
     /// `GL_ELEMENT_ARRAY_BUFFER_BINDING`. `None` means "unknown, ask the
@@ -196,6 +197,7 @@ pub(super) struct GLShadowState {
 impl Default for GLShadowState {
     fn default() -> Self {
         GLShadowState {
+            resource_group_token: 0,
             array_buffer: 0,
             element_array_buffer: Some(0),
             fog_enabled: false,
@@ -350,6 +352,9 @@ impl GLShadowState {
 #[derive(Default)]
 pub(super) struct EAGLContextHostObject {
     pub(super) gles_ctx: Option<Box<dyn GLESContext>>,
+    /// Guest object addresses can be reused when a game session restarts.
+    present_token: usize,
+    resource_group_token: usize,
     /// See [GLShadowState].
     pub(super) shadow: GLShadowState,
     /// Which EAGL rendering API was requested. This influences how
@@ -366,9 +371,18 @@ pub(super) struct EAGLContextHostObject {
     renderbuffer_drawable_bindings: Rc<RefCell<HashMap<GLuint, id>>>,
     fps_counter: Option<FpsCounter>,
     next_frame_due: Option<Instant>,
-    pub mapped_buffers: HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, *mut GLvoid, usize)>,
+    /// Buffers the guest currently has mapped, keyed by target and buffer
+    /// object name: `(guest mirror, driver mapping, size)`.
+    ///
+    /// The driver mapping is only set for `glMapBufferRange`, whose mapping is
+    /// still open; `glMapBufferOES` keeps the data in the guest mirror alone
+    /// and uploads it on unmap, so it never holds a driver pointer across a
+    /// guest call (see `gles_guest::glMapBufferOES`).
+    pub mapped_buffers:
+        HashMap<(GLenum, GLuint), (MutPtr<GLvoid>, Option<*mut GLvoid>, usize)>,
 }
 impl HostObject for EAGLContextHostObject {}
+
 
 /// Log the effective state of the `fix_texture_min_filter` option once,
 /// the first time an EAGL context is created. This makes it easy to
@@ -411,6 +425,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 + (id)alloc {
     let host_object = Box::new(EAGLContextHostObject {
         gles_ctx: None,
+        present_token: crate::gles::perf_overlay::allocate_context_token(),
+        resource_group_token: 0,
         shadow: GLShadowState::default(),
         api: kEAGLRenderingAPIOpenGLES1,
         drawable_framebuffer: 0,
@@ -461,6 +477,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         return msg![env; this initWithAPI:api];
     }
 
+    let resource_group_token = {
+        let group_context = env.objc.borrow::<EAGLContextHostObject>(group);
+        if group_context.resource_group_token != 0 {
+            group_context.resource_group_token
+        } else {
+            group_context.present_token
+        }
+    };
+
     let window = env.window.as_mut().expect("OpenGL ES is not supported in headless mode");
     let prev_context = env.objc.borrow_mut::<EAGLContextHostObject>(group).gles_ctx.as_mut().unwrap();
 
@@ -500,10 +525,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     env.window.as_mut().unwrap().set_share_with_current_context(false);
 
@@ -522,6 +552,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         );
         return nil;
     }
+
+    let resource_group_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
 
     let effective_api = effective_eagl_api(
         api,
@@ -550,10 +582,15 @@ pub const CLASSES: ClassExports = objc_classes! {
         framebuffer as GLuint
     };
 
-    let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    host_object.gles_ctx = Some(gles_ins);
-    host_object.api = effective_api;
-    host_object.drawable_framebuffer = drawable_framebuffer;
+    {
+        let host_object = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        host_object.gles_ctx = Some(gles_ins);
+        host_object.api = effective_api;
+        host_object.drawable_framebuffer = drawable_framebuffer;
+        host_object.resource_group_token = resource_group_token;
+        host_object.shadow.resource_group_token = resource_group_token;
+    }
+    crate::gles::perf_overlay::register_gl_resource_context(resource_group_token);
 
     this
 }
@@ -569,16 +606,31 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (())dealloc {
-    let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
-    for &(guest_buf, _host_buf, _size) in host_obj.mapped_buffers.values() {
-        env.mem.free(guest_buf);
+    let (resource_group_token, drawables, mapped_guest_buffers) = {
+        let host_obj = env.objc.borrow_mut::<EAGLContextHostObject>(this);
+        let mapped_guest_buffers = host_obj
+            .mapped_buffers
+            .values()
+            .map(|&(guest_buf, _, _)| guest_buf)
+            .collect::<Vec<_>>();
+        let resource_group_token = host_obj.resource_group_token;
+        host_obj.resource_group_token = 0;
+        host_obj.shadow.resource_group_token = 0;
+        let drawables = if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
+            let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
+            bindings.take().into_values().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        (resource_group_token, drawables, mapped_guest_buffers)
+    };
+    for guest_buffer in mapped_guest_buffers {
+        env.mem.free(guest_buffer);
     }
-    if Rc::strong_count(&host_obj.renderbuffer_drawable_bindings) == 1 {
-        let bindings = std::mem::take(&mut host_obj.renderbuffer_drawable_bindings);
-        for (_renderbuffer, drawable) in bindings.take() {
-            release(env, drawable);
-        }
+    for drawable in drawables {
+        release(env, drawable);
     }
+    crate::gles::perf_overlay::unregister_gl_resource_context(resource_group_token);
     env.objc.dealloc_object(this, &mut env.mem);
 }
 
@@ -995,8 +1047,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     // delayed, so this needs to be checked before returning.
     let frame_due = limit_framerate(&mut env.objc.borrow_mut::<EAGLContextHostObject>(this).next_frame_due, &env.options, env.guest_clock.speed().multiplier());
 
-    // The iOS host always counts frames so it can show its own FPS overlay.
-    if env.options.print_fps || cfg!(target_os = "ios") {
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
+        if crate::gles::perf_overlay::enabled() {
+            crate::gles::perf_overlay::record_guest_flip();
+        }
         env
             .objc
             .borrow_mut::<EAGLContextHostObject>(this)
@@ -1226,7 +1283,8 @@ pub const CLASSES: ClassExports = objc_classes! {
                 mark_presented_directly(env, fullscreen_layer);
             }
             unsafe {
-                present_renderbuffer(env, renderbuffer, drawable, options, this.to_bits() as usize);
+                let context_token = env.objc.borrow::<EAGLContextHostObject>(this).present_token;
+                present_renderbuffer(env, renderbuffer, drawable, options, context_token);
             }
         }
     } else {
@@ -1465,6 +1523,7 @@ unsafe fn present_full_frame_readback(
     let viewport = window.viewport();
     let rotation = window.rotation_matrix();
     let cursor = window.virtual_cursor_visible_at();
+    let context_token = window.perf_context_token();
     let mut texture = env.framework_state.opengles.fullscreen_readback_texture;
     let mut gles = window.make_internal_gl_ctx_current();
     gles.ActiveTexture(gles11::TEXTURE0);
@@ -1522,7 +1581,7 @@ unsafe fn present_full_frame_readback(
         gles.MatrixMode(mode);
         gles.LoadIdentity();
     }
-    present_frame(gles.as_mut(), viewport, rotation, cursor);
+    present_frame(gles.as_mut(), viewport, rotation, cursor, context_token);
     drop(gles);
     window.swap_window();
     env.framework_state.opengles.fullscreen_readback_texture = texture;
@@ -2233,6 +2292,7 @@ unsafe fn present_renderbuffer_es2(
     // Cheat Engine-style trainer overlay (floating button + panel), drawn
     // with a dedicated ES 2.0 shader so it also works on native ES 2.0
     // drivers (Android), where the fixed-function GLES 1.x path is unusable.
+    crate::gles::perf_overlay::draw_es2(gles, viewport, context_token);
     crate::trainer_ui::draw_es2(gles, viewport, context_token);
 
     // Optional: virtual cursor.
@@ -2406,6 +2466,19 @@ fn invalidate_present_cache_for_context(context_token: usize) {
         PRESENT_ES1_REJECTED_CAPS.with(|cell| cell.set(None));
         log!("EAGL presenter: invalidated cached GL objects after EAGL context switch");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn presenter_cache_is_invalidated_across_recreated_contexts() {
+    let first = crate::gles::perf_overlay::allocate_context_token();
+    let second = crate::gles::perf_overlay::allocate_context_token();
+    assert_ne!(first, second);
+
+    invalidate_present_cache_for_context(first);
+    PRESENT_ES1_TEXTURE.with(|cell| cell.set(Some((42, 1024, 768))));
+    invalidate_present_cache_for_context(second);
+    PRESENT_ES1_TEXTURE.with(|cell| assert_eq!(cell.get(), None));
 }
 
 /// Drain the GL error queue. Returns whether there was anything in it.
@@ -3747,7 +3820,13 @@ unsafe fn present_renderbuffer(
     }
 
     // Draw the quad
-    present_frame(gles, viewport, rotation_matrix, virtual_cursor_visible_at);
+    present_frame(
+        gles,
+        viewport,
+        rotation_matrix,
+        virtual_cursor_visible_at,
+        context_token,
+    );
     {
         static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -4085,6 +4164,60 @@ mod readback_buffer_tests {
 mod native_present_regression {
     use super::*;
     use crate::gles::{gles3_native::GLES3NativeContext, gles30_raw as gl, GLESContext};
+
+    #[test]
+    #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]
+    fn texture_overlay_preserves_guest_attributes_and_blending() {
+        let mut window = crate::window::Window::graphics_test_window().unwrap();
+        let mut context = GLES3NativeContext::new(&mut window).unwrap();
+        let mut gles = context.make_current(&mut window);
+        unsafe {
+            gles.Viewport(0, 0, 480, 320);
+            gles.ClearColor(1.0, 0.0, 0.0, 1.0);
+            gles.Clear(gl::COLOR_BUFFER_BIT);
+            let mut buffer = 0;
+            gles.GenBuffers(1, &mut buffer);
+            gles.BindBuffer(gl::ARRAY_BUFFER, buffer);
+            let data = [0.0f32; 32];
+            gles.BufferData(gl::ARRAY_BUFFER, 128, data.as_ptr().cast(), gl::STATIC_DRAW);
+            gles.VertexAttribPointer(2, 3, gl::FLOAT, gl::FALSE, 20, 16usize as *const _);
+            gles.DisableVertexAttribArray(2);
+            let mut texture = 0;
+            gles.GenTextures(1, &mut texture);
+            gles.BindTexture(gl::TEXTURE_2D, texture);
+            let white = [255u8; 4];
+            gles.TexImage2D(gl::TEXTURE_2D, 0, gl::RGBA as _, 1, 1, 0,
+                gl::RGBA, gl::UNSIGNED_BYTE, white.as_ptr().cast());
+            gles.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as _);
+            gles.TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as _);
+            gles.BlendFuncSeparate(gl::ONE, gl::ZERO, gl::ZERO, gl::ONE);
+            gles.BlendEquationSeparate(gl::FUNC_REVERSE_SUBTRACT, gl::FUNC_ADD);
+            gles.Enable(gl::SCISSOR_TEST);
+            gles.Scissor(0, 0, 1, 1);
+            gles.ColorMask(gl::FALSE, gl::FALSE, gl::FALSE, gl::FALSE);
+            crate::trainer_ui::draw_texture_es2(gles.as_mut(), (0, 0, 480, 320),
+                0, texture, (20.0, 20.0, 80.0, 80.0), (1.0, 1.0));
+            for (pname, expected) in [(gl::VERTEX_ATTRIB_ARRAY_SIZE, 3),
+                (gl::VERTEX_ATTRIB_ARRAY_STRIDE, 20),
+                (gl::VERTEX_ATTRIB_ARRAY_ENABLED, 0),
+                (gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, buffer as GLint)] {
+                let mut actual = 0;
+                gles.GetVertexAttribiv(2, pname, &mut actual);
+                assert_eq!(actual, expected);
+            }
+            assert_eq!(get_int(gles.as_mut(), gl::BLEND_SRC_RGB), gl::ONE as GLint);
+            assert_eq!(get_int(gles.as_mut(), gl::BLEND_SRC_ALPHA), gl::ZERO as GLint);
+            assert_eq!(get_int(gles.as_mut(), gl::BLEND_EQUATION_RGB), gl::FUNC_REVERSE_SUBTRACT as GLint);
+            assert_ne!(gles.IsEnabled(gl::SCISSOR_TEST), 0);
+            let mut mask = [gl::TRUE; 4];
+            gles.GetBooleanv(gl::COLOR_WRITEMASK, mask.as_mut_ptr());
+            assert_eq!(mask, [gl::FALSE; 4]);
+            let mut pixel = [0u8; 4];
+            gles.ReadPixels(40, 280, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, pixel.as_mut_ptr().cast());
+            assert!(pixel[..3].iter().all(|&v| v > 240), "Overlay missing: {pixel:?}");
+            assert_eq!(gles.GetError(), 0);
+        }
+    }
 
     #[test]
     #[ignore = "Requires a real Windows GPU; run explicitly with --ignored"]

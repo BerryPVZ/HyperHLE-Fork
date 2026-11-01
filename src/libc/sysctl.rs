@@ -275,6 +275,14 @@ fn sysctlbyname(
                 }
                 _ => {}
             }
+            // `sysctl.proc_native` tells an app whether it is running natively
+            // or translated (Rosetta). touchHLE emulates the CPU but the
+            // process itself is native, so answer 1 like a real device; an
+            // unknown-parameter -1 here reads as "the check failed" to apps
+            // that use it to decide how much they trust their own addresses.
+            if name_str == "sysctl.proc_native" {
+                return Some(("sysctl.proc_native", SysInfoType::Int32(1)));
+            }
             let Some((name_str, val)) = STRING_MAP.get_key_value(name_str) else {
                 log!(
                     "sysctlbyname(): unknown parameter {}, returning -1",

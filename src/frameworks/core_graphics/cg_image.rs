@@ -75,8 +75,128 @@ struct CGImageHostObject {
     /// component, top bit unused). The pixels are still stored as RGBA8; this
     /// only changes the format the image reports to the app.
     rgb555: bool,
+    /// Set for images created by `CGImageMaskCreate`. An image mask is a
+    /// single-component coverage bitmap, not colour data, and CoreGraphics
+    /// reports a different format for it (`CGImageIsMask` is true,
+    /// `CGImageGetColorSpace` is NULL, one component per pixel).
+    mask: Option<ImageMask>,
 }
 impl HostObject for CGImageHostObject {}
+
+/// The packed bitmap an image mask was created from, kept alongside the RGBA
+/// pixels so `CGImageGetDataProvider`, `CGImageGetBytesPerRow` and
+/// `CGImageCreateWithImageInRect` can work with the samples the app supplied
+/// instead of our internal pixel layout.
+#[derive(Clone)]
+struct ImageMask {
+    bits_per_component: u32,
+    bits_per_pixel: u32,
+    bytes_per_row: u32,
+    /// Rows of `bytes_per_row` bytes, samples packed most-significant-bit
+    /// first, as CoreGraphics requires.
+    samples: Vec<u8>,
+}
+
+impl ImageMask {
+    /// Sample of the pixel at `x`, `y`, or `None` if it is outside the bitmap.
+    fn sample_at(&self, x: usize, y: usize) -> Option<u32> {
+        mask_sample_at(
+            &self.samples,
+            self.bytes_per_row as usize,
+            x,
+            y,
+            self.bits_per_pixel as usize,
+            self.bits_per_component as usize,
+        )
+    }
+
+    /// Build a mask in the same sample format from one sample per pixel.
+    fn from_samples(&self, samples: &[u32], width: u32, height: u32) -> ImageMask {
+        let (samples, bytes_per_row) = pack_mask_samples(
+            samples,
+            width as usize,
+            height as usize,
+            self.bits_per_component as usize,
+            self.bits_per_pixel as usize,
+        );
+        ImageMask {
+            bits_per_component: self.bits_per_component,
+            bits_per_pixel: self.bits_per_pixel,
+            bytes_per_row: bytes_per_row as u32,
+            samples,
+        }
+    }
+}
+
+/// Read one sample of a packed, single-component bitmap at `x`, `y`.
+///
+/// Samples are packed most-significant-bit first and each row starts at a
+/// multiple of `bytes_per_row`, like the grey bitmaps CoreGraphics, TIFF and
+/// PNG use. Only the first sample of each pixel is read, as an image mask has
+/// no use for the others.
+fn mask_sample_at(
+    src: &[u8],
+    bytes_per_row: usize,
+    x: usize,
+    y: usize,
+    bits_per_pixel: usize,
+    bits_per_component: usize,
+) -> Option<u32> {
+    if bits_per_component == 0 || bits_per_component > 8 || bits_per_pixel < bits_per_component {
+        return None;
+    }
+    let bit = x.checked_mul(bits_per_pixel)?;
+    let offset_in_byte = bit % 8;
+    if offset_in_byte + bits_per_component > 8 {
+        // We only decode formats where a sample never straddles two bytes,
+        // which is true of every legal mask format.
+        return None;
+    }
+    let byte = *src.get(y.checked_mul(bytes_per_row)? + bit / 8)?;
+    Some(
+        ((byte >> (8 - bits_per_component - offset_in_byte)) as u32)
+            & ((1 << bits_per_component) - 1),
+    )
+}
+
+/// Pack one sample per pixel into a packed bitmap; the inverse of
+/// [mask_sample_at]. Returns the bytes and the row stride they use.
+fn pack_mask_samples(
+    samples: &[u32],
+    width: usize,
+    height: usize,
+    bits_per_component: usize,
+    bits_per_pixel: usize,
+) -> (Vec<u8>, usize) {
+    let bytes_per_row = (width * bits_per_pixel).div_ceil(8);
+    let mut bitmap = vec![0u8; bytes_per_row * height];
+    let max_sample = (1u32 << bits_per_component) - 1;
+    for y in 0..height {
+        for x in 0..width {
+            let sample = samples[y * width + x].min(max_sample);
+            let bit = x * bits_per_pixel;
+            let shift = 8 - bits_per_component - (bit % 8);
+            bitmap[y * bytes_per_row + bit / 8] |= (sample as u8) << shift;
+        }
+    }
+    (bitmap, bytes_per_row)
+}
+
+/// Coverage of a mask sample, as the alpha value our RGBA pixels carry.
+///
+/// Mask samples are an inverse alpha: 0 is painted (fully opaque) and the
+/// maximum sample value is not painted at all. The optional decode array
+/// CoreGraphics takes remaps the sample's 0.0-1.0 range.
+fn mask_alpha(sample: u32, max_sample: u32, decode: (CGFloat, CGFloat)) -> u8 {
+    let value = if max_sample == 0 {
+        0.0
+    } else {
+        sample as f32 / max_sample as f32
+    };
+    let (min, max) = decode;
+    let coverage = 1.0 - (min + value * (max - min)).clamp(0.0, 1.0);
+    (coverage * 255.0).round().clamp(0.0, 255.0) as u8
+}
 
 pub type CGImageRef = CFTypeRef;
 
@@ -97,7 +217,7 @@ pub fn CGImageRetain(env: &mut Environment, c: CGImageRef) -> CGImageRef {
 pub fn from_image(env: &mut Environment, image: Image) -> CGImageRef {
     let host_obj = Box::new(CGImageHostObject {
         image,
-        rgb555: false,
+        ..Default::default()
     });
     let class = env.objc.get_known_class("_touchHLE_CGImage", &mut env.mem);
     env.objc.alloc_object(class, host_obj, &mut env.mem)
@@ -113,8 +233,38 @@ pub fn from_rgb555_image(env: &mut Environment, image: Image) -> CGImageRef {
     cg_image
 }
 
-fn is_rgb555(env: &Environment, image: CGImageRef) -> bool {
-    env.objc.borrow::<CGImageHostObject>(image).rgb555
+fn image_mask<'a>(objc: &'a ObjC, image: CGImageRef) -> Option<&'a ImageMask> {
+    objc.borrow::<CGImageHostObject>(image).mask.as_ref()
+}
+
+fn is_mask(env: &Environment, image: CGImageRef) -> bool {
+    env.objc.borrow::<CGImageHostObject>(image).mask.is_some()
+}
+
+/// The packed samples of an image mask, for `CGDataProvider`'s benefit.
+pub fn borrow_mask_samples<'a>(objc: &'a ObjC, image: CGImageRef) -> Option<&'a [u8]> {
+    image_mask(objc, image).map(|mask| mask.samples.as_slice())
+}
+
+/// Copy a `CGImage`, keeping every format flag (`rgb555`, image mask and its
+/// packed samples). The pixels themselves are shared, like `CGImageCreateCopy`.
+fn copy_image(env: &mut Environment, image: CGImageRef) -> CGImageRef {
+    let (image_data, rgb555, mask) = {
+        let host_obj = env.objc.borrow::<CGImageHostObject>(image);
+        (
+            host_obj.image.clone(),
+            host_obj.rgb555,
+            host_obj.mask.clone(),
+        )
+    };
+    let new_host_obj = CGImageHostObject {
+        image: image_data,
+        rgb555,
+        mask,
+    };
+    let class = env.objc.get_known_class("_touchHLE_CGImage", &mut env.mem);
+    env.objc
+        .alloc_object(class, Box::new(new_host_obj), &mut env.mem)
 }
 
 pub fn borrow_image(objc: &ObjC, image: CGImageRef) -> &Image {
@@ -146,8 +296,7 @@ fn CGImageCreateCopyWithColorSpace(
         CGColorSpaceGetModel(env, color_space)
     );
 
-    let new_image = env.objc.borrow::<CGImageHostObject>(image).image.clone();
-    from_image(env, new_image)
+    copy_image(env, image)
 }
 
 fn CGImageCreateWithPNGDataProvider(
@@ -194,7 +343,13 @@ fn CGImageGetAlphaInfo(env: &mut Environment, image: CGImageRef) -> CGImageAlpha
     if image.is_null() {
         return kCGImageAlphaNone;
     }
-    if is_rgb555(env, image) {
+    let host_obj = env.objc.borrow::<CGImageHostObject>(image);
+    // An image mask has a single coverage component: no colour channels and
+    // no alpha channel either, the coverage *is* the pixel value.
+    if host_obj.mask.is_some() {
+        return kCGImageAlphaNone;
+    }
+    if host_obj.rgb555 {
         return kCGImageAlphaNoneSkipFirst;
     }
     kCGImageAlphaPremultipliedLast
@@ -202,6 +357,10 @@ fn CGImageGetAlphaInfo(env: &mut Environment, image: CGImageRef) -> CGImageAlpha
 
 fn CGImageGetColorSpace(env: &mut Environment, image: CGImageRef) -> CGColorSpaceRef {
     if image.is_null() {
+        return nil;
+    }
+    // "If the image is an image mask, this function returns NULL."
+    if is_mask(env, image) {
         return nil;
     }
     let srgb_name = ns_string::get_static_str(env, kCGColorSpaceGenericRGB);
@@ -236,7 +395,11 @@ fn CGImageGetBitsPerPixel(env: &mut Environment, image: CGImageRef) -> GuestUSiz
     if image.is_null() {
         return 0;
     }
-    if is_rgb555(env, image) {
+    let host_obj = env.objc.borrow::<CGImageHostObject>(image);
+    if let Some(mask) = &host_obj.mask {
+        return mask.bits_per_pixel;
+    }
+    if host_obj.rgb555 {
         return 16;
     }
     32
@@ -246,11 +409,11 @@ fn CGImageGetBytesPerRow(env: &mut Environment, image: CGImageRef) -> GuestUSize
     if image.is_null() {
         return 0;
     }
-    let (width, _height) = env
-        .objc
-        .borrow::<CGImageHostObject>(image)
-        .image
-        .dimensions();
+    let host_obj = env.objc.borrow::<CGImageHostObject>(image);
+    if let Some(mask) = &host_obj.mask {
+        return mask.bytes_per_row;
+    }
+    let (width, _height) = host_obj.image.dimensions();
     width * 4
 }
 
@@ -266,19 +429,22 @@ fn CGImageGetBitsPerComponent(env: &mut Environment, image: CGImageRef) -> Guest
     if image.is_null() {
         return 0;
     }
-    if is_rgb555(env, image) {
+    let host_obj = env.objc.borrow::<CGImageHostObject>(image);
+    if let Some(mask) = &host_obj.mask {
+        return mask.bits_per_component;
+    }
+    if host_obj.rgb555 {
         return 5;
     }
     8
 }
 
-/// Copy of an existing CGImage — just clone the underlying Image.
+/// Copy of an existing CGImage — same pixels, same format flags.
 fn CGImageCreateCopy(env: &mut Environment, image: CGImageRef) -> CGImageRef {
     if image.is_null() {
         return nil;
     }
-    let new_image = env.objc.borrow::<CGImageHostObject>(image).image.clone();
-    from_image(env, new_image)
+    copy_image(env, image)
 }
 
 /// Crop to a sub-rectangle. CGRect is in pixels (no coordinate transform here).
@@ -318,19 +484,84 @@ fn CGImageCreateWithImageInRect(
             .copy_from_slice(&src_pixels[src_start..src_start + width as usize * 4]);
     }
 
-    let new_image = Image::from_pixels(width, height, dst);
-    from_image(env, new_image)
+    let cropped_mask = image_mask(&env.objc, image).map(|mask| {
+        let mut samples = Vec::with_capacity((width * height) as usize);
+        for row in 0..height as usize {
+            for col in 0..width as usize {
+                samples.push(
+                    mask.sample_at(x as usize + col, y as usize + row)
+                        .unwrap_or(0),
+                );
+            }
+        }
+        mask.from_samples(&samples, width, height)
+    });
+
+    let cg_image = from_image(env, Image::from_pixels(width, height, dst));
+    env.objc.borrow_mut::<CGImageHostObject>(cg_image).mask = cropped_mask;
+    cg_image
 }
 
-/// Create an image masked by another image. We don't apply the mask —
-/// return a copy of the source so apps that read back pixels get something.
-fn CGImageCreateWithMask(
-    env: &mut Environment,
-    image: CGImageRef,
-    _mask: CGImageRef,
-) -> CGImageRef {
-    log!("CGImageCreateWithMask: mask not applied (stubbed)");
-    CGImageCreateCopy(env, image)
+/// Create an image masked by an image mask.
+///
+/// CoreGraphics requires the second argument to be an image mask (see
+/// [CGImageMaskCreate]); its samples are an inverse alpha, so the source
+/// image's premultiplied pixels are scaled by the mask's coverage. A mask of
+/// a different size is sampled at the source image's pixel positions, as
+/// `CGContextDrawImage` would do when drawing both into the same rectangle.
+fn CGImageCreateWithMask(env: &mut Environment, image: CGImageRef, mask: CGImageRef) -> CGImageRef {
+    if image.is_null() || mask.is_null() {
+        return nil;
+    }
+    if !is_mask(env, mask) {
+        // Anything else is a programming error on the app's part; keep the
+        // unmasked image rather than guessing at what it wanted.
+        log!("CGImageCreateWithMask: mask argument is not an image mask, ignoring it");
+        return CGImageCreateCopy(env, image);
+    }
+
+    let (width, height) = env
+        .objc
+        .borrow::<CGImageHostObject>(image)
+        .image
+        .dimensions();
+    let (mask_width, mask_height, mask_pixels) = {
+        let host_obj = env.objc.borrow::<CGImageHostObject>(mask);
+        let (mask_width, mask_height) = host_obj.image.dimensions();
+        (mask_width, mask_height, host_obj.image.pixels().to_vec())
+    };
+    if width == 0 || height == 0 || mask_width == 0 || mask_height == 0 {
+        return nil;
+    }
+
+    let mut pixels = env
+        .objc
+        .borrow::<CGImageHostObject>(image)
+        .image
+        .pixels()
+        .to_vec();
+
+    // The mask's pixels already carry the coverage the decode array asked for,
+    // so they can be used as-is: a fully opaque mask pixel multiplies by 255,
+    // a fully transparent one clears the pixel.
+    for y in 0..height as usize {
+        let mask_y = y * mask_height as usize / height as usize;
+        for x in 0..width as usize {
+            let mask_x = x * mask_width as usize / width as usize;
+            let coverage = mask_pixels[(mask_y * mask_width as usize + mask_x) * 4 + 3] as u32;
+            if coverage == 255 {
+                continue;
+            }
+            let offset = (y * width as usize + x) * 4;
+            // The image's pixels are premultiplied, so scaling every channel
+            // keeps them consistent.
+            for channel in &mut pixels[offset..offset + 4] {
+                *channel = ((*channel as u32 * coverage + 127) / 255) as u8;
+            }
+        }
+    }
+
+    from_image(env, Image::from_pixels(width, height, pixels))
 }
 
 /// Invert-mask stub — just copy.
@@ -341,9 +572,14 @@ fn CGImageCreateMaskWithImageMask(env: &mut Environment, mask_image: CGImageRef)
 
 // MARK: - Additional accessors
 
-fn CGImageGetBitmapInfo(_env: &mut Environment, image: CGImageRef) -> CGBitmapInfo {
+fn CGImageGetBitmapInfo(env: &mut Environment, image: CGImageRef) -> CGBitmapInfo {
     if image.is_null() {
         return 0;
+    }
+    if is_mask(env, image) {
+        // An image mask has a single coverage component and no alpha channel,
+        // with the default byte order, which is what CoreGraphics reports.
+        return kCGImageAlphaNone | kCGImageByteOrderDefault;
     }
     // Report premultiplied-last RGBA, big-endian 32-bit — matches our Image
     // format.
@@ -367,8 +603,8 @@ fn CGImageGetRenderingIntent(_env: &mut Environment, _image: CGImageRef) -> i32 
     0
 }
 
-fn CGImageIsMask(_env: &mut Environment, _image: CGImageRef) -> bool {
-    false
+fn CGImageIsMask(env: &mut Environment, image: CGImageRef) -> bool {
+    !image.is_null() && is_mask(env, image)
 }
 
 /// `CGImageCreate` — create a bitmap image from raw pixel data provided by a
@@ -467,6 +703,109 @@ fn CGImageCreate(
 
     let image = Image::from_pixels(width, height, dst);
     from_image(env, image)
+}
+
+/// `CGImageMaskCreate` — create an image mask from a one-component bitmap.
+///
+/// <https://developer.apple.com/documentation/coregraphics/1455142-cgimagemaskcreate>
+///
+/// "Legal values for bits per component are 1, 2, 4 and 8. Bits per pixel
+/// must be either the same as bits per component or 8, with exception of 8
+/// bits per component where bits per pixel can be also 16 or 32."
+/// (`CoreGraphics/CGImage.h`)
+///
+/// A mask is a stencil rather than a picture: its samples are an inverse
+/// alpha, where 0 paints and the maximum value is transparent, so it is kept
+/// as premultiplied RGBA with black colour channels and the coverage in the
+/// alpha channel. The packed samples the app supplied are kept as well, so
+/// that `CGImageGetDataProvider` and `CGImageGetBytesPerRow` describe the mask
+/// the way the app built it.
+fn CGImageMaskCreate(
+    env: &mut Environment,
+    width: GuestUSize,
+    height: GuestUSize,
+    bits_per_component: GuestUSize,
+    bits_per_pixel: GuestUSize,
+    bytes_per_row: GuestUSize,
+    provider: CGDataProviderRef,
+    decode: ConstPtr<CGFloat>,
+    _should_interpolate: bool,
+) -> CGImageRef {
+    if provider.is_null() || width == 0 || height == 0 {
+        return nil;
+    }
+
+    let bpc = bits_per_component as usize;
+    let bpp = bits_per_pixel as usize;
+    let bytes_per_row = bytes_per_row as usize;
+    if !matches!(bpc, 1 | 2 | 4 | 8) || bpp < bpc || bpp % bpc != 0 {
+        log!(
+            "CGImageMaskCreate: unsupported format ({} bits per component, {} bits per pixel)",
+            bits_per_component,
+            bits_per_pixel
+        );
+        return nil;
+    }
+
+    let src = cg_data_provider::borrow_bytes(env, provider).to_vec();
+    let row_bytes = (width as usize * bpp).div_ceil(8);
+    if bytes_per_row < row_bytes {
+        log!(
+            "CGImageMaskCreate: {} bytes per row cannot hold {} pixels at {} bits per pixel",
+            bytes_per_row,
+            width,
+            bits_per_pixel
+        );
+        return nil;
+    }
+    // The last row is often stored without its padding, so only the bytes the
+    // pixels actually occupy have to be there.
+    let needed = (height as usize - 1) * bytes_per_row + row_bytes;
+    if src.len() < needed {
+        log!(
+            "CGImageMaskCreate: provider has {} bytes but {}×{} at {} bytes per row needs {}",
+            src.len(),
+            width,
+            height,
+            bytes_per_row,
+            needed
+        );
+        return nil;
+    }
+
+    // The decode array maps the sample range onto 0.0-1.0; it is normally
+    // nil, meaning the identity mapping.
+    let decode_range = if decode.is_null() {
+        (0.0, 1.0)
+    } else {
+        let min: CGFloat = env.mem.read(decode);
+        let max: CGFloat = env.mem.read(decode + 1);
+        (min, max)
+    };
+
+    let max_sample = ((1u32 << bpc) - 1) as u32;
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let sample = mask_sample_at(&src, bytes_per_row, x, y, bpp, bpc).unwrap_or(max_sample);
+            let offset = (y * width as usize + x) * 4;
+            pixels[offset + 3] = mask_alpha(sample, max_sample, decode_range);
+        }
+    }
+
+    // Keep the padded rows so the stride stays meaningful for the app.
+    let mut samples = vec![0u8; bytes_per_row * height as usize];
+    let copy_len = needed.min(src.len());
+    samples[..copy_len].copy_from_slice(&src[..copy_len]);
+
+    let cg_image = from_image(env, Image::from_pixels(width, height, pixels));
+    env.objc.borrow_mut::<CGImageHostObject>(cg_image).mask = Some(ImageMask {
+        bits_per_component: bpc as u32,
+        bits_per_pixel: bpp as u32,
+        bytes_per_row: bytes_per_row as u32,
+        samples,
+    });
+    cg_image
 }
 
 // =========================================================================
@@ -821,6 +1160,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGImageCreateWithPNGDataProvider(_, _, _, _)),
     export_c_func!(CGImageCreateWithJPEGDataProvider(_, _, _, _)),
     export_c_func!(CGImageCreateWithImageInRect(_, _)),
+    export_c_func!(CGImageMaskCreate(_, _, _, _, _, _, _, _)),
     export_c_func!(CGImageCreateWithMask(_, _)),
     export_c_func!(CGImageCreateMaskWithImageMask(_)),
     export_c_func!(CGImageCreateCopy(_)),
@@ -1176,3 +1516,81 @@ pub const CONSTANTS: ConstantExports = &[
         HostConstant::NSString("kCGImageSourceTypeIdentifierHint"),
     ),
 ];
+
+#[cfg(test)]
+mod mask_tests {
+    use super::*;
+
+    #[test]
+    fn one_bit_mask_rows_are_msb_first_and_padded_to_the_stride() {
+        // Two rows of eight 1-bit pixels, one byte per row.
+        let bitmap = [0b1000_0001, 0b0111_1110];
+        let row = |y| {
+            (0..8)
+                .map(|x| mask_sample_at(&bitmap, 1, x, y, 1, 1).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(row(0), vec![1, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(row(1), vec![0, 1, 1, 1, 1, 1, 1, 0]);
+        // Reading past the end is not a panic.
+        assert_eq!(mask_sample_at(&bitmap, 1, 0, 2, 1, 1), None);
+    }
+
+    #[test]
+    fn four_bit_mask_samples_do_not_straddle_bytes() {
+        // Four 4-bit pixels per byte, then a row pad of two bytes.
+        let bitmap = [0x12, 0x34, 0xff, 0xff, 0x56, 0x78, 0xff, 0xff];
+        let samples = (0..4)
+            .map(|x| mask_sample_at(&bitmap, 4, x, 1, 4, 4).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(samples, vec![5, 6, 7, 8]);
+        assert_eq!(mask_sample_at(&bitmap, 4, 0, 0, 4, 4), Some(1));
+    }
+
+    #[test]
+    fn packed_samples_round_trip() {
+        for bits_per_component in [1usize, 2, 4, 8] {
+            let (width, height) = (7usize, 3usize);
+            let max_sample = (1u32 << bits_per_component) - 1;
+            let samples = (0..width * height)
+                .map(|i| i as u32 & max_sample)
+                .collect::<Vec<_>>();
+            let (bitmap, bytes_per_row) = pack_mask_samples(
+                &samples,
+                width,
+                height,
+                bits_per_component,
+                bits_per_component,
+            );
+            assert_eq!(bitmap.len(), bytes_per_row * height);
+            let mut read_back = Vec::with_capacity(samples.len());
+            for y in 0..height {
+                for x in 0..width {
+                    let sample = mask_sample_at(
+                        &bitmap,
+                        bytes_per_row,
+                        x,
+                        y,
+                        bits_per_component,
+                        bits_per_component,
+                    )
+                    .unwrap();
+                    read_back.push(sample);
+                }
+            }
+            assert_eq!(read_back, samples);
+        }
+    }
+
+    #[test]
+    fn mask_samples_are_an_inverse_alpha() {
+        // A sample of zero paints, the maximum sample value is transparent.
+        assert_eq!(mask_alpha(0, 255, (0.0, 1.0)), 255);
+        assert_eq!(mask_alpha(255, 255, (0.0, 1.0)), 0);
+        assert_eq!(mask_alpha(1, 1, (0.0, 1.0)), 0);
+        assert_eq!(mask_alpha(1, 2, (0.0, 1.0)), 128);
+        // An inverted decode array swaps the two ends.
+        assert_eq!(mask_alpha(0, 255, (1.0, 0.0)), 0);
+        assert_eq!(mask_alpha(255, 255, (1.0, 0.0)), 255);
+    }
+}

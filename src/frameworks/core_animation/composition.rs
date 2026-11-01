@@ -14,7 +14,7 @@ use super::ca_eagl_layer::find_fullscreen_eagl_layer;
 use super::ca_layer::CALayerHostObject;
 use crate::frameworks::core_animation::animation;
 use crate::frameworks::core_graphics::cg_color::CGColorHostObject;
-use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect};
+use crate::frameworks::core_graphics::{cg_bitmap_context, cg_image, CGFloat, CGRect, CGSize};
 use crate::frameworks::foundation::ns_time_interval_to_duration_or_zero;
 use crate::gles::gles11_raw as gles11; // constants only
 use crate::gles::gles11_raw::types::*;
@@ -122,7 +122,10 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         }
     }
 
-    if env.options.print_fps || cfg!(target_os = "ios") {
+    if env.options.print_fps
+        || cfg!(target_os = "ios")
+        || crate::gles::present::onscreen_fps_enabled()
+    {
         env.framework_state
             .core_animation
             .composition
@@ -198,6 +201,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
         env.window().viewport(),
         rotation,
         env.window().virtual_cursor_visible_at(),
+        env.window().perf_context_token(),
     );
     let host_framebuffer = env.window().host_framebuffer();
 
@@ -606,6 +610,7 @@ pub fn recomposite_if_necessary(env: &mut Environment, force: bool) -> Option<In
             present_frame_args.0,
             present_frame_args.1,
             present_frame_args.2,
+            present_frame_args.3,
         );
         // Hand the context back to the guest with the buffer bindings it
         // left behind (see the save at the top of this function).
@@ -1012,7 +1017,37 @@ unsafe fn composite_layer_recursive(
             .as_ref()
             .unwrap();
 
+        // Position `contents` images by `contentsGravity`; the unit quad is
+        // otherwise scaled to the whole bounds (kCAGravityResize).
+        if host_obj.contents != nil
+            && host_obj.contents_gravity != super::ca_layer::kCAGravityResize
+        {
+            let (width, height) = cg_image::borrow_image(&env.objc, host_obj.contents).dimensions();
+            let scale = host_obj.contents_scale;
+            let size = CGSize {
+                width: width as CGFloat / scale,
+                height: height as CGFloat / scale,
+            };
+            let rect = super::ca_layer::contents_rect_for_gravity(
+                &host_obj.contents_gravity,
+                host_obj.bounds,
+                size,
+            );
+            gles.MatrixMode(gles11::MODELVIEW);
+            load_matrix(
+                gles.as_mut(),
+                Matrix::<4>::from(&Matrix::scale_2d(rect.size.width, rect.size.height))
+                    .multiply(&Matrix::translate_3d(rect.origin.x, rect.origin.y, 0.0))
+                    .multiply(&cumulative_transform),
+            );
+        }
+
         gles.Color4f(opacity, opacity, opacity, opacity);
+        // Apple: `opaque` "affects only the backing store managed by Core
+        // Animation. If you assign an image with an alpha channel to the
+        // layer's contents property, that image retains its alpha channel
+        // regardless of the value of this property."
+        // https://developer.apple.com/documentation/quartzcore/calayer/1410763-isopaque
         if opacity == 1.0 && host_obj.opaque && !have_background && host_obj.contents == nil {
             gles.Disable(gles11::BLEND);
         } else {

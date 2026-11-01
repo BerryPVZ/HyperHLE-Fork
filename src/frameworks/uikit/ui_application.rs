@@ -168,10 +168,6 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (id)init {
     assert!(env.framework_state.uikit.ui_application.shared_application.is_none());
     env.framework_state.uikit.ui_application.shared_application = Some(this);
-    // UIKit tracking must keep common-mode timers and thread requests alive.
-    let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    let tracking = get_static_str(env, "UITrackingRunLoopMode");
-    crate::frameworks::foundation::ns_run_loop::add_common_mode(env, run_loop, tracking);
     this
 }
 
@@ -481,11 +477,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 - (bool)sendAction:(SEL)action
                 to:(id)target
               from:(id)sender
-          forEvent:(id)_event { // UIEvent*
+          forEvent:(id)event { // UIEvent*
+    let has_event_argument = action.as_str(&env.mem).bytes().filter(|&c| c == b':').count() == 2;
     if target != nil {
         let responds: bool = msg![env; target respondsToSelector:action];
         if responds {
-            () = msg![env; target performSelector:action withObject:sender];
+            if has_event_argument {
+                () = msg![env; target performSelector:action withObject:sender withObject:event];
+            } else {
+                () = msg![env; target performSelector:action withObject:sender];
+            }
             return true;
         }
         return false;
@@ -495,7 +496,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     while responder != nil {
         let responds: bool = msg![env; responder respondsToSelector:action];
         if responds {
-            () = msg![env; responder performSelector:action withObject:sender];
+            if has_event_argument {
+                () = msg![env; responder performSelector:action withObject:sender withObject:event];
+            } else {
+                () = msg![env; responder performSelector:action withObject:sender];
+            }
             return true;
         }
         responder = msg![env; responder nextResponder];
@@ -1108,7 +1113,7 @@ pub(super) fn UIApplicationMain(
     }
 
     let run_loop: id = msg_class![env; NSRunLoop mainRunLoop];
-    crate::frameworks::foundation::ns_run_loop::run_application_main_loop(env, run_loop);
+    let _: () = msg![env; run_loop run];
 }
 
 /// Dispatches `applicationWillResignActive:` and posts

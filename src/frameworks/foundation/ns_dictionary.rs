@@ -181,55 +181,17 @@ impl Default for CFDictionaryHostObject {
 }
 // TODO: Unify implementations of NSDictionary and CFDictionary
 impl CFDictionaryHostObject {
-    /// Looks `key` up, telling a NULL value from a missing key ([None]).
-    ///
-    /// Unlike the methods below, this leaves the host object in place while
-    /// the guest's callbacks run, so they can read the dictionary.
-    fn lookup_entry(env: &mut Environment, dict: id, key: id) -> Option<id> {
-        let host_obj = env.objc.borrow::<CFDictionaryHostObject>(dict);
-        let hash_func = host_obj.key_callbacks.hash;
-        let equal_func = host_obj.key_callbacks.equal;
-        let hash = if hash_func.to_ptr().is_null() {
-            key.to_bits()
-        } else {
-            hash_func.call_from_host(env, (key,))
+    fn lookup(&self, env: &mut Environment, key: id) -> id {
+        let hash = self.hash(env, key);
+        let Some(collisions) = self.superclass.map.get(&hash) else {
+            return nil;
         };
-        let host_obj = env.objc.borrow::<CFDictionaryHostObject>(dict);
-        let collisions = host_obj.superclass.map.get(&hash)?.clone();
-        for (candidate_key, value) in collisions {
-            let equal = if equal_func.to_ptr().is_null() {
-                candidate_key == key
-            } else {
-                equal_func.call_from_host(env, (candidate_key, key))
-            };
-            if equal {
-                return Some(value);
+        for &(candidate_key, value) in collisions {
+            if self.equal_keys(env, candidate_key, key) {
+                return value;
             }
         }
-        None
-    }
-    /// `CFDictionaryContainsValue`, as `CFBasicHashGetCountOfValue` does it:
-    /// the same pointer, or else the value callbacks' `equal`. Like
-    /// [Self::lookup_entry], leaves the host object in place.
-    fn contains_value(env: &mut Environment, dict: id, value: id) -> bool {
-        let host_obj = env.objc.borrow::<CFDictionaryHostObject>(dict);
-        let equal_func = host_obj.value_callbacks.equal;
-        let values: Vec<id> = host_obj
-            .superclass
-            .map
-            .values()
-            .flatten()
-            .map(|&(_key, value)| value)
-            .collect();
-        for candidate_value in values {
-            if candidate_value == value
-                || (!equal_func.to_ptr().is_null()
-                    && equal_func.call_from_host(env, (candidate_value, value)))
-            {
-                return true;
-            }
-        }
-        false
+        nil
     }
     fn insert(&mut self, env: &mut Environment, key: id, value: id) {
         let hash = self.hash(env, key);
@@ -318,44 +280,6 @@ impl CFDictionaryHostObject {
             value_release_func.call_from_host(env, (nil, value))
         }
     }
-}
-
-fn is_cf_dictionary(env: &Environment, dict: id) -> bool {
-    env.objc
-        .get_host_object(dict)
-        .is_some_and(|host_obj| host_obj.as_any().is::<CFDictionaryHostObject>())
-}
-
-/// Looks up `key` for the `CFDictionary` functions. A dictionary made by
-/// `CFDictionaryCreateMutable` can store NULL values, so a nil from
-/// `objectForKey:` doesn't mean the key is missing. Returns [None] if it is.
-pub(crate) fn cf_dictionary_lookup(env: &mut Environment, dict: id, key: id) -> Option<id> {
-    if !is_cf_dictionary(env, dict) {
-        let value: id = msg![env; dict objectForKey:key];
-        return (value != nil).then_some(value);
-    }
-    CFDictionaryHostObject::lookup_entry(env, dict, key)
-}
-
-/// `CFDictionaryContainsValue`. A dictionary made by
-/// `CFDictionaryCreateMutable` compares values with its value callbacks.
-pub(crate) fn cf_dictionary_contains_value(env: &mut Environment, dict: id, value: id) -> bool {
-    if is_cf_dictionary(env, dict) {
-        return CFDictionaryHostObject::contains_value(env, dict, value);
-    }
-    if value == nil {
-        return false;
-    }
-    let values: id = msg![env; dict allValues];
-    let count: NSUInteger = msg![env; values count];
-    for i in 0..count {
-        let candidate: id = msg![env; values objectAtIndex:i];
-        let equal: bool = msg![env; candidate isEqual:value];
-        if equal {
-            return true;
-        }
-    }
-    false
 }
 
 /// Helper to enable sharing `dictionaryWithObjectsAndKeys:` and
@@ -1806,14 +1730,18 @@ pub const CLASSES: ClassExports = objc_classes! {
 // our custom init, not a part of API
 - (id)initWithKeyCallbacks:(ConstPtr<CFDictionaryKeyCallBacks>)key_callbacks
          andValueCallbacks:(ConstPtr<CFDictionaryValueCallBacks>)value_callbacks {
-    // NULL callbacks mean none: pointer equality and hashing, no retaining.
     if !key_callbacks.is_null() {
-        let key_callbacks = env.mem.read(key_callbacks);
-        env.objc.borrow_mut::<CFDictionaryHostObject>(this).key_callbacks = key_callbacks;
-    }
-    if !value_callbacks.is_null() {
-        let value_callbacks = env.mem.read(value_callbacks);
-        env.objc.borrow_mut::<CFDictionaryHostObject>(this).value_callbacks = value_callbacks;
+        if value_callbacks.is_null() {
+            log!(
+                "Warning: _touchHLE_NSMutableDictionary_non_retaining initWithKeyCallbacks: \
+                 value_callbacks is NULL while key_callbacks is set; using default value callbacks."
+            );
+        } else {
+            let host_object = env.objc.borrow_mut::<CFDictionaryHostObject>(this);
+            host_object.value_callbacks = env.mem.read(value_callbacks);
+        }
+        let host_object = env.objc.borrow_mut::<CFDictionaryHostObject>(this);
+        host_object.key_callbacks = env.mem.read(key_callbacks);
     }
     this
 }
@@ -1854,7 +1782,10 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 - (id)objectForKey:(id)key {
-    CFDictionaryHostObject::lookup_entry(env, this, key).unwrap_or(nil)
+    let host_obj: CFDictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
+    let res = host_obj.lookup(env, key);
+    *env.objc.borrow_mut(this) = host_obj;
+    res
 }
 
 - (id)valueForKey:(id)_key {
@@ -1867,12 +1798,16 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (())setObject:(id)object
          forKey:(id)key {
+    // ИСПРАВЛЕНИЕ: Безопасная обработка nil-ключей и объектов (как в основном словаре)
+    if object == nil {
+        log!("Warning: [_touchHLE_NSMutableDictionary_non_retaining setObject:forKey:] attempt to insert nil object — ignoring");
+        return;
+    }
     if key == nil {
         log!("Warning: [_touchHLE_NSMutableDictionary_non_retaining setObject:forKey:] attempt to use nil key — ignoring");
         return;
     }
 
-    // Unlike NSMutableDictionary, a CFDictionary can store NULL values.
     let mut host_obj: CFDictionaryHostObject = std::mem::take(env.objc.borrow_mut(this));
     host_obj.insert(env, key, object);
     *env.objc.borrow_mut(this) = host_obj;

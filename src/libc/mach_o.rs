@@ -8,7 +8,7 @@
 use crate::abi::{CallFromHost, GuestFunction};
 use crate::dyld::{export_c_func, FunctionExports};
 use crate::libc::string::strcmp;
-use crate::mem::{ConstPtr, GuestUSize, MutPtr, Ptr, SafeRead};
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
 use std::collections::HashMap;
 

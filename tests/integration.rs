@@ -2,10 +2,9 @@ use std::env;
 use std::env::current_dir;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 // adapted from `assert_cmd` crate
 fn target_dir() -> PathBuf {
@@ -26,65 +25,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
-}
-
-/// Drain both pipes while the guest runs, and reap it even on timeout.
-fn run_guest_with_deadline(
-    cmd: &mut Command,
-    timeout: Duration,
-) -> std::io::Result<(Output, bool)> {
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            pipe.read_to_end(&mut bytes).map(|_| bytes)
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().unwrap()));
-    let stderr = drain(Box::new(child.stderr.take().unwrap()));
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            child.kill()?;
-            break child.wait()?;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    Ok((
-        Output {
-            status,
-            stdout: stdout.join().expect("stdout reader panicked")?,
-            stderr: stderr.join().expect("stderr reader panicked")?,
-        },
-        timed_out,
-    ))
-}
-
-#[cfg(unix)]
-#[test]
-fn test_guest_deadline_reaps_a_hung_process() {
-    let mut success = Command::new("/bin/sh");
-    success.args(["-c", "printf complete; printf diagnostics >&2"]);
-    let (output, timed_out) =
-        run_guest_with_deadline(&mut success, Duration::from_secs(5)).unwrap();
-    assert!(!timed_out);
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"complete");
-    assert_eq!(output.stderr, b"diagnostics");
-
-    let mut hung = Command::new("/bin/sh");
-    // exec ensures the tested process owns the pipes: no sleeping grandchild
-    // can keep a pipe open after its parent is killed.
-    hung.args(["-c", "exec sleep 30"]);
-    let (output, timed_out) =
-        run_guest_with_deadline(&mut hung, Duration::from_millis(100)).unwrap();
-    assert!(timed_out);
-    assert!(!output.status.success());
 }
 
 /// Makes a path object, and checks that it exists.
@@ -247,35 +187,20 @@ fn run_test_app(
     )?;
     let binary_name = "touchHLE";
     let binary_path = target_dir().join(format!("{}{}", binary_name, env::consts::EXE_SUFFIX));
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut cmd = Command::new("/usr/bin/sandbox-exec");
-        // The blocking-I/O regression test uses UDP on loopback only.
-        // Nested sandbox-exec may be denied by an existing outer sandbox.
-        // Fail closed; do not retry with unrestricted network access.
-        cmd.args(["-p", r#"(version 1)(allow default)(deny network*)(allow network-outbound (remote ip "localhost:*"))(allow network-inbound (local ip "localhost:*"))(allow network-bind (local ip "localhost:*"))"#]);
-        cmd.arg(&binary_path);
-        cmd
-    };
-    // Other platforms have no OS network sandbox here. The guest flag enables
-    // sockets; only the TestApp code restricts its traffic to loopback.
-    #[cfg(not(target_os = "macos"))]
     let mut cmd = Command::new(binary_path);
-    // Use OpenAL Soft's silent backend so audio tests need no CI device.
-    cmd.env("ALSOFT_DRIVERS", "null");
-    cmd.arg(test_app_path)
+    let output = cmd
+        .arg(test_app_path)
+        // headless mode avoids a distracting window briefly appearing during
+        // testing, and works in CI.
         .arg("--headless")
         .args(extra_run_args)
+        // Run the automated CLI tests, rather than the manual UIKit tests.
         .arg("--args")
-        .arg("--cli-tests");
-    let (output, timed_out) = run_guest_with_deadline(&mut cmd, Duration::from_secs(120))
+        .arg("--cli-tests")
+        .output()
         .expect("failed to execute touchHLE process");
     std::io::stdout().write_all(&output.stdout).unwrap();
     std::io::stderr().write_all(&output.stderr).unwrap();
-    assert!(
-        !timed_out,
-        "{test_app_name}: guest exceeded 120-second deadline"
-    );
     assert!(output.status.success());
     // sanity check: check that emulation actually happened
     assert_ne!(
@@ -382,7 +307,6 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         stubs_lib_search_arg.as_str(),
         stubs_frameworks_search_arg.as_str(),
         "-ObjC",
-        "-fblocks",
         "-fno-objc-exceptions",
         // ARC is not available until IOS 5, so it can't be used.
         "-fno-objc-arc",
@@ -391,8 +315,6 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         // itself (see ns_string::register_constant_strings), so no stub
         // exports it.
         "-Wl,-U,___CFConstantStringClassReference",
-        // Block classes are also provided directly by dyld, not the stubs.
-        "-Wl,-U,__NSConcreteGlobalBlock",
     ];
 
     // Generate symbol stubs.
@@ -521,6 +443,6 @@ fn test_app() -> Result<(), Box<dyn Error>> {
         &tests_dir,
         "TestApp",
         &extra_compile_args,
-        &["--allow-network-access"],
+        &["--game-center-authenticated"],
     )
 }

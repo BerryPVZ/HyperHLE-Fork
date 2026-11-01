@@ -29,7 +29,7 @@ These are impractical to reimplement, but they are Free Software.
 * License: public domain (see `COPYING.libsqlite3`)
 * Binary origin: compilation of SQLite source code
 * Build code: <https://github.com/touchHLE/sqlite-dylib>
-* Source code: <https://github.com/sqlite/sqlite/tree/version-3.6.10>
+* Source code: <https://github.com/sqlite/sqlite/tree/version-3.6.12>
 
 ## Original Apple license acknowledgements
 

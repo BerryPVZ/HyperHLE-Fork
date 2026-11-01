@@ -120,3 +120,19 @@ fn reachable_route_is_wifi_without_connection_or_intervention_requirements() {
         );
     }
 }
+
+// The two tests that used to live here (`scheduling_queues_one_initial_
+// notification_for_the_run_loop` and `queued_notification_is_dropped_after_
+// unschedule_or_unregister`) were written for 2636d89, which queued the
+// initial callout through `ns_run_loop`. That machinery came from PR #259 and
+// was reverted in 24a2107; 5984633 then restored the synchronous delivery
+// `SCNetworkReachabilityScheduleWithRunLoop` does today. The host object no
+// longer has `schedule()`, `begin_scheduled_callback()`, `scheduled` or
+// `notification_pending`, so those tests could not be kept, and they cannot be
+// re-expressed as unit tests either: delivering the callout needs a live
+// `Environment` and a guest function, which the `test_app` integration test
+// covers on macOS.
+//
+// What is testable without an `Environment` — context lifetime, replacement and
+// the nested-callback release queue — is covered above by
+// `replace_unregister_and_nested_callbacks_release_each_old_context_once`.
