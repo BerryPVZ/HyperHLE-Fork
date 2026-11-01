@@ -465,6 +465,14 @@ pub struct Dyld {
     /// keyed by `(svc_pc, svc)`, with the number of times each was reported.
     /// A stray trap can be hit on every frame, so logging is capped.
     stray_svc_reports: HashMap<(u32, u32), u32>,
+    /// Cached guest C-strings with the path of each loaded image, keyed by
+    /// index into `Environment::bins`. Crash reporters and logging helpers
+    /// call `dladdr` once per image (and sometimes per address), so the
+    /// strings are allocated once instead of on every call.
+    pub dladdr_image_paths: HashMap<usize, MutPtr<u8>>,
+    /// Cached guest C-strings with `dladdr` symbol names, keyed by
+    /// `(image index, symbol address)`.
+    pub dladdr_symbol_names: HashMap<(usize, u32), MutPtr<u8>>,
 }
 
 impl Dyld {
@@ -502,6 +510,8 @@ impl Dyld {
             guest_sjlj_runtime_available: false,
             guest_cxxabi_exports: HashMap::new(),
             stray_svc_reports: HashMap::new(),
+            dladdr_image_paths: HashMap::new(),
+            dladdr_symbol_names: HashMap::new(),
         }
     }
 

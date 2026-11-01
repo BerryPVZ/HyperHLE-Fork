@@ -1350,11 +1350,6 @@ fn system(env: &mut Environment, cmd: ConstPtr<u8>) -> i32 {
     }
 }
 
-fn dladdr(_env: &mut Environment, _addr: ConstVoidPtr, _info: MutVoidPtr) -> i32 {
-    // FakeDladdr
-    0
-}
-
 fn kqueue(_env: &mut Environment) -> i32 {
     // FakeKqueue
     999
@@ -2044,7 +2039,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(fcvt(_, _, _, _)),
     export_c_func!(gcvt(_, _, _)),
     export_c_func!(system(_)),
-    export_c_func!(dladdr(_, _)),
     export_c_func!(kqueue()),
     export_c_func!(_NSGetExecutablePath(_, _)),
     export_c_func!(kevent(_, _, _, _, _, _)),
