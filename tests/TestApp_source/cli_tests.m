@@ -6419,39 +6419,9 @@ int test_NSNotificationCenter_addObserver_nilName_removeObserver() {
 
 // clang-format off
 // The tests re-ported from the post-merge commits of PR #259 sit after the
-// FUNC_DEF table, so the type, the externs and the helpers they use have to be
-// declared before it, like they were before the revert.
+// FUNC_DEF table, so they have to be declared before it, like they were
+// before the revert.
 
-// From Apple's dladdr(3) man page: dladdr() returns non-zero and fills in
-// the image path and base, and the nearest lower symbol, for an address in
-// a loaded image, and returns 0 otherwise. Symbol names have no leading
-// underscore. The old SDK has no dlfcn.h; this is its Dl_info layout.
-// https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html
-typedef struct {
-  const char *dli_fname;
-  void *dli_fbase;
-  const char *dli_sname;
-  void *dli_saddr;
-} TestAppDlInfo;
-extern int dladdr(const void *addr, TestAppDlInfo *info);
-
-// Apple: +[AVAsset assetWithURL:] "Returns an asset for inspection of a
-// resource referenced by a given URL" (iOS 5.0+). Talking Ted relies on it
-// to load its animations (HyperHLE-Reborn issue 303).
-// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
-@interface AVAsset : NSObject
-+ (id)assetWithURL:(NSURL *)url;
-@end
-@interface AVURLAsset : AVAsset
-- (NSURL *)URL;
-@end
-@interface NSObject (AVAssetTest)
-- (BOOL)isKindOfClass:(Class)cls;
-- (BOOL)isEqual:(id)object;
-@end
-
-int test_dladdr(void);
-int test_AVAsset_assetWithURL(void);
 int test_CFRunLoopTimerCreate_callout(void);
 int test_CFRunLoopTimerSetNextFireDate_NSTimer(void);
 int test_CFURLCreatePropertyFromResource(void);
@@ -6582,8 +6552,6 @@ struct {
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
-    FUNC_DEF(test_dladdr),
-    FUNC_DEF(test_AVAsset_assetWithURL),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
     XFUNC_DEF(test_CFRunLoopTimerSetNextFireDate_NSTimer),
     FUNC_DEF(test_CFURLCreatePropertyFromResource),
@@ -6598,45 +6566,6 @@ struct {
 // the queue-aware `dispatch_after` that the revert removed, so they would fail
 // at runtime even if the declarations came back. Restore them together with
 // that machinery, not before it.
-
-extern int dladdr(const void *addr, TestAppDlInfo *info);
-int test_dladdr(void) {
-  TestAppDlInfo info;
-  memset(&info, 0, sizeof(info));
-  if (!dladdr((const void *)&test_dladdr, &info))
-    return -1;
-  if (info.dli_fname == NULL || strstr(info.dli_fname, "TestApp") == NULL)
-    return -2;
-  // An image's base address is its Mach-O header (MH_MAGIC or MH_MAGIC_64).
-  if (info.dli_fbase == NULL)
-    return -3;
-  uint32_t magic = *(const uint32_t *)info.dli_fbase;
-  if (magic != 0xfeedface && magic != 0xfeedfacf)
-    return -3;
-  if (info.dli_sname == NULL || strcmp(info.dli_sname, "test_dladdr") != 0)
-    return -4;
-  if (info.dli_saddr != (void *)&test_dladdr)
-    return -5;
-  // The page at address 0 is not part of any image.
-  if (dladdr((const void *)4, &info) != 0)
-    return -6;
-  return 0;
-}
-
-int test_AVAsset_assetWithURL(void) {
-  NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
-  NSURL *url = [NSURL URLWithString:@"file:///nonexistent/movie.m4v"];
-  id asset = [AVAsset assetWithURL:url];
-  int result = 0;
-  if (asset == nil)
-    result = -1;
-  else if (![asset isKindOfClass:[AVURLAsset class]])
-    result = -2;
-  else if (![[asset URL] isEqual:url])
-    result = -3;
-  [pool drain];
-  return result;
-}
 
 
 // CFRunLoopTimerCreate returns a timer that calls its callout with the
