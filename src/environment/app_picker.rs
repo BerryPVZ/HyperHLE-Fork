@@ -382,6 +382,7 @@ struct AppPickerDelegateHostObject {
     orientation_portrait_upside_down: bool,
     analog_stick_tilt_controls: Option<bool>,
     network: Option<bool>,
+    game_center_authenticated: Option<bool>,
     show_fps: Option<bool>,
     overlay_mode: Option<PerformanceOverlayMode>,
     overlay_corner: Option<PerformanceOverlayCorner>,
@@ -427,6 +428,7 @@ struct PickerSettings {
     trace_gl_errors: bool,
     cheat_engine: bool,
     network: bool,
+    game_center_authenticated: bool,
     analog_stick_tilt_controls: bool,
     device_model_tag: Option<i32>,
     language_tag: Option<i32>,
@@ -449,6 +451,7 @@ impl PickerSettings {
             trace_gl_errors: options.trace_gl_errors,
             cheat_engine: quick_options_trainer_enabled(options),
             network: options.network_access,
+            game_center_authenticated: options.game_center_authenticated,
             analog_stick_tilt_controls: options.analog_stick_tilt_controls,
             device_model_tag: None,
             language_tag: None,
@@ -497,6 +500,9 @@ impl PickerSettings {
                 "trace_gl_errors" => set_bool(value, &mut settings.trace_gl_errors),
                 "cheat_engine" => set_bool(value, &mut settings.cheat_engine),
                 "network" => set_bool(value, &mut settings.network),
+                "game_center_authenticated" => {
+                    set_bool(value, &mut settings.game_center_authenticated)
+                }
                 "analog_stick_tilt_controls" => {
                     set_bool(value, &mut settings.analog_stick_tilt_controls)
                 }
@@ -533,6 +539,7 @@ impl PickerSettings {
              trace_gl_errors={}\n\
              cheat_engine={}\n\
              network={}\n\
+             game_center_authenticated={}\n\
              analog_stick_tilt_controls={}\n\
              device_model_tag={}\n\
              language_tag={}\n",
@@ -549,6 +556,7 @@ impl PickerSettings {
             self.trace_gl_errors,
             self.cheat_engine,
             self.network,
+            self.game_center_authenticated,
             self.analog_stick_tilt_controls,
             optional_tag(self.device_model_tag),
             optional_tag(self.language_tag),
@@ -720,6 +728,10 @@ const CLASSES: ClassExports = objc_classes! {
 - (())network:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
     env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).network = Some(switch_state);
+}
+- (())gameCenterAuthenticated:(id)switch { // UISwitch*
+    let switch_state: bool = msg![env; switch isOn];
+    env.objc.borrow_mut::<AppPickerDelegateHostObject>(this).game_center_authenticated = Some(switch_state);
 }
 - (())traceGLErrors:(id)switch { // UISwitch*
     let switch_state: bool = msg![env; switch isOn];
@@ -1632,6 +1644,8 @@ fn app_picker_inner(
             quick_options_analog_stick_tilt_controls = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.network) {
             quick_options_network = enabled;
+        } else if let Some(enabled) = std::mem::take(&mut host_obj.game_center_authenticated) {
+            picker_settings.game_center_authenticated = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.cheat_engine) {
             quick_options_cheat_engine = enabled;
         } else if let Some(enabled) = std::mem::take(&mut host_obj.show_fps) {
@@ -1809,6 +1823,14 @@ fn app_picker_inner(
         option_args.push("--no-network-access".to_string());
     }
     option_args.push(quick_options_trainer_argument(quick_options_cheat_engine).to_string());
+    option_args.push(
+        if picker_settings.game_center_authenticated {
+            "--game-center-authenticated"
+        } else {
+            "--no-game-center-authenticated"
+        }
+        .to_string(),
+    );
 
     env.window_mut().set_performance_overlay_settings(
         quick_options_show_fps,
@@ -3978,6 +4000,12 @@ fn setup_settings(
         vec![
             SettingsRow::Toggle("Cheat Engine", "cheatEngine:", picker_settings.cheat_engine, true),
             SettingsRow::Toggle("Network access", "network:", picker_settings.network, true),
+            SettingsRow::Toggle(
+                "Local Game Center sign-in",
+                "gameCenterAuthenticated:",
+                picker_settings.game_center_authenticated,
+                true,
+            ),
             SettingsRow::Toggle(
                 "Use analog sticks for tilt controls",
                 "analogStickTiltControls:",

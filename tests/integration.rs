@@ -439,5 +439,10 @@ fn test_app() -> Result<(), Box<dyn Error>> {
     }
 
     // Finally, build TestApp itself.
-    run_test_app(&tests_dir, "TestApp", &extra_compile_args, &[])
+    run_test_app(
+        &tests_dir,
+        "TestApp",
+        &extra_compile_args,
+        &["--game-center-authenticated"],
+    )
 }
