@@ -282,7 +282,7 @@ int test_Block_byref_lifetime(void) {
 @end
 extern NSString *const GKPlayerAuthenticationDidChangeNotificationName;
 
-static int gk_calls, gk_ok, gk_gone, gk_clear_in_handler, gk_authenticated;
+static int gk_calls, gk_ok, gk_gone, gk_clear_in_handler;
 
 @interface GKTestProbe : NSObject
 @end
@@ -328,8 +328,7 @@ static const struct GKTestHandlerDescriptor gk_handler_descriptor = {
 // void (^)(NSError *error)
 static void gk_completion_invoke(struct GKTestHandler *block, id error) {
   gk_calls++;
-  gk_ok = (error == nil) == gk_authenticated && !gk_gone &&
-          [block->captured retainCount] == 1;
+  gk_ok = error == nil && !gk_gone && [block->captured retainCount] == 1;
 }
 // void (^)(UIViewController *viewController, NSError *error)
 static void gk_handler_invoke(struct GKTestHandler *block, id vc, id error) {
@@ -337,7 +336,7 @@ static void gk_handler_invoke(struct GKTestHandler *block, id vc, id error) {
   if (gk_clear_in_handler)
     [[GKLocalPlayer localPlayer] setAuthenticateHandler:nil];
   // The block and what it captured must live until it returns.
-  gk_ok = vc == nil && (error == nil) == gk_authenticated && !gk_gone &&
+  gk_ok = vc == nil && error == nil && !gk_gone &&
           [block->captured retainCount] == 1;
 }
 
@@ -356,7 +355,7 @@ static int gk_run(int kind) {
   gk_clear_in_handler = kind == GK_CLEAR_IN_HANDLER;
   stack.captured = [[GKTestProbe alloc] init];
   GKLocalPlayer *player = [GKLocalPlayer localPlayer];
-  gk_authenticated = [player isAuthenticated];
+  BOOL authenticated = [player isAuthenticated];
   if (kind == GK_COMPLETION)
     [player authenticateWithCompletionHandler:(id)&stack];
   else
@@ -379,7 +378,7 @@ static int gk_run(int kind) {
     return -3;
   if (!gk_gone)
     return -4;
-  if (!gk_authenticated)
+  if (!authenticated)
     return -5;
   return 0;
 }

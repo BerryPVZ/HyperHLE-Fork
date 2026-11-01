@@ -458,14 +458,6 @@ Other options:
         including HTTP/HTTPS URL-loading APIs (NSURLConnection, NSURLSession, and NSData).
         Disabled by default.
 
-    --game-center-authenticated
-        Report the local Game Center player as signed in. This can let games
-        that require authentication at startup enter their offline content.
-        Online Game Center services are still unavailable.
-
-    --no-game-center-authenticated
-        Disable the local Game Center sign-in compatibility setting.
-
     --ignore-gl-errors
         Ignore host OpenGL errors as queried by glGetError function.
         This only affects return value of glGetError as seen by the guest

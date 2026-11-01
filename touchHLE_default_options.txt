@@ -385,6 +385,3 @@ com.foursakenmedia.civilwar: --reverse-attrib-locations
 
 # Illusia: draws in landscape but never declares or requests an orientation.
 com.gamevil.illusia: --landscape-left
-
-# Monster Hunter: Dynamic Hunting requires local Game Center sign-in at startup.
-jp.co.capcom.monhunipus: --game-center-authenticated

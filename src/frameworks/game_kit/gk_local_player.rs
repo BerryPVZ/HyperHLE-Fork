@@ -17,10 +17,8 @@ use crate::Environment;
 
 /// Apple GameKit `GKError.h`:
 /// `GKErrorNotAuthenticated = 6`. Returned by GameKit APIs when the
-/// local player is not signed in to Game Center. We use this code in
-/// the NSError we hand back to authentication completion handlers when
-/// local authentication emulation is disabled. Online Game Center
-/// connectivity is unavailable either way.
+/// local player is not signed in to Game Center. Used by the stubs for
+/// unavailable online Game Center operations.
 const GK_ERROR_NOT_AUTHENTICATED: i32 = 6;
 
 /// Apple Block ABI: word offset 3 (== byte offset 12) of a block
@@ -198,7 +196,8 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.alias        = alias;
         host.display_name = display;
         host.friends      = friends;
-        host.authenticated = env.options.game_center_authenticated;
+        // Emulate an already signed-in local player for offline games.
+        host.authenticated = true;
     }
 
     State::get(env).local_player = Some(player);
@@ -296,9 +295,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 // "If the local player can't be authenticated, GameKit calls your
 //  completion handler with an error."
 //
-// By default, we follow the documented "not authenticated" branch. With
-// local authentication emulation enabled, the completion handler gets no
-// error. Neither path connects to online Game Center services.
+// Local authentication succeeds automatically without contacting Game Center.
 //
 // CRITICAL: real GameKit *never* calls this handler synchronously from
 // inside the method — authentication is asynchronous and the handler is
@@ -355,12 +352,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     post_auth_change_notification(env);
 
-    let error = if env.objc.borrow::<GKLocalPlayerHostObject>(this).authenticated {
-        nil
-    } else {
-        make_not_authenticated_error(env)
-    };
-    invoke_error_block(env, handler, error);
+    invoke_error_block(env, handler, nil);
     release_block(env, handler);
 }
 
@@ -371,9 +363,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 //  controller. If the player cannot sign in, the handler is called with a
 //  non-nil error."
 //
-// We have no UI to present, so the handler gets a nil view controller and
-// either success or `GKErrorNotAuthenticated` according to the local
-// authentication setting. As with authenticateWithCompletionHandler:,
+// Local authentication succeeds with a nil view controller and error.
+// As with authenticateWithCompletionHandler:,
 // the handler must NOT run inline —
 // GameKit invokes it asynchronously on the main thread. We Block_copy and
 // retain it for the lifetime of the singleton (GameKit keeps the handler
@@ -409,8 +400,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 }
 
 // Internal: deliver the stored authenticate handler on the next run-loop
-// iteration (main thread) with a nil view controller and an error matching
-// the local authentication state. We keep the handler retained because
+// iteration (main thread) with a nil view controller and error.
+// We keep the handler retained because
 // GameKit may invoke it more than once.
 - (())_touchHLE_deliverAuthHandler {
     let handler = env.objc.borrow::<GKLocalPlayerHostObject>(this).authenticate_handler;
@@ -421,12 +412,7 @@ pub const CLASSES: ClassExports = objc_classes! {
     // itself may replace the stored handler, which releases it.
     let handler = copy_block(env, handler);
     post_auth_change_notification(env);
-    let error = if env.objc.borrow::<GKLocalPlayerHostObject>(this).authenticated {
-        nil
-    } else {
-        make_not_authenticated_error(env)
-    };
-    invoke_vc_error_block(env, handler, nil, error);
+    invoke_vc_error_block(env, handler, nil, nil);
     release_block(env, handler);
 }
 
@@ -478,7 +464,7 @@ pub const CLASSES: ClassExports = objc_classes! {
 };
 
 /// Post `GKPlayerAuthenticationDidChangeNotificationName` so registered
-/// observers see the (unchanged, not-authenticated) state, matching the
+/// observers see the local authentication state, matching the
 /// ordering GameKit uses before invoking authentication callbacks.
 fn post_auth_change_notification(env: &mut Environment) {
     let notif_center: id = msg_class![env; NSNotificationCenter defaultCenter];
