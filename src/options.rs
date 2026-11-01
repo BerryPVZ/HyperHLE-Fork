@@ -286,6 +286,9 @@ pub struct Options {
     /// Apps that are ES 2.0-only will fail to create a context with this set.
     pub force_gles1_context: bool,
     pub network_access: bool,
+    /// Report a local Game Center player as signed in, without providing
+    /// online Game Center services. Some games require this at startup.
+    pub game_center_authenticated: bool,
     pub popup_errors: bool,
     pub dumping_options: DumpingOptions,
     pub dumping_file: PathBuf,
@@ -423,6 +426,7 @@ impl Default for Options {
                 })
                 .unwrap_or(false),
             network_access: false,
+            game_center_authenticated: false,
             popup_errors: true,
             dumping_options: Default::default(),
             dumping_file: crate::paths::user_data_base_path().join("DUMP.txt"),
@@ -751,6 +755,10 @@ impl Options {
             self.network_access = true;
         } else if arg == "--no-network-access" {
             self.network_access = false;
+        } else if arg == "--game-center-authenticated" {
+            self.game_center_authenticated = true;
+        } else if arg == "--no-game-center-authenticated" {
+            self.game_center_authenticated = false;
         } else if arg == "--no-error-popup" {
             self.popup_errors = false;
         } else if let Some(values) = arg.strip_prefix("--dump=") {
@@ -921,6 +929,16 @@ mod option_parsing_tests {
 
         assert!(options.parse_argument("--no-rotation-fix").unwrap());
         assert!(!options.rotation_fix);
+    }
+
+    #[test]
+    fn local_game_center_sign_in_is_opt_in_and_can_be_disabled() {
+        let mut options = Options::default();
+        assert!(!options.game_center_authenticated);
+        assert!(options.parse_argument("--game-center-authenticated").unwrap());
+        assert!(options.game_center_authenticated);
+        assert!(options.parse_argument("--no-game-center-authenticated").unwrap());
+        assert!(!options.game_center_authenticated);
     }
 
     #[test]
