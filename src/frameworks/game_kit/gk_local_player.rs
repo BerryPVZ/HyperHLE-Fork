@@ -142,7 +142,6 @@ struct GKLocalPlayerHostObject {
     alias: id,
     /// `NSString*`
     display_name: id,
-    authenticated: bool,
     underage: bool,
     /// `NSArray*` of `NSString*` friend player IDs
     friends: id,
@@ -196,8 +195,6 @@ pub const CLASSES: ClassExports = objc_classes! {
         host.alias        = alias;
         host.display_name = display;
         host.friends      = friends;
-        // Emulate an already signed-in local player for offline games.
-        host.authenticated = true;
     }
 
     State::get(env).local_player = Some(player);
@@ -283,7 +280,8 @@ pub const CLASSES: ClassExports = objc_classes! {
 // MARK: - Authentication state
 
 - (bool)isAuthenticated {
-    env.objc.borrow::<GKLocalPlayerHostObject>(this).authenticated
+    // Emulate an already signed-in local player for offline games.
+    true
 }
 
 - (bool)isUnderage {
