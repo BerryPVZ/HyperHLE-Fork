@@ -107,115 +107,6 @@ fn get_etext(env: &mut Environment) -> u32 {
 
 // --- dyld API functions ---
 
-/// `int dladdr(const void *addr, Dl_info *info)` — find the image and the
-/// nearest symbol containing an address.
-/// See: <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html>
-///
-/// `Dl_info` is a four-word structure:
-///
-/// ```c
-/// typedef struct dl_info {
-///   const char *dli_fname; // path of the image containing `addr`
-///   void *dli_fbase;       // its load address
-///   const char *dli_sname; // name of the nearest symbol, or NULL
-///   void *dli_saddr;       // address of that symbol, or NULL
-/// } Dl_info;
-/// ```
-///
-/// Every loaded image is in `env.bins`, so the search is a lookup in that
-/// list plus a scan of the winning image's symbol table for the closest
-/// symbol at or below `addr`. A stub that always failed made apps that name
-/// code addresses in their own log output (a Unity/Cocos crash reporter
-/// calling `dladdr` once per loaded image, for example) report every image as
-/// unresolvable: `image_add_callback: dladdr(0x4000, ...) failed`.
-pub fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutVoidPtr) -> i32 {
-    let addr = addr.to_bits();
-    if info.is_null() {
-        return 0;
-    }
-
-    // Pick the image with the highest load address at or below `addr`, so a
-    // large image can't shadow a more specific one that was loaded inside the
-    // part of the address space it spans. Images are mapped at their preferred
-    // addresses, so a simple range check over `env.bins` matches what dyld
-    // would see on a real device.
-    let mut best: Option<(usize, u32)> = None;
-    for (image_index, bin) in env.bins.iter().enumerate() {
-        if addr < bin.text_base || addr >= bin.last_segment_end {
-            continue;
-        }
-        if best.is_none_or(|(_, base)| bin.text_base >= base) {
-            best = Some((image_index, bin.text_base));
-        }
-    }
-    let Some((image_index, fbase)) = best else {
-        log_dbg!("dladdr({:#x}): address is not in any loaded image", addr);
-        return 0;
-    };
-
-    // Nearest symbol at or below the address. `exported_symbols` holds every
-    // defined symbol, including local ones, and Thumb function symbols keep
-    // their low bit set, matching the symbol table on a real device.
-    let (symbol_name, symbol_addr) = env.bins[image_index]
-        .exported_symbols
-        .iter()
-        .filter(|(_, &sym_addr)| sym_addr <= addr)
-        .max_by_key(|(_, &sym_addr)| sym_addr)
-        .map(|(name, &sym_addr)| (Some(name.clone()), sym_addr))
-        .unwrap_or((None, 0));
-
-    // Report a full path, like dyld does: the bundle path for the app binary
-    // and `/usr/lib/<name>` for the bundled dylibs, which is where the guest
-    // sees them.
-    let image_name = env.bins[image_index].name.clone();
-    let fname = if image_index == 0 && !image_name.contains('/') {
-        env.bundle.executable_path().as_str().to_string()
-    } else if image_name.contains('/') {
-        image_name
-    } else {
-        format!("/usr/lib/{}", image_name)
-    };
-
-    let fname_ptr = match env.dyld.dladdr_image_paths.get(&image_index) {
-        Some(&ptr) => ptr,
-        None => {
-            let ptr = env.mem.alloc_and_write_cstr(fname.as_bytes());
-            env.dyld.dladdr_image_paths.insert(image_index, ptr);
-            ptr
-        }
-    };
-
-    let sname_ptr = match &symbol_name {
-        Some(name) => match env.dyld.dladdr_symbol_names.get(&(image_index, symbol_addr)) {
-            Some(&ptr) => ptr,
-            None => {
-                let ptr = env.mem.alloc_and_write_cstr(name.as_bytes());
-                env.dyld
-                    .dladdr_symbol_names
-                    .insert((image_index, symbol_addr), ptr);
-                ptr
-            }
-        },
-        None => Ptr::null(),
-    };
-
-    let fields = info.cast::<u32>();
-    env.mem.write(fields, fname_ptr.to_bits());
-    env.mem.write(fields + 1, fbase);
-    env.mem.write(fields + 2, sname_ptr.to_bits());
-    env.mem.write(fields + 3, symbol_addr);
-
-    log_dbg!(
-        "dladdr({:#x}) => 1 (image {:?} at {:#x}, symbol {:?} at {:#x})",
-        addr,
-        fname,
-        fbase,
-        symbol_name,
-        symbol_addr
-    );
-    1
-}
-
 /// `uint32_t _dyld_image_count(void)` — returns the number of images
 /// (Mach-O binaries) currently loaded in the process address space.
 /// See: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dyld.3.html
@@ -962,7 +853,6 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(get_end()),
     export_c_func!(get_etext()),
     export_c_func!(host_info(_, _, _, _)),
-    export_c_func!(dladdr(_, _)),
     export_c_func!(_dyld_image_count()),
     export_c_func!(_dyld_get_image_header(_)),
     export_c_func!(_dyld_get_image_name(_)),
