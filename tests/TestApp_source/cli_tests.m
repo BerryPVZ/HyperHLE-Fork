@@ -284,10 +284,6 @@ extern NSString *const GKPlayerAuthenticationDidChangeNotificationName;
 
 static int gk_calls, gk_ok, gk_gone, gk_clear_in_handler, gk_authenticated;
 
-int test_GKLocalPlayer_authenticated(void) {
-  return [[GKLocalPlayer localPlayer] isAuthenticated] ? 0 : -1;
-}
-
 @interface GKTestProbe : NSObject
 @end
 @implementation GKTestProbe
@@ -383,6 +379,8 @@ static int gk_run(int kind) {
     return -3;
   if (!gk_gone)
     return -4;
+  if (!gk_authenticated)
+    return -5;
   return 0;
 }
 
@@ -6557,7 +6555,6 @@ struct {
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_withObject),
     FUNC_DEF(test_NSNotificationCenter_addObserver_nilName_removeObserver),
     FUNC_DEF(test_performSelectorOnMainThread_mainThreadDeferred),
-    FUNC_DEF(test_GKLocalPlayer_authenticated),
     FUNC_DEF(test_UIApplication_canOpenURL_own_registered_scheme),
     FUNC_DEF(test_NSBundle_subbundleCacheRetainsAutoreleasedBundle),
     XFUNC_DEF(test_CFRunLoopTimerCreate_callout),
