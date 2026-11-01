@@ -10,8 +10,17 @@
 //! стороны гостевого приложения.
 
 use crate::dyld::{export_c_func, FunctionExports};
-use crate::mem::{ConstPtr, MutVoidPtr, Ptr};
+use crate::mach_o::MachO;
+use crate::mem::{ConstPtr, ConstVoidPtr, GuestUSize, MutPtr, MutVoidPtr, Ptr, SafeRead};
 use crate::Environment;
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub struct State {
+    /// Guest copies of the strings `dladdr` hands out, keyed by their text.
+    /// `Dl_info` only borrows them, so they must live for the whole process.
+    strings: HashMap<String, ConstPtr<u8>>,
+}
 
 /// Псевдо-дескриптор для доступа к глобальной области видимости символов (main
 //executable).
@@ -220,10 +229,158 @@ fn dlerror(_env: &mut Environment) -> ConstPtr<u8> {
     Ptr::null()
 }
 
+/// `Dl_info` from `dlfcn.h`.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct Dl_info {
+    dli_fname: ConstPtr<u8>,
+    dli_fbase: ConstVoidPtr,
+    dli_sname: ConstPtr<u8>,
+    dli_saddr: ConstVoidPtr,
+}
+unsafe impl SafeRead for Dl_info {}
+
+/// What `dladdr` reports for an address: the index of the image (in
+/// `Environment::bins`) that contains it, and the nearest symbol at or below
+/// it in that image, if there is one.
+fn image_and_symbol_for_address(bins: &[MachO], addr: u32) -> Option<(usize, Option<(&str, u32)>)> {
+    let idx = bins
+        .iter()
+        .position(|bin| (bin.text_base..bin.last_segment_end).contains(&addr))?;
+    let symbol = bins[idx]
+        .exported_symbols
+        .iter()
+        // Thumb function symbols carry the Thumb bit, which isn't part of
+        // the symbol's address.
+        .filter(|&(_, &sym_addr)| sym_addr & !1 <= addr)
+        .max_by_key(|&(name, &sym_addr)| (sym_addr & !1, std::cmp::Reverse(name)))
+        .map(|(name, &sym_addr)| (name.as_str(), sym_addr));
+    Some((idx, symbol))
+}
+
+fn guest_string(env: &mut Environment, s: &str) -> ConstPtr<u8> {
+    if let Some(&cached) = env.libc_state.dlfcn.strings.get(s) {
+        return cached;
+    }
+    let len = s.len() as GuestUSize + 1;
+    let ptr: MutPtr<u8> = env.mem.alloc(len).cast();
+    let dst = env.mem.bytes_at_mut(ptr, len);
+    dst[..s.len()].copy_from_slice(s.as_bytes());
+    dst[s.len()] = 0;
+    let ptr = ptr.cast_const();
+    env.libc_state.dlfcn.strings.insert(s.to_owned(), ptr);
+    ptr
+}
+
+/// `int dladdr(const void *addr, Dl_info *info)`.
+///
+/// From Apple's dladdr(3) man page: "If an image containing addr cannot be
+/// found, dladdr() returns 0. On success, a non-zero value is returned."
+/// `dli_fname` and `dli_fbase` are the path and Mach-O header of that image;
+/// `dli_sname` and `dli_saddr` are the nearest symbol with a lower address,
+/// or NULL if there is none. As with `dlsym`, symbol names have no leading
+/// underscore.
+/// <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/dladdr.3.html>
+fn dladdr(env: &mut Environment, addr: ConstVoidPtr, info: MutPtr<Dl_info>) -> i32 {
+    let Some((idx, symbol)) = image_and_symbol_for_address(&env.bins, addr.to_bits()) else {
+        return 0;
+    };
+    let fbase = env.bins[idx].text_base;
+    let symbol = symbol
+        .map(|(name, sym_addr)| (name.strip_prefix('_').unwrap_or(name).to_owned(), sym_addr));
+    let fname = if idx == 0 {
+        env.bundle.executable_path().as_str().to_owned()
+    } else {
+        // Dylibs are known by file name; report the install path the app
+        // linked against when there is one.
+        let name = &env.bins[idx].name;
+        env.bins[0]
+            .dynamic_libraries
+            .iter()
+            .find(|path| path.rsplit('/').next() == Some(name.as_str()))
+            .unwrap_or(name)
+            .clone()
+    };
+
+    let dli_fname = guest_string(env, &fname);
+    let (dli_sname, dli_saddr) = match symbol {
+        Some((name, sym_addr)) => (guest_string(env, &name), Ptr::from_bits(sym_addr)),
+        None => (Ptr::null(), Ptr::null()),
+    };
+    if !info.is_null() {
+        env.mem.write(
+            info,
+            Dl_info {
+                dli_fname,
+                dli_fbase: Ptr::from_bits(fbase),
+                dli_sname,
+                dli_saddr,
+            },
+        );
+    }
+    1
+}
+
 // Экспорт C-функций в глобальное адресное пространство гостевого процесса.
 pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(dlopen(_, _)),
     export_c_func!(dlsym(_, _)),
     export_c_func!(dlclose(_)),
     export_c_func!(dlerror()),
+    export_c_func!(dladdr(_, _)),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mach_o::{Section, SectionType};
+
+    fn mock_binary(name: &str, text_base: u32, end: u32, symbols: &[(&str, u32)]) -> MachO {
+        MachO {
+            name: name.to_owned(),
+            dynamic_libraries: Vec::new(),
+            sections: vec![Section {
+                name: "__text".to_owned(),
+                addr: text_base + 0x1000,
+                size: end - text_base - 0x1000,
+                type_: SectionType::Normal,
+                dyld_indirect_symbol_info: None,
+            }],
+            exported_symbols: symbols.iter().map(|&(n, a)| (n.to_owned(), a)).collect(),
+            external_symbols: HashMap::new(),
+            external_relocations: Vec::new(),
+            entry_point_pc: None,
+            entry_point_is_lc_main: false,
+            last_segment_end: end,
+            text_base,
+        }
+    }
+
+    #[test]
+    fn dladdr_finds_image_and_nearest_lower_symbol() {
+        let bins = [
+            mock_binary(
+                "App",
+                0x1000,
+                0x5000,
+                &[("_main", 0x2000), ("_thumb_fn", 0x2101)],
+            ),
+            mock_binary("libz.1.dylib", 0x9000, 0xa000, &[]),
+        ];
+        // Mach-O header of the app: inside the image, below every symbol.
+        assert_eq!(image_and_symbol_for_address(&bins, 0x1000), Some((0, None)));
+        assert_eq!(
+            image_and_symbol_for_address(&bins, 0x2050),
+            Some((0, Some(("_main", 0x2000))))
+        );
+        // The Thumb bit is not part of the symbol's address.
+        assert_eq!(
+            image_and_symbol_for_address(&bins, 0x2100),
+            Some((0, Some(("_thumb_fn", 0x2101))))
+        );
+        assert_eq!(image_and_symbol_for_address(&bins, 0x9004), Some((1, None)));
+        // Not in any image: dladdr() returns 0.
+        assert_eq!(image_and_symbol_for_address(&bins, 0x5000), None);
+        assert_eq!(image_and_symbol_for_address(&bins, 0x10), None);
+    }
+}

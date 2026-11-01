@@ -169,6 +169,7 @@ pub struct State {
     aio: aio::State,
     dirent: dirent::State,
     dispatch: dispatch::State,
+    dlfcn: dlfcn::State,
     keymgr: keymgr::State,
     malloc: malloc::State,
     math: math::State,

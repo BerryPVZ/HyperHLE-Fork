@@ -453,6 +453,13 @@ pub const CLASSES: ClassExports = objc_classes! {
     env.objc.alloc_object(this, host, &mut env.mem)
 }
 
+// Apple: "Returns an asset for inspection of a resource referenced by a given
+// URL" (iOS 5.0+). For a URL this is an AVURLAsset, as it is on iOS.
+// https://developer.apple.com/documentation/avfoundation/avasset/1389943-assetwithurl
++ (id)assetWithURL:(id)url {
+    msg_class![env; AVURLAsset URLAssetWithURL:url options:nil]
+}
+
 - (())dealloc {
     let url = env.objc.borrow::<AVAssetHostObject>(this).url;
     release(env, url);
