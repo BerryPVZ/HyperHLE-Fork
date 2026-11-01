@@ -217,7 +217,7 @@ fn invoke_source_handler(
     queue: dispatch_queue_t,
     context: MutVoidPtr,
 ) {
-    super::dispatch::push_current_queue(env, queue);
+    get_state(env).current_queue_stack.push(queue.to_bits());
     match handler {
         SourceHandler::Block(block) => call_void_block(env, block),
         SourceHandler::Function(function) => {
@@ -226,7 +226,7 @@ fn invoke_source_handler(
             }
         }
     }
-    super::dispatch::pop_current_queue(env);
+    get_state(env).current_queue_stack.pop();
 }
 
 fn dispatch_source_fire_event(env: &mut Environment, source: u32) {
